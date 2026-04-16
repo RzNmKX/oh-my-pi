@@ -647,7 +647,10 @@ function buildAdditionalModelRequestFields(
 	if (mode === "anthropic-adaptive") {
 		const effort = mapEffortToAnthropicAdaptiveEffort(model, reasoning);
 		return {
-			thinking: { type: "adaptive" },
+			// `display: "summarized"` is the default on Opus 4.6 and Sonnet 4.6,
+			// but defaults to "omitted" on Opus 4.7+. Set it explicitly so thinking
+			// content is visible across all adaptive-capable models.
+			thinking: { type: "adaptive", display: "summarized" },
 			output_config: { effort },
 		};
 	}

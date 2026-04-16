@@ -1423,7 +1423,9 @@ function buildParams(
 			options.effort ?? (requestedEffort ? mapEffortToAnthropicAdaptiveEffort(model, requestedEffort) : undefined);
 
 		if (mode === "anthropic-adaptive") {
-			params.thinking = { type: "adaptive" };
+			// Opus 4.7+ defaults `display` to "omitted"; pin "summarized" so thinking
+			// text is returned uniformly across adaptive-capable models.
+			params.thinking = { type: "adaptive", display: "summarized" } as any;
 			if (effort) {
 				params.output_config = { effort };
 			}
