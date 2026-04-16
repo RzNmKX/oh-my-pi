@@ -1415,7 +1415,7 @@ fn grep_sync(
 	let include_hidden = options.hidden.unwrap_or(true);
 	let use_gitignore = options.gitignore.unwrap_or(true);
 	let use_cache = options.cache.unwrap_or(false);
-	let glob_set = glob_util::try_compile_glob(options.glob.as_deref(), true)?;
+	let glob_set = glob_util::try_compile_glob(options.glob.as_deref(), true, true)?;
 	let type_filter = resolve_type_filter(options.type_filter.as_deref());
 
 	let params = SearchParams {

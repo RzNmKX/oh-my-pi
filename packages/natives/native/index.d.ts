@@ -720,6 +720,8 @@ export interface GlobOptions {
   signal?: unknown
   /** Timeout in milliseconds for the operation. */
   timeoutMs?: number
+  /** Case-sensitive pattern matching (default: true). */
+  matchCase?: boolean
 }
 
 /** Result payload returned by a glob operation. */

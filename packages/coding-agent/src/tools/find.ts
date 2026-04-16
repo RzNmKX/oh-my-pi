@@ -33,6 +33,7 @@ const findSchema = Type.Object({
 	pattern: Type.String({ description: "Glob pattern, e.g. '*.ts', 'src/**/*.json', 'lib/*.tsx'" }),
 	hidden: Type.Optional(Type.Boolean({ description: "Include hidden files and directories (default: true)" })),
 	limit: Type.Optional(Type.Number({ description: "Max results (default: 1000)" })),
+	matchCase: Type.Optional(Type.Boolean({ description: "Case-sensitive matching (default: false)" })),
 });
 
 export type FindToolInput = Static<typeof findSchema>;
@@ -96,7 +97,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 		onUpdate?: AgentToolUpdateCallback<FindToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<FindToolDetails>> {
-		const { pattern, limit, hidden } = params;
+		const { pattern, limit, hidden, matchCase } = params;
 
 		return untilAborted(signal, async () => {
 			const formatScopePath = (targetPath: string): string => {
@@ -259,6 +260,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 							maxResults: effectiveLimit,
 							sortByMtime: true,
 							gitignore: useGitignore,
+							matchCase: matchCase ?? false,
 						},
 						onMatch,
 						this.session.searchDb,

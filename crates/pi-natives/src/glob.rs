@@ -65,6 +65,9 @@ pub struct GlobOptions<'env> {
 	/// Timeout in milliseconds for the operation.
 	#[napi(js_name = "timeoutMs")]
 	pub timeout_ms:           Option<u32>,
+	/// Case-sensitive pattern matching (default: true).
+	#[napi(js_name = "matchCase")]
+	pub match_case:           Option<bool>,
 }
 
 /// Result payload returned by a glob operation.
@@ -88,6 +91,7 @@ struct GlobConfig {
 	mentions_node_modules: bool,
 	sort_by_mtime:         bool,
 	use_cache:             bool,
+	match_case:            bool,
 }
 
 fn resolve_symlink_target_type(root: &Path, relative_path: &str) -> Option<FileType> {
@@ -233,7 +237,7 @@ fn run_glob(
 	on_match: Option<&ThreadsafeFunction<GlobMatch>>,
 	ct: task::CancelToken,
 ) -> Result<GlobResult> {
-	let glob_set = glob_util::compile_glob(&config.pattern, config.recursive)?;
+	let glob_set = glob_util::compile_glob(&config.pattern, config.recursive, config.match_case)?;
 	if config.max_results == 0 {
 		return Ok(GlobResult { matches: Vec::new(), total_matches: 0 });
 	}
@@ -318,6 +322,7 @@ pub fn glob(
 		include_node_modules,
 		timeout_ms,
 		signal,
+		match_case,
 	} = options;
 
 	let pattern = pattern.trim();
@@ -340,6 +345,7 @@ pub fn glob(
 					.unwrap_or_else(|| pattern.contains("node_modules")),
 				sort_by_mtime: sort_by_mtime.unwrap_or(false),
 				use_cache: cache.unwrap_or(false),
+				match_case: match_case.unwrap_or(true),
 				pattern,
 			},
 			db.as_ref(),

@@ -135,9 +135,9 @@ fn matches_editor_config_pattern(pattern: &str, relative_path: &str) -> bool {
 	}
 
 	let candidates: Vec<Result<GlobSet, _>> = if normalized.contains('/') {
-		vec![compile_glob(normalized, false)]
+		vec![compile_glob(normalized, false, true)]
 	} else {
-		vec![compile_glob(normalized, false), compile_glob(normalized, true)]
+		vec![compile_glob(normalized, false, true), compile_glob(normalized, true, true)]
 	};
 
 	for gs in candidates {

@@ -399,7 +399,7 @@ fn collect_candidates(
 		)));
 	}
 
-	let glob_set = glob_util::try_compile_glob(glob, false)?;
+	let glob_set = glob_util::try_compile_glob(glob, false, true)?;
 	let mentions_node_modules = glob.is_some_and(|value| value.contains("node_modules"));
 	let scan = fs_cache::get_or_scan(&search_path, true, true, ct)?;
 	let mut files = collect_from_entries(

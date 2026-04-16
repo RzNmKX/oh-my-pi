@@ -5,6 +5,7 @@ Finds files using fast pattern matching that works with any codebase size.
 - You may provide comma-separated path lists, for example `apps/,packages/,phases/`
 - Simple patterns like `*.ts` automatically search recursively from cwd
 - Includes hidden files by default (use `hidden: false` to exclude)
+- Matching is case-insensitive by default (use `matchCase: true` for exact case)
 - You **SHOULD** perform multiple searches in parallel when potentially useful
 </instruction>
 

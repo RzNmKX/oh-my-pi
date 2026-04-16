@@ -20,11 +20,14 @@ pub fn build_glob_pattern(glob: &str, recursive: bool) -> String {
 ///
 /// When `recursive` is true, simple patterns (no path separators, no leading
 /// `**`) are automatically prefixed with `**/`.
-pub fn compile_glob(glob: &str, recursive: bool) -> Result<GlobSet> {
+///
+/// When `match_case` is false the pattern matches case-insensitively.
+pub fn compile_glob(glob: &str, recursive: bool, match_case: bool) -> Result<GlobSet> {
 	let mut builder = GlobSetBuilder::new();
 	let pattern = build_glob_pattern(glob, recursive);
 	let glob = GlobBuilder::new(&pattern)
 		.literal_separator(true)
+		.case_insensitive(!match_case)
 		.build()
 		.map_err(|err| Error::from_reason(format!("Invalid glob pattern: {err}")))?;
 	builder.add(glob);
@@ -35,11 +38,11 @@ pub fn compile_glob(glob: &str, recursive: bool) -> Result<GlobSet> {
 
 /// Like [`compile_glob`], but accepts an `Option<&str>` — returns `Ok(None)`
 /// when the input is `None`, empty, or whitespace-only.
-pub fn try_compile_glob(glob: Option<&str>, recursive: bool) -> Result<Option<GlobSet>> {
+pub fn try_compile_glob(glob: Option<&str>, recursive: bool, match_case: bool) -> Result<Option<GlobSet>> {
 	let Some(glob) = glob.map(str::trim).filter(|v| !v.is_empty()) else {
 		return Ok(None);
 	};
-	compile_glob(glob, recursive).map(Some)
+	compile_glob(glob, recursive, match_case).map(Some)
 }
 
 /// Close unclosed `{` alternation groups in a glob pattern.
@@ -106,11 +109,34 @@ mod tests {
 
 	#[test]
 	fn compile_glob_accepts_valid_pattern() {
-		assert!(compile_glob("*.ts", true).is_ok());
+		assert!(compile_glob("*.ts", true, true).is_ok());
 	}
 
 	#[test]
 	fn compile_glob_fixes_unclosed_brace() {
-		assert!(compile_glob("*.{ts,tsx,js", true).is_ok());
+		assert!(compile_glob("*.{ts,tsx,js", true, true).is_ok());
+	}
+
+	#[test]
+	fn compile_glob_case_insensitive() {
+		let set = compile_glob("*.RS", true, false).unwrap();
+		assert!(set.is_match("src/main.rs"));
+		assert!(set.is_match("src/main.RS"));
+	}
+
+	#[test]
+	fn compile_glob_case_sensitive() {
+		let set = compile_glob("*.RS", true, true).unwrap();
+		assert!(!set.is_match("src/main.rs"));
+		assert!(set.is_match("src/main.RS"));
+	}
+
+	#[test]
+	fn compile_glob_case_insensitive_brace_alternation() {
+		let set = compile_glob("*.{ts,JS}", true, false).unwrap();
+		assert!(set.is_match("src/foo.ts"));
+		assert!(set.is_match("src/foo.TS"));
+		assert!(set.is_match("src/bar.js"));
+		assert!(set.is_match("src/bar.JS"));
 	}
 }
