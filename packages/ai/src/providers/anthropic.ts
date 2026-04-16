@@ -162,9 +162,15 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 
 type AnthropicCacheControl = { type: "ephemeral"; ttl?: "1h" | "5m" };
 
-type AnthropicSamplingParams = MessageCreateParamsStreaming & {
+// Anthropic's adaptive thinking config accepts a `display` field that is not yet
+// in the SDK types. Defaults to "omitted" on Opus 4.7+; must be set to "summarized"
+// to receive thinking content blocks.
+type AnthropicAdaptiveThinking = { type: "adaptive"; display?: "omitted" | "summarized" };
+
+type AnthropicSamplingParams = Omit<MessageCreateParamsStreaming, "thinking"> & {
 	top_p?: number;
 	top_k?: number;
+	thinking?: MessageCreateParamsStreaming["thinking"] | AnthropicAdaptiveThinking;
 };
 function getCacheControl(
 	baseUrl: string,
@@ -1423,7 +1429,9 @@ function buildParams(
 			options.effort ?? (requestedEffort ? mapEffortToAnthropicAdaptiveEffort(model, requestedEffort) : undefined);
 
 		if (mode === "anthropic-adaptive") {
-			params.thinking = { type: "adaptive" };
+			// Opus 4.7+ defaults `display` to "omitted"; pin "summarized" so thinking
+			// text is returned uniformly across adaptive-capable models.
+			params.thinking = { type: "adaptive", display: "summarized" };
 			if (effort) {
 				params.output_config = { effort };
 			}
