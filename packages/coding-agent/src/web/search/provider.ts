@@ -2,6 +2,7 @@ import { AnthropicProvider } from "./providers/anthropic";
 import type { SearchProvider } from "./providers/base";
 import { BraveProvider } from "./providers/brave";
 import { CodexProvider } from "./providers/codex";
+import { DuckDuckGoProvider } from "./providers/duckduckgo";
 import { ExaProvider } from "./providers/exa";
 import { GeminiProvider } from "./providers/gemini";
 import { JinaProvider } from "./providers/jina";
@@ -31,6 +32,7 @@ const SEARCH_PROVIDERS: Record<SearchProviderId, SearchProvider> = {
 	parallel: new ParallelProvider(),
 	kagi: new KagiProvider(),
 	synthetic: new SyntheticProvider(),
+	duckduckgo: new DuckDuckGoProvider(),
 } as const;
 
 export const SEARCH_PROVIDER_ORDER: SearchProviderId[] = [
@@ -47,6 +49,7 @@ export const SEARCH_PROVIDER_ORDER: SearchProviderId[] = [
 	"parallel",
 	"kagi",
 	"synthetic",
+	"duckduckgo",
 ];
 
 export function getSearchProvider(provider: SearchProviderId): SearchProvider {

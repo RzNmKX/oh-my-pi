@@ -335,6 +335,7 @@ const OPTION_PROVIDERS: Partial<Record<SettingPath, OptionProvider>> = {
 		{ value: "kagi", label: "Kagi", description: "Requires KAGI_API_KEY and Kagi Search API beta access" },
 		{ value: "synthetic", label: "Synthetic", description: "Requires SYNTHETIC_API_KEY" },
 		{ value: "parallel", label: "Parallel", description: "Requires PARALLEL_API_KEY" },
+		{ value: "duckduckgo", label: "DuckDuckGo", description: "Free, no API key required (HTML scraping)" },
 	],
 	"providers.image": [
 		{ value: "auto", label: "Auto", description: "Priority: OpenRouter > Gemini" },
