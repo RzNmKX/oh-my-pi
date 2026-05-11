@@ -142,17 +142,24 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 		});
 	}
 
+	// Project-level: <cwd>/CLAUDE.md (standalone) or <cwd>/.claude/CLAUDE.md
 	const projectBase = getProjectClaude(ctx);
-	const projectClaudeMd = path.join(projectBase, "CLAUDE.md");
-	const projectContent = await readFile(projectClaudeMd);
+	const standaloneClaudeMd = path.join(ctx.cwd, "CLAUDE.md");
+	const dotClaudeClaudeMd = path.join(projectBase, "CLAUDE.md");
+
+	// Prefer standalone <cwd>/CLAUDE.md; fall back to <cwd>/.claude/CLAUDE.md
+	const standaloneContent = await readFile(standaloneClaudeMd);
+	const projectPath = standaloneContent !== null ? standaloneClaudeMd : dotClaudeClaudeMd;
+	const projectContent = standaloneContent ?? (await readFile(dotClaudeClaudeMd));
+
 	if (projectContent !== null) {
-		const depth = calculateDepth(ctx.cwd, path.dirname(projectBase), path.sep);
+		const depth = calculateDepth(ctx.cwd, path.dirname(projectPath), path.sep);
 		items.push({
-			path: projectClaudeMd,
+			path: projectPath,
 			content: projectContent,
 			level: "project",
 			depth,
-			_source: createSourceMeta(PROVIDER_ID, projectClaudeMd, "project"),
+			_source: createSourceMeta(PROVIDER_ID, projectPath, "project"),
 		});
 	}
 
