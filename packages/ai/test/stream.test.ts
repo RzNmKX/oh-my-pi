@@ -1495,13 +1495,13 @@ describe("Generate E2E Tests", () => {
 
 				const payload = capturedPayload as {
 					additionalModelRequestFields?: {
-						thinking?: { type?: string };
+						thinking?: { type?: string; display?: string };
 						output_config?: { effort?: string };
 						anthropic_beta?: string[];
 					};
 				};
 
-				expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive" });
+				expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive", display: "summarized" });
 				expect(payload.additionalModelRequestFields?.output_config).toEqual({ effort: "max" });
 				expect(payload.additionalModelRequestFields?.anthropic_beta).toBeUndefined();
 			},

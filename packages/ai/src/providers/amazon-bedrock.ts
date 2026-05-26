@@ -201,6 +201,18 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 
 			while (true) {
 				const client = new BedrockRuntimeClient(config);
+				const bedrockUserAgent = $env.BEDROCK_USER_AGENT;
+				if (bedrockUserAgent) {
+					client.middlewareStack.add(
+						next => (args: any) => {
+							if (args.request?.headers) {
+								args.request.headers["user-agent"] = bedrockUserAgent;
+							}
+							return next(args);
+						},
+						{ step: "build", priority: "low", name: "overrideUserAgent" },
+					);
+				}
 				try {
 					const command = new ConverseStreamCommand(commandInput);
 					const response = await client.send(command, { abortSignal: options.signal });
