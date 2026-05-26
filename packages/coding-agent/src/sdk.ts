@@ -846,7 +846,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		return { ttsrManager, rulebookRules, alwaysApplyRules };
 	});
 
-	const contextFiles = await logger.time(
+	let contextFiles = await logger.time(
 		"discoverContextFiles",
 		async () => options.contextFiles ?? (await discoverContextFiles(cwd, agentDir)),
 	);
@@ -1598,6 +1598,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			onPayload,
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
+			onNewSession: async () => {
+				contextFiles = await discoverContextFiles(cwd, agentDir);
+			},
 			mcpDiscoveryEnabled,
 			initialSelectedMCPToolNames,
 			defaultSelectedMCPToolNames,

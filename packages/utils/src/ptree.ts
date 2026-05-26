@@ -227,7 +227,7 @@ export class ChildProcess<In extends InMask = InMask> {
 		return text;
 	}
 
-	async blob(): Promise<Blob> {
+	async blob() {
 		const p = new Response(this.stdout).blob();
 		if (this.#nothrow) return p;
 		const [blob] = await Promise.all([p, this.exitedCleanly]);
