@@ -1078,7 +1078,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// Add web search tools
 		if (options.toolNames?.includes("web_search")) {
-			customTools.push(...getSearchTools());
+			customTools.push(...getSearchTools(toolSession));
 		}
 
 		// Discover and load custom tools from .omp/tools/, .claude/tools/, etc.

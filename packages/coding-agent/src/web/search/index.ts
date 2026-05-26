@@ -1,23 +1,31 @@
 /**
  * Unified Web Search Tool
  *
- * Single tool supporting Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, Codex, Tavily, Kagi, Z.AI, SearXNG, and Synthetic
- * providers with provider-specific parameters exposed conditionally.
+ * Single tool supporting Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, Codex,
+ * Tavily, Kagi, Z.AI, SearXNG, Synthetic, and DuckDuckGo providers with provider-specific
+ * parameters exposed conditionally.
  *
+ * When a provider returns raw results without a synthesized answer (e.g. DuckDuckGo, Brave, Exa),
+ * and a "search" model role is configured, results are summarized via a cheap/fast LLM.
  */
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { StringEnum } from "@oh-my-pi/pi-ai";
-import { prompt } from "@oh-my-pi/pi-utils";
+import { type Api, completeSimple, type Model, StringEnum } from "@oh-my-pi/pi-ai";
+import { logger, prompt } from "@oh-my-pi/pi-utils";
 import { Type } from "@sinclair/typebox";
+import type { ModelRegistry } from "../../config/model-registry";
+import { MODEL_ROLE_IDS } from "../../config/model-registry";
+import { resolveRoleSelection } from "../../config/model-resolver";
+import type { Settings } from "../../config/settings";
 import type { CustomTool, CustomToolContext, RenderResultOptions } from "../../extensibility/custom-tools/types";
 import type { Theme } from "../../modes/theme/theme";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
+import searchSummarizePrompt from "../../prompts/tools/search-summarize.md" with { type: "text" };
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
 import type { ToolSession } from "../../tools";
 import { formatAge } from "../../tools/render-utils";
 import { getSearchProvider, resolveProviderChain, type SearchProvider } from "./provider";
 import { renderSearchCall, renderSearchResult, type SearchRenderDetails } from "./render";
-import type { SearchProviderId, SearchResponse } from "./types";
+import type { SearchProviderId, SearchResponse, SearchSource } from "./types";
 import { SearchProviderError } from "./types";
 
 /** Web search tool parameters schema */
@@ -48,6 +56,12 @@ export type SearchToolParams = {
 
 export interface SearchQueryParams extends SearchToolParams {
 	provider?: SearchProviderId | "auto";
+}
+
+/** Context for optional LLM-based summarization of raw search results. */
+interface SummarizationContext {
+	modelRegistry: ModelRegistry;
+	settings: Settings;
 }
 
 function formatProviderList(providers: SearchProvider[]): string {
@@ -132,10 +146,11 @@ function formatForLLM(response: SearchResponse): string {
 	return parts.join("\n");
 }
 
-/** Execute web search */
+/** Execute web search, optionally summarizing raw results via a cheap model. */
 async function executeSearch(
 	_toolCallId: string,
 	params: SearchQueryParams,
+	summarization?: SummarizationContext,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
 	const providers =
 		params.provider && params.provider !== "auto"
@@ -167,6 +182,14 @@ async function executeSearch(
 				temperature: params.temperature,
 			});
 
+			// If provider returned raw results without an answer, try LLM summarization
+			if (!response.answer && response.sources.length > 0 && summarization) {
+				const answer = await summarizeResults(params.query, response.sources, summarization);
+				if (answer) {
+					response.answer = answer;
+				}
+			}
+
 			const text = formatForLLM(response);
 
 			return {
@@ -191,6 +214,71 @@ async function executeSearch(
 }
 
 /**
+ * Resolve a model for the "search" role, falling back through smol and other roles.
+ * Returns undefined if no model is available (summarization will be skipped).
+ */
+async function resolveSearchModel(
+	ctx: SummarizationContext,
+): Promise<{ model: Model<Api>; apiKey: string } | undefined> {
+	const available = ctx.modelRegistry.getAvailable();
+	const resolved = resolveRoleSelection(
+		["search", "smol", ...MODEL_ROLE_IDS],
+		ctx.settings,
+		available,
+		ctx.modelRegistry,
+	);
+	if (!resolved?.model) return undefined;
+	const apiKey = await ctx.modelRegistry.getApiKey(resolved.model);
+	if (!apiKey) return undefined;
+	return { model: resolved.model, apiKey };
+}
+
+/**
+ * Summarize raw search results using a cheap/fast model.
+ * Returns the synthesized answer, or undefined on failure.
+ */
+async function summarizeResults(
+	query: string,
+	sources: SearchSource[],
+	ctx: SummarizationContext,
+): Promise<string | undefined> {
+	try {
+		const resolved = await resolveSearchModel(ctx);
+		if (!resolved) return undefined;
+
+		const userContent = prompt.render(searchSummarizePrompt, {
+			query,
+			results: sources.map((src, i) => ({
+				index: i + 1,
+				title: src.title,
+				url: src.url,
+				snippet: src.snippet,
+			})),
+		});
+
+		const response = await completeSimple(
+			resolved.model,
+			{
+				systemPrompt: webSearchSystemPrompt,
+				messages: [{ role: "user", content: userContent, timestamp: Date.now() }],
+			},
+			{ apiKey: resolved.apiKey, maxTokens: 4096 },
+		);
+
+		const text = response.content
+			.filter(block => block.type === "text")
+			.map(block => block.text)
+			.join("\n")
+			.trim();
+
+		return text || undefined;
+	} catch (err) {
+		logger.warn("Search summarization failed, returning raw results", { error: err });
+		return undefined;
+	}
+}
+
+/**
  * Execute a web search query for CLI/testing workflows.
  */
 export async function runSearchQuery(
@@ -202,8 +290,8 @@ export async function runSearchQuery(
 /**
  * Web search tool implementation.
  *
- * Supports Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, Codex, Z.AI, SearXNG, and Synthetic providers with automatic fallback.
- * Session is accepted for interface consistency but not used.
+ * Supports all providers with automatic fallback.
+ * When a model is available for the "search" role, raw results are summarized.
  */
 export class SearchTool implements AgentTool<typeof webSearchSchema, SearchRenderDetails> {
 	readonly name = "web_search";
@@ -211,9 +299,13 @@ export class SearchTool implements AgentTool<typeof webSearchSchema, SearchRende
 	readonly description: string;
 	readonly parameters = webSearchSchema;
 	readonly strict = true;
+	#summarization?: SummarizationContext;
 
-	constructor(_session: ToolSession) {
+	constructor(session: ToolSession) {
 		this.description = prompt.render(webSearchDescription);
+		if (session.modelRegistry && session.settings) {
+			this.#summarization = { modelRegistry: session.modelRegistry, settings: session.settings };
+		}
 	}
 
 	async execute(
@@ -223,38 +315,46 @@ export class SearchTool implements AgentTool<typeof webSearchSchema, SearchRende
 		_onUpdate?: AgentToolUpdateCallback<SearchRenderDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<SearchRenderDetails>> {
-		return executeSearch(_toolCallId, params);
+		return executeSearch(_toolCallId, params, this.#summarization);
 	}
 }
 
-/** Web search tool as CustomTool (for TUI rendering support) */
-export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchRenderDetails> = {
-	name: "web_search",
-	label: "Web Search",
-	description: prompt.render(webSearchDescription),
-	parameters: webSearchSchema,
+/** Create web search CustomTool with optional summarization support. */
+function createWebSearchCustomTool(
+	summarization?: SummarizationContext,
+): CustomTool<typeof webSearchSchema, SearchRenderDetails> {
+	return {
+		name: "web_search",
+		label: "Web Search",
+		description: prompt.render(webSearchDescription),
+		parameters: webSearchSchema,
 
-	async execute(
-		toolCallId: string,
-		params: SearchToolParams,
-		_onUpdate,
-		_ctx: CustomToolContext,
-		_signal?: AbortSignal,
-	) {
-		return executeSearch(toolCallId, params);
-	},
+		async execute(
+			toolCallId: string,
+			params: SearchToolParams,
+			_onUpdate,
+			_ctx: CustomToolContext,
+			_signal?: AbortSignal,
+		) {
+			return executeSearch(toolCallId, params, summarization);
+		},
 
-	renderCall(args: SearchToolParams, options: RenderResultOptions, theme: Theme) {
-		return renderSearchCall(args, options, theme);
-	},
+		renderCall(args: SearchToolParams, options: RenderResultOptions, theme: Theme) {
+			return renderSearchCall(args, options, theme);
+		},
 
-	renderResult(result, options: RenderResultOptions, theme: Theme) {
-		return renderSearchResult(result, options, theme);
-	},
-};
+		renderResult(result, options: RenderResultOptions, theme: Theme) {
+			return renderSearchResult(result, options, theme);
+		},
+	};
+}
 
-export function getSearchTools(): CustomTool<any, any>[] {
-	return [webSearchCustomTool];
+export function getSearchTools(session?: ToolSession): CustomTool<any, any>[] {
+	const summarization =
+		session?.modelRegistry && session?.settings
+			? { modelRegistry: session.modelRegistry, settings: session.settings }
+			: undefined;
+	return [createWebSearchCustomTool(summarization)];
 }
 
 export { getSearchProvider, setPreferredSearchProvider } from "./provider";

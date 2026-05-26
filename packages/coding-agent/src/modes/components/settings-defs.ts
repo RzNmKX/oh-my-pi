@@ -349,6 +349,7 @@ const OPTION_PROVIDERS: Partial<Record<SettingPath, OptionProvider>> = {
 		{ value: "synthetic", label: "Synthetic", description: "Requires SYNTHETIC_API_KEY" },
 		{ value: "parallel", label: "Parallel", description: "Requires PARALLEL_API_KEY" },
 		{ value: "searxng", label: "SearXNG", description: "Self-hosted metasearch; set searxng.endpoint" },
+		{ value: "duckduckgo", label: "DuckDuckGo", description: "Free, no API key required (HTML scraping)" },
 	],
 	"providers.image": [
 		{

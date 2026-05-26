@@ -33,5 +33,15 @@
 		"gemini-3-1-pro",
 		"gemini-3-pro",
 		"gemini-3"
+	],
+	"search": [
+		"cerebras/zai-glm-4.7",
+		"cerebras/zai-glm-4.6",
+		"cerebras/zai-glm",
+		"haiku-4-5",
+		"haiku-4.5",
+		"haiku",
+		"flash",
+		"mini"
 	]
 }
