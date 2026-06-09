@@ -243,6 +243,10 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				"content-type": "application/json",
 				accept: "application/vnd.amazon.eventstream",
 			};
+			const bedrockUserAgent = $env.BEDROCK_USER_AGENT;
+			if (bedrockUserAgent) {
+				baseHeaders["user-agent"] = bedrockUserAgent;
+			}
 
 			const bearerToken = resolveBearerToken(options);
 			let requestHeaders: Record<string, string>;

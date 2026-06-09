@@ -3114,6 +3114,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"providers.bedrockUserAgent": {
+		type: "string",
+		default: "",
+		ui: {
+			tab: "providers",
+			label: "Bedrock User Agent",
+			description: "Custom User-Agent header for AWS Bedrock requests (e.g. claude-cli/2.1.112 (external, cli))",
+		},
+	},
+
 	// Exa
 	"exa.enabled": {
 		type: "boolean",

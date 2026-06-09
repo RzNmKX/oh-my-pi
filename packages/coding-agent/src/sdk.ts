@@ -1033,6 +1033,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		setPreferredImageProvider(imageProvider);
 	}
 
+	const bedrockUserAgent = settings.get("providers.bedrockUserAgent");
+	if (bedrockUserAgent) {
+		Bun.env.BEDROCK_USER_AGENT = bedrockUserAgent;
+	}
+
 	const sessionManager =
 		options.sessionManager ??
 		logger.time("sessionManager", () =>
