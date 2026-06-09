@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `bedrock-openai-responses` API (GPT-5.5 on AWS Bedrock `bedrock-mantle`) to `buildNamedToolChoice`, so forced single-tool selection maps to the OpenAI Responses `{ type: "function", name }` shape for `amazon-bedrock-openai/openai.gpt-5.5`.
+
 ## [15.10.8] - 2026-06-09
 
 ### Added

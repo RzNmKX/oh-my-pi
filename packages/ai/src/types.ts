@@ -1,6 +1,7 @@
 import type { ZodType, z } from "zod/v4";
 import type { ApiKey } from "./auth-retry";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
+import type { BedrockOpenAIOptions } from "./providers/amazon-bedrock-openai";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses";
 import type { CursorOptions } from "./providers/cursor";
@@ -53,6 +54,7 @@ export type KnownApi =
 	| "azure-openai-responses"
 	| "anthropic-messages"
 	| "bedrock-converse-stream"
+	| "bedrock-openai-responses"
 	| "google-generative-ai"
 	| "google-gemini-cli"
 	| "google-vertex"
@@ -62,6 +64,7 @@ export type Api = KnownApi | (string & {});
 export interface ApiOptionsMap {
 	"anthropic-messages": AnthropicOptions;
 	"bedrock-converse-stream": BedrockOptions;
+	"bedrock-openai-responses": BedrockOpenAIOptions;
 	"openai-completions": OpenAICompletionsOptions;
 	"openai-responses": OpenAIResponsesOptions;
 	"openai-codex-responses": OpenAICodexResponsesOptions;

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `amazon-bedrock-openai` provider (`bedrock-openai-responses` API) for GPT-5.5 on AWS Bedrock's `bedrock-mantle` endpoint: OpenAI Responses wire protocol over AWS SigV4 (`service=bedrock`, same credential chain as `amazon-bedrock`, no API key), model ref `amazon-bedrock-openai/openai.gpt-5.5`. Region is pinned to `us-east-2` (the only region hosting gpt-5.5 — no cross-region inference); `AWS_REGION`/`AWS_DEFAULT_REGION` are intentionally not consulted, since a shell pointed at another region routed to a regional endpoint that 404s with "model does not exist". An explicit `region` option still overrides the pin. bedrock-mantle currently returns a generic `server_error` (`response.failed`) when *finalizing* any response that contains a freshly generated function_call, even though it streams the complete tool call first and accepts those tool-call items in a follow-up input; the provider salvages the completed tool call (ends the turn as `toolUse` instead of failing) so multi-turn tool use works end-to-end.
+
 ## [15.10.8] - 2026-06-09
 ### Added
 
