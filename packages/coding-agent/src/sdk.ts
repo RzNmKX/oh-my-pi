@@ -1239,7 +1239,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		return result;
 	};
-	const [contextFiles, resolvedWorkspaceTree] = await Promise.all([
+	let [contextFiles, resolvedWorkspaceTree] = await Promise.all([
 		contextFilesPromise,
 		raceWithDeadline("buildWorkspaceTree", workspaceTreePromise),
 	]);
@@ -2205,6 +2205,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			onResponse,
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
+			onNewSession: async () => {
+				contextFiles = await discoverContextFiles(cwd, agentDir);
+			},
 			reloadSshTool,
 			requestedToolNames: requestedToolNameSet,
 			getMcpServerInstructions: mcpManager
