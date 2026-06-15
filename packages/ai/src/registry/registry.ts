@@ -2,6 +2,7 @@ import type { KnownProvider } from "@oh-my-pi/pi-catalog";
 import { aimlApiProvider } from "./aimlapi";
 import { alibabaCodingPlanProvider } from "./alibaba-coding-plan";
 import { amazonBedrockProvider } from "./amazon-bedrock";
+import { amazonBedrockOpenaiProvider } from "./amazon-bedrock-openai";
 import { anthropicProvider } from "./anthropic";
 import { azureProvider } from "./azure";
 import { cerebrasProvider } from "./cerebras";
@@ -139,6 +140,7 @@ const ALL = [
 	mistralProvider,
 	minimaxProvider,
 	amazonBedrockProvider,
+	amazonBedrockOpenaiProvider,
 ];
 
 export type RegistryDef = (typeof ALL)[number];

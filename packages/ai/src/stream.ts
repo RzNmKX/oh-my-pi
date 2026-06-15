@@ -20,6 +20,7 @@ import * as AIError from "./error";
 import { ProviderHttpError } from "./error";
 import { isUsageLimitOutcome } from "./error/rate-limit";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
+import type { BedrockOpenAIOptions } from "./providers/amazon-bedrock-openai";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { CursorOptions } from "./providers/cursor";
 import type { DevinOptions } from "./providers/devin";
@@ -45,6 +46,7 @@ import {
 	streamAnthropic,
 	streamAzureOpenAIResponses,
 	streamBedrock,
+	streamBedrockOpenAI,
 	streamCursor,
 	streamDevin,
 	streamGoogle,
@@ -745,6 +747,13 @@ function streamDispatch<TApi extends Api>(
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
 		return streamBedrock(model as Model<"bedrock-converse-stream">, context, requestOptions as BedrockOptions);
+	} else if (model.api === "bedrock-openai-responses") {
+		// Bedrock OpenAI (bedrock-mantle) also uses SigV4, no API keys.
+		return streamBedrockOpenAI(
+			model as Model<"bedrock-openai-responses">,
+			context,
+			(requestOptions || {}) as BedrockOpenAIOptions,
+		);
 	}
 
 	const apiKey = requestOptions.apiKey || getEnvApiKey(model.provider);
@@ -1081,6 +1090,10 @@ export function streamSimple<TApi extends Api>(
 		return stream(model, context, providerOptions);
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
+		const providerOptions = mapOptionsForApi(model, requestOptions, undefined);
+		return stream(model, context, providerOptions);
+	} else if (model.api === "bedrock-openai-responses") {
+		// Bedrock OpenAI (bedrock-mantle) also uses SigV4 credentials, no API keys.
 		const providerOptions = mapOptionsForApi(model, requestOptions, undefined);
 		return stream(model, context, providerOptions);
 	}
@@ -1726,6 +1739,13 @@ function mapOptionsForApi<TApi extends Api>(
 				chatModelUid: resolveWireModelId(devinModel, effort),
 			});
 		}
+		case "bedrock-openai-responses":
+			return castApi<"bedrock-openai-responses">({
+				...base,
+				reasoning: resolveOpenAiReasoningEffort(model, options),
+				toolChoice: options?.toolChoice,
+				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
+			});
 		default:
 			throw new AIError.ConfigurationError(`Unhandled API in mapOptionsForApi: ${model.api}`);
 	}

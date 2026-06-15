@@ -78,6 +78,10 @@ export const CATALOG_PROVIDERS = [
 		defaultModel: "us.anthropic.claude-opus-4-8",
 	},
 	{
+		id: "amazon-bedrock-openai",
+		defaultModel: "openai.gpt-5.5",
+	},
+	{
 		id: "anthropic",
 		defaultModel: "claude-opus-4-8",
 		createModelManagerOptions: (config: ModelManagerConfig) => anthropicModelManagerOptions(config),

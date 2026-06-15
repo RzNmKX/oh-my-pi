@@ -1,6 +1,5 @@
 export * from "@oh-my-pi/pi-catalog/effort";
 export * from "@oh-my-pi/pi-catalog/types";
-
 import type {
 	DeleteArgs,
 	DeleteResult,
@@ -24,6 +23,7 @@ import type { Type } from "arktype";
 import type { ZodType, z } from "zod/v4";
 import type { ApiKey } from "./auth-retry";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
+import type { BedrockOpenAIOptions } from "./providers/amazon-bedrock-openai";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { StopDetails } from "./providers/anthropic-wire";
 import type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses";
@@ -56,9 +56,11 @@ export type { AssistantMessageEventStream } from "./utils/event-stream";
  */
 export const OPENAI_MAX_OUTPUT_TOKENS = 64000;
 
+
 export interface ApiOptionsMap {
 	"anthropic-messages": AnthropicOptions;
 	"bedrock-converse-stream": BedrockOptions;
+	"bedrock-openai-responses": BedrockOpenAIOptions;
 	"openai-completions": OpenAICompletionsOptions;
 	"openai-responses": OpenAIResponsesOptions;
 	openrouter: OpenAIResponsesOptions | OpenAICompletionsOptions;

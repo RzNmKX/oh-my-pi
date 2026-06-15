@@ -16,7 +16,8 @@ export function buildNamedToolChoice(toolName: string, model?: Model<Api>): Tool
 		model.api === "openai-codex-responses" ||
 		model.api === "openai-responses" ||
 		model.api === "openai-completions" ||
-		model.api === "azure-openai-responses"
+		model.api === "azure-openai-responses" ||
+		model.api === "bedrock-openai-responses"
 	) {
 		return { type: "function", name: toolName };
 	}
