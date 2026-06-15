@@ -283,6 +283,11 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				requestHeaders = { ...baseHeaders, ...signed };
 			}
 
+			const bedrockUserAgent = $env.BEDROCK_USER_AGENT;
+			if (bedrockUserAgent) {
+				requestHeaders["user-agent"] = bedrockUserAgent;
+			}
+
 			// Bun's native fetch ceiling is disabled below (`timeout: false`) so
 			// configurable watchdogs govern slow-prefill streams (issue #2422).
 			// Direct callers that bypass `register-builtins` (which installs the
