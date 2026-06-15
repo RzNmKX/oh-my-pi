@@ -19,6 +19,7 @@ export const SEARCH_PROVIDER_ORDER = [
 	"kagi",
 	"synthetic",
 	"searxng",
+	"duckduckgo",
 ] as const;
 
 /** Supported web search providers */
@@ -62,6 +63,7 @@ export const SEARCH_PROVIDER_OPTIONS = [
 	{ value: "kagi", label: "Kagi", description: "Requires KAGI_API_KEY and Kagi Search API beta access" },
 	{ value: "synthetic", label: "Synthetic", description: "Requires SYNTHETIC_API_KEY" },
 	{ value: "searxng", label: "SearXNG", description: "Requires SEARXNG_ENDPOINT or searxng.endpoint" },
+	{ value: "duckduckgo", label: "DuckDuckGo", description: "Free, no API key required (HTML scraping)" },
 ] as const;
 
 export const SEARCH_PROVIDER_LABELS: Record<SearchProviderId, string> = {
@@ -79,6 +81,7 @@ export const SEARCH_PROVIDER_LABELS: Record<SearchProviderId, string> = {
 	kagi: "Kagi",
 	synthetic: "Synthetic",
 	searxng: "SearXNG",
+	duckduckgo: "DuckDuckGo",
 };
 
 export function isSearchProviderId(value: string): value is SearchProviderId {

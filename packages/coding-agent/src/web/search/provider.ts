@@ -94,6 +94,11 @@ const PROVIDER_META: Record<SearchProviderId, ProviderMeta> = {
 		label: SEARCH_PROVIDER_LABELS.searxng,
 		load: async () => new (await import("./providers/searxng")).SearXNGProvider(),
 	},
+	duckduckgo: {
+		id: "duckduckgo",
+		label: SEARCH_PROVIDER_LABELS.duckduckgo,
+		load: async () => new (await import("./providers/duckduckgo")).DuckDuckGoProvider(),
+	},
 };
 
 const instanceCache = new Map<SearchProviderId, SearchProvider>();
