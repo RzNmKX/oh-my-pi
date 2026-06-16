@@ -61,6 +61,12 @@ export interface Args {
 	noTitle?: boolean;
 	autoApprove?: boolean;
 	approvalMode?: "always-ask" | "write" | "yolo";
+	web?: boolean;
+	webHost?: string;
+	webPort?: number;
+	webUrl?: string;
+	webCert?: string;
+	webKey?: string;
 	messages: string[];
 	fileArgs: string[];
 	/** Extension-registered flags this parse recognized — name to value. */
@@ -194,6 +200,8 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.noPty = true;
 		} else if (arg === "--hide-thinking") {
 			result.hideThinking = true;
+		} else if (arg === "--web") {
+			result.web = true;
 		} else if (arg === "--print" || arg === "-p") {
 			result.print = true;
 		} else if (arg === "--no-extensions") {

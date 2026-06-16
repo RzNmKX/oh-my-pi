@@ -5,7 +5,9 @@
  * exponential backoff on transient drops. Fatal relay close codes (room gone,
  * host conflict, room full) and decryption failures never reconnect.
  */
-import { logger } from "@oh-my-pi/pi-utils";
+import * as os from "node:os";
+import * as path from "node:path";
+import { getAgentDir, logger } from "@oh-my-pi/pi-utils";
 import { open, seal } from "./crypto";
 import type { CollabFrame, RelayControlMessage } from "./protocol";
 import { packEnvelope, unpackEnvelope } from "./protocol";
@@ -29,6 +31,48 @@ export interface CollabSocketOptions {
 	key: CryptoKey;
 }
 
+/**
+ * True when `hostname` is this machine itself — loopback or one of its own
+ * network-interface addresses. The `--web` relay always binds locally and its
+ * link host is derived from these interfaces (which may be RFC-1918, CGNAT, a
+ * Tailscale `100.64/10` address, IPv6, etc.), so matching the actual interface
+ * list is more reliable than enumerating private ranges.
+ */
+function isLocalAddress(hostname: string): boolean {
+	if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") return true;
+	const normalized = hostname.replace(/^\[|\]$/g, "").replace(/%.*$/, "");
+	for (const entries of Object.values(os.networkInterfaces())) {
+		for (const entry of entries ?? []) {
+			if (entry.address.replace(/%.*$/, "") === normalized) return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Relax TLS verification when connecting to our own locally-generated HTTPS
+ * relay — the `--web` host serving its own session (see local-tls.ts). Without
+ * this the host rejects its own self-signed cert with a TLS handshake failure;
+ * the cert is a `CA:FALSE` leaf, so it cannot be passed as a trust anchor
+ * (`ca`) either. This is scoped to (a) loopback/private-LAN relays where (b)
+ * this machine actually holds the generated cert, so it only ever loosens
+ * verification for a relay we started ourselves. The collab payload is
+ * end-to-end encrypted (AES-GCM, see crypto.ts) independent of TLS, so the
+ * transport channel is not the security boundary here.
+ */
+async function resolveLocalRelayTls(wsUrl: string): Promise<Bun.TLSOptions | undefined> {
+	let hostname: string;
+	try {
+		hostname = new URL(wsUrl).hostname;
+	} catch {
+		return undefined;
+	}
+	if (!isLocalAddress(hostname)) return undefined;
+	const certFile = Bun.file(path.join(getAgentDir(), "collab-web", "local-cert.pem"));
+	if (!(await certFile.exists())) return undefined;
+	return { rejectUnauthorized: false };
+}
+
 export class CollabSocket {
 	/** Fires after every successful (re)connect. */
 	onOpen?: () => void;
@@ -40,6 +84,10 @@ export class CollabSocket {
 	readonly #opts: CollabSocketOptions;
 	#ws: WebSocket | null = null;
 	#retryTimer: NodeJS.Timeout | undefined;
+	/** Resolved once: TLS options (local self-signed CA) or undefined for public relays. */
+	#tlsPromise: Promise<Bun.TLSOptions | undefined> | undefined;
+	/** True while an async connect is in flight, before `#ws` is assigned. */
+	#connecting = false;
 	#attempt = 0;
 	/** Terminal state: intentional close or fatal failure. Cleared by connect(). */
 	#closed = false;
@@ -59,7 +107,7 @@ export class CollabSocket {
 	}
 
 	connect(): void {
-		if (this.#ws || this.#retryTimer) return;
+		if (this.#ws || this.#retryTimer || this.#connecting) return;
 		this.#closed = false;
 		this.#attempt = 0;
 		this.#openSocket();
@@ -110,7 +158,20 @@ export class CollabSocket {
 	}
 
 	#openSocket(): void {
-		const ws = new WebSocket(`${this.#opts.wsUrl}?role=${this.#opts.role}`);
+		if (this.#connecting || this.#ws) return;
+		this.#connecting = true;
+		void this.#connectSocket().finally(() => {
+			this.#connecting = false;
+		});
+	}
+
+	async #connectSocket(): Promise<void> {
+		this.#tlsPromise ??= resolveLocalRelayTls(this.#opts.wsUrl);
+		const tls = await this.#tlsPromise;
+		// A close()/fatal failure may have landed while resolving the cert.
+		if (this.#closed) return;
+		const url = `${this.#opts.wsUrl}?role=${this.#opts.role}`;
+		const ws = tls ? new WebSocket(url, { tls }) : new WebSocket(url);
 		ws.binaryType = "arraybuffer";
 		this.#ws = ws;
 		ws.onopen = () => {

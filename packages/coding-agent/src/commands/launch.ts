@@ -130,6 +130,24 @@ export default class Index extends Command {
 		export: Flags.string({
 			description: "Export session file to HTML and exit",
 		}),
+		web: Flags.boolean({
+			description: "Start a local collab web server and host this session",
+		}),
+		"web-host": Flags.string({
+			description: "Host/interface for --web server (default: 127.0.0.1; use 0.0.0.0 for LAN)",
+		}),
+		"web-port": Flags.string({
+			description: "Port for --web server (default: random free port)",
+		}),
+		"web-url": Flags.string({
+			description: "Public browser URL for --web links (use your HTTPS reverse-proxy origin for phones)",
+		}),
+		"web-cert": Flags.string({
+			description: "TLS certificate file for serving --web directly over HTTPS",
+		}),
+		"web-key": Flags.string({
+			description: "TLS key file for serving --web directly over HTTPS",
+		}),
 		"no-title": Flags.boolean({
 			description: "Disable title auto-generation",
 		}),

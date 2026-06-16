@@ -183,6 +183,26 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	"--skills": (result, value) => {
 		result.skills = value.split(",").map(s => s.trim());
 	},
+	"--web-host": (result, value) => {
+		result.webHost = value;
+	},
+	"--web-url": (result, value) => {
+		result.webUrl = value;
+	},
+	"--web-cert": (result, value) => {
+		result.webCert = value;
+	},
+	"--web-key": (result, value) => {
+		result.webKey = value;
+	},
+	"--web-port": (result, value, deps) => {
+		const port = Number(value);
+		if (Number.isInteger(port) && port >= 0 && port <= 65_535) {
+			result.webPort = port;
+		} else {
+			deps.logger.warn("Invalid value passed to --web-port", { value });
+		}
+	},
 	"--approval-mode": (result, value, deps) => {
 		if (value === "always-ask" || value === "write" || value === "yolo") {
 			result.approvalMode = value;

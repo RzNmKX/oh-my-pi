@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `omp --web` to start a local collab web/relay server, auto-host the current session, and print a short pairing URL for phone browsers.
+
 ## [16.0.0] - 2026-06-15
 
 ### Breaking Changes

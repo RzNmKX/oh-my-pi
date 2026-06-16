@@ -57,29 +57,35 @@ async function main(): Promise<void> {
 	// placeholder empty.
 	await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--generate"]);
 	try {
-		await runCommand([
-			"bun",
-			"build",
-			"--target=bun",
-			"--outdir",
-			"dist",
-			"--minify-whitespace",
-			"--minify-syntax",
-			"--keep-names",
-			"--external",
-			"mupdf",
-			"--external",
-			"@oh-my-pi/pi-natives",
-			"--external",
-			"@huggingface/transformers",
-			"--external",
-			"fastembed",
-			"--external",
-			"onnxruntime-node",
-			"--define",
-			'process.env.PI_BUNDLED="true"',
-			"./src/cli.ts",
-		]);
+		// Likewise embed collab-web for `--web`; the npm bundle has no source tree.
+		await runCommand(["bun", "scripts/generate-collab-web-bundle.ts", "--generate"]);
+		try {
+			await runCommand([
+				"bun",
+				"build",
+				"--target=bun",
+				"--outdir",
+				"dist",
+				"--minify-whitespace",
+				"--minify-syntax",
+				"--keep-names",
+				"--external",
+				"mupdf",
+				"--external",
+				"@oh-my-pi/pi-natives",
+				"--external",
+				"@huggingface/transformers",
+				"--external",
+				"fastembed",
+				"--external",
+				"onnxruntime-node",
+				"--define",
+				'process.env.PI_BUNDLED="true"',
+				"./src/cli.ts",
+			]);
+		} finally {
+			await runCommand(["bun", "scripts/generate-collab-web-bundle.ts", "--reset"]);
+		}
 	} finally {
 		await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--reset"]);
 	}

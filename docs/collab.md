@@ -26,6 +26,23 @@ The browser line is click-to-join (an OSC 8 hyperlink to the full `https://` dee
 
 The guest's previous session is restored on `/leave` (or when the host stops).
 
+For a local browser server tied to the current TUI, start omp with:
+
+```
+omp --web
+```
+
+This builds and serves the browser client, hosts the relay at the same origin, auto-starts `/collab`, and prints both the full browser link and a short `/p/<code>` pairing URL.
+
+For phone use on the same LAN, bind all interfaces:
+
+```
+omp --web --web-host 0.0.0.0 --web-port 7443
+```
+
+That picks a LAN IP for the printed phone URL and serves HTTPS/WSS with a generated self-signed certificate. Pass `--web-url https://192.168.1.50:7443` only when you want to force the printed origin. Accept the browser warning on first open. `--web-cert` and `--web-key` override the generated cert.
+
+
 ### Commands
 
 | Command | Effect |

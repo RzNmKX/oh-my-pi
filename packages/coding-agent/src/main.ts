@@ -27,6 +27,7 @@ import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
 import { selectSession } from "./cli/session-picker";
 import { applyStartupCwd } from "./cli/startup-cwd";
+import { type CollabWebLaunch, startCollabWebLaunch } from "./collab/web-launch";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import {
@@ -388,6 +389,7 @@ async function runInteractiveMode(
 	initialImages?: ImageContent[],
 	titleSystemPrompt?: string,
 	joinLink?: string,
+	webLaunch?: CollabWebLaunch,
 ): Promise<void> {
 	const mode = new InteractiveMode(
 		session,
@@ -455,11 +457,25 @@ async function runInteractiveMode(
 			mode.showStatus(notify.message);
 		}
 	}
-
 	// `omp join <link>`: dispatch through the same builtin path as a typed
 	// `/join` so collab guards and error rendering stay in one place.
 	if (joinLink !== undefined) {
 		await executeBuiltinSlashCommand(`/join ${joinLink}`, { ctx: mode });
+	} else if (webLaunch) {
+		await executeBuiltinSlashCommand(`/collab ${webLaunch.relayUrl}`, { ctx: mode });
+		if (mode.collabHost) {
+			const published = webLaunch.publishLink(mode.collabHost.link);
+			const lines = [
+				"Collab web session ready!",
+				`Open on phone: ${published.pairLink}`,
+				`Full browser link: ${published.webLink}`,
+				`Relay/web server: ${webLaunch.webUrl}`,
+			];
+			if (webLaunch.generatedLocalCert) {
+				lines.push("Generated a local self-signed HTTPS cert; accept the browser warning on first open.");
+			}
+			mode.showStatus(lines.join("\n"), { dim: false });
+		}
 	}
 
 	if (initialMessage !== undefined) {
@@ -1015,6 +1031,10 @@ export async function runRootCommand(
 	const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
 	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
 	const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
+	if (parsedArgs.web && !isInteractive) {
+		process.stderr.write(`${chalk.red("--web requires interactive mode")}\n`);
+		process.exit(1);
+	}
 
 	// Initialize discovery system with settings for provider persistence
 	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
@@ -1310,26 +1330,40 @@ export async function runRootCommand(
 				}
 			}
 
+			const webLaunch = parsedArgs.web
+				? await logger.time("startCollabWebLaunch", startCollabWebLaunch, {
+						host: parsedArgs.webHost,
+						port: parsedArgs.webPort,
+						publicUrl: parsedArgs.webUrl,
+						certPath: parsedArgs.webCert,
+						keyPath: parsedArgs.webKey,
+					})
+				: undefined;
 			stopStartupWatchdog();
 			logger.endTiming();
-			await runInteractiveMode(
-				session,
-				VERSION,
-				changelogMarkdown,
-				notifs,
-				versionCheckPromise,
-				initialArgs.messages,
-				setToolUIContext,
-				lspServers,
-				mcpManager,
-				Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork),
-				deps.forceSetupWizard === true,
-				eventBus,
-				initialMessage,
-				initialImages,
-				titleSystemPrompt,
-				parsedArgs.join,
-			);
+			try {
+				await runInteractiveMode(
+					session,
+					VERSION,
+					changelogMarkdown,
+					notifs,
+					versionCheckPromise,
+					initialArgs.messages,
+					setToolUIContext,
+					lspServers,
+					mcpManager,
+					Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork),
+					deps.forceSetupWizard === true,
+					eventBus,
+					initialMessage,
+					initialImages,
+					titleSystemPrompt,
+					parsedArgs.join,
+					webLaunch,
+				);
+			} finally {
+				await webLaunch?.stop();
+			}
 		} else {
 			// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.
 			stopStartupWatchdog();
