@@ -123,10 +123,20 @@ export class CollabHost {
 	#agentsDebounce: Timer | null = null;
 	#busUnsubscribers: (() => void)[] = [];
 	#registryUnsubscribe?: () => void;
+	#onTeardown?: () => void | Promise<void>;
 	#stopped = false;
 
 	constructor(ctx: InteractiveModeContext) {
 		this.#ctx = ctx;
+	}
+
+	/**
+	 * Register a cleanup callback run once when the host tears down (via /collab
+	 * stop, /leave, a session switch, or a non-recoverable relay close). Used by
+	 * `/collab web` to shut down the locally-hosted relay + web server it spun up.
+	 */
+	setOnTeardown(callback: () => void | Promise<void>): void {
+		this.#onTeardown = callback;
 	}
 
 	get link(): string {
@@ -264,13 +274,18 @@ export class CollabHost {
 		this.#ctx.collabHost = undefined;
 		this.#ctx.statusLine.setCollabStatus(null);
 		this.#ctx.ui.requestRender();
+		const onTeardown = this.#onTeardown;
+		this.#onTeardown = undefined;
+		if (onTeardown) await onTeardown();
 	}
 
 	#broadcast(frame: CollabFrame): void {
 		if (this.#stopped || !this.#socket) return;
 		if (this.#ctx.sessionManager.getSessionId() !== this.#sessionId) {
-			void this.stop("session switched");
-			this.#ctx.session.emitNotice("warning", "Collab ended: session switched", "collab");
+			// /resume or a branch switch changed the active session: move collab to
+			// it rather than ending. The triggering frame is dropped because the
+			// re-welcome carries the new session's full state.
+			this.#reanchorToActiveSession();
 			return;
 		}
 		this.#socket.send(frame);
@@ -323,6 +338,21 @@ export class CollabHost {
 		const canWrite = this.#verifyWriteToken(writeToken);
 		this.#peers.set(fromPeer, { name: cleanName, canWrite });
 
+		this.#sendWelcomeTo(fromPeer, canWrite);
+		this.#ctx.session.emitNotice(
+			"info",
+			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
+			"collab",
+		);
+		this.#updateStatusSegment();
+		this.#scheduleStateBroadcast();
+	}
+
+	/**
+	 * Build a full-state welcome snapshot and send it to one peer. Shared by the
+	 * initial join handshake and by re-anchoring after a session switch.
+	 */
+	#sendWelcomeTo(fromPeer: number, canWrite: boolean): void {
 		// Snapshot and send synchronously: no awaits between snapshot and send, so
 		// later entries/events queue behind the welcome on the same socket and the
 		// guest never sees a gap.
@@ -347,13 +377,22 @@ export class CollabHost {
 			},
 			fromPeer,
 		);
-		this.#ctx.session.emitNotice(
-			"info",
-			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
-			"collab",
-		);
+	}
+
+	/**
+	 * Re-point the host at the now-active session after a /resume or branch
+	 * switch and resync every connected guest to it, instead of ending the
+	 * collab. Guests fully reset on a fresh welcome, so re-welcoming each peer
+	 * swaps them onto the resumed transcript in place.
+	 */
+	#reanchorToActiveSession(): void {
+		this.#sessionId = this.#ctx.sessionManager.getSessionId();
+		// Drop the dedupe baseline so the next state broadcast is not suppressed
+		// against the previous session's state.
+		this.#lastStateJson = "";
+		for (const [peerId, peer] of this.#peers) this.#sendWelcomeTo(peerId, peer.canWrite);
+		this.#ctx.session.emitNotice("info", "Collab moved to the resumed session", "collab");
 		this.#updateStatusSegment();
-		this.#scheduleStateBroadcast();
 	}
 
 	#handlePrompt(text: string, images: ImageContent[] | undefined, fromPeer: number): void {

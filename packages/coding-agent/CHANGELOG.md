@@ -5,6 +5,11 @@
 ### Added
 
 - Added `omp --web` to start a local collab web/relay server, auto-host the current session, and print a short pairing URL for phone browsers.
+- Added a `/collab web` slash command to self-host the relay + web client from the prompt mid-session (binds `0.0.0.0` with a generated self-signed cert and prints a phone pairing URL), so a running session can be opened on a phone without a public relay.
+
+### Fixed
+
+- Fixed collab ending with "Collab ended: session switched" after a `/resume` or branch switch; the host now re-anchors to the resumed session and re-welcomes connected guests onto it instead of tearing the session down.
 
 ## [16.0.0] - 2026-06-15
 

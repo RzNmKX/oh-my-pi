@@ -7,6 +7,7 @@ import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import { APP_NAME, setProjectDir } from "@oh-my-pi/pi-utils";
 import { COLLAB_GUEST_ALLOWED_COMMANDS, CollabGuestLink } from "../collab/guest";
 import { CollabHost } from "../collab/host";
+import { startCollabWebLaunch } from "../collab/web-launch";
 import type { SettingPath, SettingValue } from "../config/settings";
 import { settings } from "../config/settings";
 import {
@@ -585,8 +586,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "collab",
 		description: "Share this session live via a relay",
-		inlineHint: "[start|view|stop|status] [relayUrl]",
+		inlineHint: "[start|web|view|stop|status] [relayUrl]",
 		subcommands: [
+			{ name: "web", description: "Self-host the relay + web client on this machine (open on phone over LAN/VPN)" },
 			{ name: "view", description: "Share a read-only link (guests can watch, not prompt)" },
 			{ name: "status", description: "Show link + participants" },
 			{ name: "stop", description: "Stop sharing" },
@@ -633,6 +635,47 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					collabLinkHint(ctx.collabHost, view ? "Read-only collab link" : "Collab session active", view),
 					{ dim: false },
 				);
+				return;
+			}
+			// `/collab web [https://host:port]`: self-host the relay + web client
+			// on this machine (no public relay), mirroring the `--web` startup
+			// flag. Binds 0.0.0.0 with a generated self-signed cert so a phone on
+			// the same LAN/VPN can open it; the optional arg overrides the public
+			// origin for a reverse-proxy/HTTPS setup.
+			if (first === "web") {
+				const override = args.slice(first.length).trim();
+				if (override && !override.includes("://")) {
+					ctx.showError("Usage: /collab web [https://host:port] — the override must be a full http(s):// URL");
+					return;
+				}
+				let webLaunch: Awaited<ReturnType<typeof startCollabWebLaunch>>;
+				try {
+					webLaunch = await startCollabWebLaunch({ host: "0.0.0.0", publicUrl: override || undefined });
+				} catch (err) {
+					ctx.showError(`Failed to start collab web server: ${errorMessage(err)}`);
+					return;
+				}
+				const webHost = new CollabHost(ctx);
+				webHost.setOnTeardown(() => webLaunch.stop());
+				try {
+					await webHost.start(webLaunch.relayUrl);
+				} catch (err) {
+					await webLaunch.stop();
+					ctx.showError(`Failed to start collab session: ${errorMessage(err)}`);
+					return;
+				}
+				ctx.collabHost = webHost;
+				const published = webLaunch.publishLink(webHost.link);
+				const lines = [
+					"Collab web session ready!",
+					`Open on phone: ${published.pairLink}`,
+					`Full browser link: ${published.webLink}`,
+					`Relay/web server: ${webLaunch.webUrl}`,
+				];
+				if (webLaunch.generatedLocalCert) {
+					lines.push("Generated a local self-signed HTTPS cert; accept the browser warning on first open.");
+				}
+				ctx.showStatus(lines.join("\n"), { dim: false });
 				return;
 			}
 			const explicitUrl = first === "start" || view ? args.slice(first.length).trim() : args;
