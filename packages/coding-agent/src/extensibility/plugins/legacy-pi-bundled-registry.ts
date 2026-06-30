@@ -67,6 +67,7 @@ import * as bundledPiAiOauthWafer from "@oh-my-pi/pi-ai/oauth/wafer";
 import * as bundledPiAiOauthXaiOauth from "@oh-my-pi/pi-ai/oauth/xai-oauth";
 import * as bundledPiAiOauthXiaomi from "@oh-my-pi/pi-ai/oauth/xiaomi";
 import * as bundledPiAiProvidersAmazonBedrock from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
+import * as bundledPiAiProvidersAmazonBedrockOpenai from "@oh-my-pi/pi-ai/providers/amazon-bedrock-openai";
 import * as bundledPiAiProvidersAnthropic from "@oh-my-pi/pi-ai/providers/anthropic";
 import * as bundledPiAiProvidersAnthropicClient from "@oh-my-pi/pi-ai/providers/anthropic-client";
 import * as bundledPiAiProvidersAnthropicMessagesServer from "@oh-my-pi/pi-ai/providers/anthropic-messages-server";
@@ -1099,6 +1100,9 @@ export const BUNDLED_PI_REGISTRY: Readonly<Record<string, Readonly<Record<string
 	"@oh-my-pi/pi-ai/auth-gateway/http": bundledPiAiAuthGatewayHttp as unknown as Readonly<Record<string, unknown>>,
 	"@oh-my-pi/pi-ai/auth-gateway/server": bundledPiAiAuthGatewayServer as unknown as Readonly<Record<string, unknown>>,
 	"@oh-my-pi/pi-ai/auth-gateway/types": bundledPiAiAuthGatewayTypes as unknown as Readonly<Record<string, unknown>>,
+	"@oh-my-pi/pi-ai/providers/amazon-bedrock-openai": bundledPiAiProvidersAmazonBedrockOpenai as unknown as Readonly<
+		Record<string, unknown>
+	>,
 	"@oh-my-pi/pi-ai/providers/amazon-bedrock": bundledPiAiProvidersAmazonBedrock as unknown as Readonly<
 		Record<string, unknown>
 	>,

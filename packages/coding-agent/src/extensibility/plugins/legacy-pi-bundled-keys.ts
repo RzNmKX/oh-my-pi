@@ -44,6 +44,7 @@ export const BUNDLED_PI_REGISTRY_KEYS: ReadonlySet<string> = new Set([
 	"@oh-my-pi/pi-ai/auth-gateway/http",
 	"@oh-my-pi/pi-ai/auth-gateway/server",
 	"@oh-my-pi/pi-ai/auth-gateway/types",
+	"@oh-my-pi/pi-ai/providers/amazon-bedrock-openai",
 	"@oh-my-pi/pi-ai/providers/amazon-bedrock",
 	"@oh-my-pi/pi-ai/providers/anthropic-client",
 	"@oh-my-pi/pi-ai/providers/anthropic-messages-server-schema",
