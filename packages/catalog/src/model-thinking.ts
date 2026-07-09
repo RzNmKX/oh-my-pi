@@ -610,7 +610,8 @@ function inferFallbackEfforts<TApi extends Api>(spec: ModelSpec<TApi>, compat: C
 	if (
 		spec.api === "openai-responses" ||
 		spec.api === "openai-codex-responses" ||
-		spec.api === "azure-openai-responses"
+		spec.api === "azure-openai-responses" ||
+		spec.api === "bedrock-openai-responses"
 	) {
 		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
 	}

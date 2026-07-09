@@ -24,6 +24,7 @@ const BUILTIN_API_IDS = [
 	"azure-openai-responses",
 	"anthropic-messages",
 	"bedrock-converse-stream",
+	"bedrock-openai-responses",
 	"google-generative-ai",
 	"google-gemini-cli",
 	"google-vertex",

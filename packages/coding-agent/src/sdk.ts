@@ -1280,6 +1280,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Initialize provider preferences from settings
 	applyProviderGlobalsFromSettings(settings);
 
+	const bedrockUserAgent = settings.get("providers.bedrockUserAgent");
+	if (bedrockUserAgent) {
+		Bun.env.BEDROCK_USER_AGENT = bedrockUserAgent;
+	}
+
 	const sessionManager =
 		options.sessionManager ??
 		logger.time("sessionManager", () =>

@@ -3,6 +3,7 @@ import { aimlApiProvider } from "./aimlapi";
 import { alibabaCodingPlanProvider } from "./alibaba-coding-plan";
 import { alibabaTokenPlanProvider } from "./alibaba-token-plan";
 import { amazonBedrockProvider } from "./amazon-bedrock";
+import { amazonBedrockOpenaiProvider } from "./amazon-bedrock-openai";
 import { anthropicProvider } from "./anthropic";
 import { azureProvider } from "./azure";
 import { basetenProvider } from "./baseten";
@@ -152,6 +153,7 @@ const ALL = [
 	mistralProvider,
 	minimaxProvider,
 	amazonBedrockProvider,
+	amazonBedrockOpenaiProvider,
 ];
 
 export type RegistryDef = (typeof ALL)[number];

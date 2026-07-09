@@ -353,6 +353,9 @@ function inferGeneratedApplyPatchToolType(
 	model: ModelSpec<Api>,
 	parsedModel: ParsedModel,
 ): ModelSpec<Api>["applyPatchToolType"] {
+	if (model.provider === "amazon-bedrock-openai" && model.api === "bedrock-openai-responses") {
+		return "freeform";
+	}
 	if (parsedModel.family !== "openai" || parsedModel.version.major !== 5) {
 		return undefined;
 	}
