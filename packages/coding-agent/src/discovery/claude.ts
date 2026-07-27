@@ -1,7 +1,8 @@
 /**
  * Claude Code Provider
  *
- * Loads configuration from .claude directories.
+ * Loads configuration from .claude directories, plus standalone CLAUDE.md files
+ * discovered by walking up from cwd (Claude Code reads a repo-root CLAUDE.md).
  * Priority: 80 (tool-specific, below builtin but above shared standards)
  */
 import * as path from "node:path";
@@ -33,6 +34,8 @@ const PROVIDER_ID = "claude";
 const DISPLAY_NAME = "Claude Code";
 const PRIORITY = 80;
 const CONFIG_DIR = ".claude";
+/** Dedupe scope for standalone (non-`.claude/`) CLAUDE.md files. */
+const STANDALONE_SCOPE = "claude-md";
 
 /**
  * Get user-level .claude path.
@@ -155,6 +158,39 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 			depth,
 			_source: createSourceMeta(PROVIDER_ID, projectClaudeMd, "project"),
 		});
+	}
+
+	// Standalone CLAUDE.md in the project root (not under .claude/), mirroring how
+	// the agents-md provider walks up from cwd for AGENTS.md. Claude Code reads a
+	// repo-root CLAUDE.md, so a repo carrying only that file would otherwise load
+	// no project context at all.
+	let current = ctx.cwd;
+	while (true) {
+		const candidate = path.join(current, "CLAUDE.md");
+		const baseName = current.split(path.sep).pop() ?? "";
+
+		// Skip dot-directories: `.claude/CLAUDE.md` is already handled above, and
+		// `$HOME/.claude/CLAUDE.md` is the user-level file, not a project one.
+		if (!baseName.startsWith(".")) {
+			const content = await readFile(candidate);
+			if (content !== null) {
+				items.push({
+					path: candidate,
+					content,
+					level: "project",
+					depth: calculateDepth(ctx.cwd, current, path.sep),
+					// Own dedupe scope: a root CLAUDE.md complements AGENTS.md at the
+					// same depth rather than shadowing it (claude outranks agents-md).
+					scope: STANDALONE_SCOPE,
+					_source: createSourceMeta(PROVIDER_ID, candidate, "project"),
+				});
+			}
+		}
+
+		if (current === (ctx.repoRoot ?? ctx.home)) break; // scanned repo root or home, stop
+		const parent = path.dirname(current);
+		if (parent === current) break; // reached filesystem root
+		current = parent;
 	}
 
 	return { items, warnings };
@@ -526,7 +562,7 @@ registerProvider<MCPServer>(mcpCapability.id, {
 registerProvider<ContextFile>(contextFileCapability.id, {
 	id: PROVIDER_ID,
 	displayName: DISPLAY_NAME,
-	description: "Load CLAUDE.md files from .claude/ directories",
+	description: "Load CLAUDE.md files from .claude/ directories and project roots",
 	priority: PRIORITY,
 	load: loadContextFiles,
 });
