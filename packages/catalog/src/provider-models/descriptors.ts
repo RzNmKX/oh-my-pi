@@ -101,7 +101,7 @@ export const CATALOG_PROVIDERS = [
 	},
 	{
 		id: "amazon-bedrock-openai",
-		defaultModel: "openai.gpt-5.5",
+		defaultModel: "openai.gpt-5.6-sol",
 	},
 	{
 		id: "anthropic",
@@ -349,6 +349,13 @@ export const CATALOG_PROVIDERS = [
 		envVars: ["OPENROUTER_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => openrouterModelManagerOptions(config),
 		catalogDiscovery: { label: "OpenRouter", allowUnauthenticated: true },
+	},
+	{
+		// Foundry's proxy publishes no `/models` endpoint, so the catalog is the
+		// static seed in openai-compat.ts and there is no model manager to run.
+		id: "palantir-foundry",
+		defaultModel: "gpt-5.6-sol",
+		envVars: ["PALANTIR_API_KEY"],
 	},
 	{
 		id: "qianfan",

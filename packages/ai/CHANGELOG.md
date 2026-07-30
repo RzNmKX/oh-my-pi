@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Palantir Foundry to the API-key login provider catalog (`omp login palantir-foundry`), plus a `responses` API-key validation strategy for gateways that only speak `/responses`. Foundry's chat-completions surface rejects the legacy `max_tokens`/`temperature` probe and it serves no `/models` endpoint, so the pasted token is validated with a minimal Responses ping.
+
 ## [17.1.6] - 2026-07-27
 
 ### Added

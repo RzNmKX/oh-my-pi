@@ -31,6 +31,7 @@ import { PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
 import {
 	ALIBABA_TOKEN_PLAN_STATIC_MODELS,
 	ANTHROPIC_CURATED_FALLBACK_MODELS,
+	BEDROCK_OPENAI_GPT56_MODELS,
 	buildFireworksFastSeed,
 	buildXaiOAuthStaticSeed,
 	clampFireworksKimiMaxTokens,
@@ -41,6 +42,7 @@ import {
 	META_MUSE_STATIC_MODELS,
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
 	mapModelsDevToModels,
+	PALANTIR_FOUNDRY_STATIC_MODELS,
 	projectOpenAIProReasoningAliases,
 	SAKANA_FUGU_STATIC_MODELS,
 	stripFireworksDeepSeekThinkingToggle,
@@ -578,6 +580,14 @@ async function generateModels() {
 	// surfaces them; the seed projects each base entry into a fast variant.
 	// Deduped behind any identical previous-snapshot entry.
 	allModels.push(...buildFireworksFastSeed());
+	// Seed the two OpenAI-model proxies that publish no catalog endpoint at all:
+	// Palantir Foundry's XOS proxy (`GET /models` -> 404) and Bedrock's
+	// `bedrock-mantle` Responses surface (SigV4, no list API). Neither provider
+	// can ever be discovered, so without these seeds their models never reach
+	// models.json. Limits and effort ladders are probe-verified; see the seed
+	// definitions in provider-models/openai-compat.ts.
+	allModels.push(...PALANTIR_FOUNDRY_STATIC_MODELS);
+	allModels.push(...BEDROCK_OPENAI_GPT56_MODELS);
 
 	const specialDiscoverySources = [
 		{ label: "Antigravity", providerId: "google-antigravity", authoritative: false, fetch: fetchAntigravityModels },

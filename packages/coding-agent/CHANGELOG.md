@@ -5,6 +5,7 @@
 ### Added
 
 - Added standalone `CLAUDE.md` discovery: the Claude provider now walks up from cwd for a project-root `CLAUDE.md` (as Claude Code does) in addition to `.claude/CLAUDE.md`, so a repo carrying only a root-level `CLAUDE.md` no longer starts with zero project context. Context files gained an optional `scope` dedupe field, which keeps a root `CLAUDE.md` alongside `AGENTS.md` at the same depth instead of shadowing it; `.claude/CLAUDE.md` keeps its existing precedence over `AGENTS.md`.
+- Added `PALANTIR_API_KEY` to the documented provider environment variables (`omp --help`), for the new `palantir-foundry` provider.
 
 ## [17.1.6] - 2026-07-27
 

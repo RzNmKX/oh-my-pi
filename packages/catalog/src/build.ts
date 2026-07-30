@@ -81,6 +81,10 @@ export function buildCompat(spec: ModelSpec<Api>): CompatOf<Api> {
 		case "openai-responses":
 		case "azure-openai-responses":
 		case "openai-codex-responses":
+		// bedrock-mantle serves the stock OpenAI Responses wire shape, so it needs
+		// the same resolved compat record; without it `model.compat` is undefined
+		// and every request throws on `compat.supportsSamplingParams`.
+		case "bedrock-openai-responses":
 			return buildOpenAIResponsesCompat(spec as ModelSpec<"openai-responses">);
 		case "anthropic-messages":
 			return buildAnthropicCompat(spec as ModelSpec<"anthropic-messages">);

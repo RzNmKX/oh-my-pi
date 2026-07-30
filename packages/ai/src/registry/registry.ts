@@ -47,6 +47,7 @@ import { openaiCodexDeviceProvider } from "./openai-codex-device";
 import { opencodeGoProvider } from "./opencode-go";
 import { opencodeZenProvider } from "./opencode-zen";
 import { openrouterProvider } from "./openrouter";
+import { palantirFoundryProvider } from "./palantir-foundry";
 import { parallelProvider } from "./parallel";
 import { perplexityProvider } from "./perplexity";
 import { qianfanProvider } from "./qianfan";
@@ -115,6 +116,7 @@ const ALL = [
 	metaProvider,
 	moonshotProvider,
 	cerebrasProvider,
+	palantirFoundryProvider,
 	basetenProvider,
 	fireworksProvider,
 	togetherProvider,

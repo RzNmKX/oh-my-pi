@@ -11,11 +11,19 @@ import {
 	validateAnthropicCompatibleApiKey,
 	validateApiKeyAgainstModelsEndpoint,
 	validateOpenAICompatibleApiKey,
+	validateOpenAIResponsesApiKey,
 } from "./api-key-validation";
 import type { OAuthController } from "./oauth/types";
 
 type ChatCompletionsValidation = {
 	kind: "chat-completions";
+	provider: string;
+	baseUrl: string;
+	model: string;
+};
+
+type ResponsesValidation = {
+	kind: "responses";
 	provider: string;
 	baseUrl: string;
 	model: string;
@@ -47,7 +55,12 @@ export type ApiKeyLoginConfig = {
 	/** Placeholder string for the prompt (e.g. "sk-...", "csk-..."). */
 	placeholder: string;
 	/** Validation strategy, or `null` to skip validation. */
-	validation: ChatCompletionsValidation | AnthropicMessagesValidation | ModelsEndpointValidation | null;
+	validation:
+		| ChatCompletionsValidation
+		| ResponsesValidation
+		| AnthropicMessagesValidation
+		| ModelsEndpointValidation
+		| null;
 };
 
 export function createApiKeyLogin(config: ApiKeyLoginConfig): (options: OAuthController) => Promise<string> {
@@ -79,6 +92,15 @@ export function createApiKeyLogin(config: ApiKeyLoginConfig): (options: OAuthCon
 			options.onProgress?.("Validating API key...");
 			if (config.validation.kind === "chat-completions") {
 				await validateOpenAICompatibleApiKey({
+					provider: config.validation.provider,
+					apiKey: trimmed,
+					baseUrl: config.validation.baseUrl,
+					model: config.validation.model,
+					signal: options.signal,
+					fetch: options.fetch,
+				});
+			} else if (config.validation.kind === "responses") {
+				await validateOpenAIResponsesApiKey({
 					provider: config.validation.provider,
 					apiKey: trimmed,
 					baseUrl: config.validation.baseUrl,

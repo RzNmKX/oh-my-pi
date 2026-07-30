@@ -344,6 +344,13 @@ function getModelDefinedEfforts<TApi extends Api>(
 	if (isSakanaFuguReasoningModel(spec)) {
 		return HIGH_MAX_REASONING_EFFORTS;
 	}
+	// Palantir Foundry's XOS proxy fronts GPT-5.6 on an Azure OpenAI backend
+	// whose effort ladder stops at xhigh: `max` (and `minimal`) come back as
+	// HTTP 400 naming the supported set. Keep the wire-exact four tiers instead
+	// of the five-tier normalization below.
+	if (spec.provider === "palantir-foundry") {
+		return GPT_5_2_PLUS_EFFORTS;
+	}
 	if (isGpt56PlusWireEffortModel(spec)) {
 		// Normalize stale baked/discovered `low..xhigh` surfaces to the
 		// wire-exact five-tier `low..max` ladder.

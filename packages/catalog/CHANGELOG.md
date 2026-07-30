@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `palantir-foundry` provider: Palantir Foundry's XOS LLM proxy (`https://xos.bpx.com/api/v2/llm/proxy/openai/v1`, `PALANTIR_API_KEY`) serving `gpt-5.6-sol`/`-terra`/`-luna` over the OpenAI Responses API. The proxy publishes no `/models` endpoint, so the three models are seeded statically with proxy-reported limits (1,050,000 context / 128,000 output) and its four-tier `low..xhigh` effort ladder — it rejects both `minimal` and `max`, so the GPT-5.6 five-tier normalization is bypassed for this provider. Freeform `apply_patch` custom tools and image input are enabled (both verified against the live proxy).
+- Restored the static `amazon-bedrock-openai` GPT-5.6 seed (`openai.gpt-5.6-sol`/`-terra`/`-luna` on `bedrock-mantle`, 272K context / 64K output). That provider authenticates with SigV4 and has no catalog endpoint, so without an explicit seed its GPT-5.6 rows never reach `models.json`.
+
+### Fixed
+
+- Fixed every `amazon-bedrock-openai` request throwing `undefined is not an object (evaluating 'model.compat.supportsSamplingParams')`: the `bedrock-openai-responses` API was missing from `buildCompat`, so those models were built with `compat: undefined`. The api now resolves the OpenAI Responses compat record like the other Responses surfaces (`CompatOf`/`CompatConfigOf` widened to match), which unbreaks the provider's pre-existing `openai.gpt-5.5` row as well.
+
 ## [17.1.6] - 2026-07-27
 
 ### Added

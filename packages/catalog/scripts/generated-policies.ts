@@ -365,6 +365,12 @@ function inferGeneratedApplyPatchToolType(
 	if (model.provider === "openai-codex" && model.api === "openai-codex-responses") {
 		return "freeform";
 	}
+	// Palantir Foundry's XOS proxy passes OpenAI `type: "custom"` tools straight
+	// through: a freeform `apply_patch` call round-trips as a `custom_tool_call`
+	// with a `*** Begin Patch` body (verified live against gpt-5.6-sol).
+	if (model.provider === "palantir-foundry" && model.api === "openai-responses") {
+		return "freeform";
+	}
 	return undefined;
 }
 

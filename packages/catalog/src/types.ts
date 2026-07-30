@@ -748,6 +748,7 @@ export type CompatConfigOf<TApi extends Api> = TApi extends
 	| "openai-responses"
 	| "azure-openai-responses"
 	| "openai-codex-responses"
+	| "bedrock-openai-responses"
 	? OpenAICompat
 	: TApi extends "anthropic-messages"
 		? AnthropicCompat
@@ -762,7 +763,11 @@ export type CompatOf<TApi extends Api> = TApi extends "openrouter"
 	? ResolvedOpenRouterCompat
 	: TApi extends "openai-completions"
 		? ResolvedOpenAICompat
-		: TApi extends "openai-responses" | "azure-openai-responses" | "openai-codex-responses"
+		: TApi extends
+					| "openai-responses"
+					| "azure-openai-responses"
+					| "openai-codex-responses"
+					| "bedrock-openai-responses"
 			? ResolvedOpenAIResponsesCompat
 			: TApi extends "anthropic-messages"
 				? ResolvedAnthropicCompat
