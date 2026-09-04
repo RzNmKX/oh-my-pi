@@ -55,9 +55,15 @@ interface EvalRenderCellArg {
 }
 
 interface EvalRenderArgs {
+	action?: "execute" | "run" | "edit" | "replay" | "list";
 	language?: string;
 	code?: string;
 	title?: string;
+	cell?: number;
+	edits?: Array<{ old?: string; new?: string }>;
+	from?: number;
+	through?: number;
+	reset?: boolean;
 	cells?: EvalRenderCellArg[];
 	__partialJson?: string;
 }
@@ -95,6 +101,25 @@ function getRenderCells(args: EvalRenderArgs | undefined): EvalRenderCell[] {
 		});
 	}
 	return out;
+}
+
+function formatStoredCellAction(args: EvalRenderArgs): string | undefined {
+	switch (args.action) {
+		case "run":
+			return `Rerun Python cell ${args.cell ?? "?"}`;
+		case "edit": {
+			const count = args.edits?.length;
+			const replacements = count === undefined ? "" : ` (${count} replacement${count === 1 ? "" : "s"})`;
+			return `Edit and rerun Python cell ${args.cell ?? "?"}${replacements}`;
+		}
+		case "replay":
+			return `Replay Python cells ${args.from ?? 1}-${args.through ?? "latest"}${args.reset ? " after reset" : ""}`;
+		case "list":
+			return "List stored Python cells";
+		case "execute":
+		case undefined:
+			return undefined;
+	}
 }
 
 type AgentEventStatus = "pending" | "running" | "completed" | "failed" | "aborted";
@@ -507,7 +532,8 @@ export const evalToolRenderer = {
 
 		if (cells.length === 0) {
 			const promptSym = uiTheme.fg("accent", ">>>");
-			const text = formatTitle(`${promptSym} …`, uiTheme);
+			const action = formatStoredCellAction(args);
+			const text = formatTitle(`${promptSym} ${action ?? "…"}`, uiTheme);
 			return new Text(text, 0, 0);
 		}
 

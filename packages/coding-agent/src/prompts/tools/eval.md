@@ -8,7 +8,23 @@ Work incrementally: imports → define → test → use, each its own cell. Re-r
 {{#if js}}JS runs under **Bun**: globals (`Bun.file`, `Bun.write`, `Bun.$`, `fetch`, `Buffer`) available; top-level `await`/`return` work.{{/if}}
 
 On error, fix and re-run only the failing step.
+{{#if py}}
 
+Python cells:
+- Every ordinary Python call stores one stable, 1-based cell. Stored source survives kernel reset/crash.
+- `run` reruns a stored cell without resending source.
+- `edit` applies exact replacements atomically, then runs the revision.
+- `replay` runs an inclusive range in order; `reset: true` resets once before its first cell.
+- `list` returns exact source, revision, run count, and kernel provenance.
+- Source changes → `action: "edit"`; NEVER reconstruct a whole cell unless unique exact matching requires it.
+
+```json
+{"action":"run","language":"py","cell":2}
+{"action":"edit","language":"py","cell":2,"edits":[{"old":"limit = 10","new":"limit = 20"}]}
+{"action":"replay","language":"py","from":1,"through":3,"reset":true}
+{"action":"list","language":"py"}
+```
+{{/if}}
 <prelude>
 {{#ifAll py js}}Python: sync, kwargs. JS: async, ONE trailing object literal, never positional.{{else}}{{#if py}}Sync; kwargs.{{/if}}{{#if js}}Async; ONE trailing object literal, never positional.{{/if}}{{/ifAll}}
 ```

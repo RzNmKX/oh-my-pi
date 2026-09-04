@@ -6,13 +6,11 @@ import { evalToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import { previewWindowRows } from "@oh-my-pi/pi-coding-agent/tools/render-utils";
 
 /**
- * Defends the bounded code-window contract for eval cells: collapsed views cap
- * the cell source to a viewport-sized TAIL window (the end stays visible, the
- * head is elided behind an "earlier lines" marker) in BOTH the pending preview
- * and the final result, so a long cell neither floods the transcript nor snaps
- * open when the result lands. Only ctrl+o (expanded) uncaps.
+ * Defends pending eval preview contracts: ordinary cells keep a bounded source
+ * tail in pending and final renderings, while source-free Python cell actions
+ * identify the operation instead of rendering an empty placeholder.
  */
-describe("eval renderer: viewport tail window for cell code", () => {
+describe("eval renderer previews", () => {
 	let theme: Theme;
 	const total = previewWindowRows() + 5;
 	const code = Array.from({ length: total }, (_, i) => `value_${i} = ${i}`).join("\n");
@@ -70,5 +68,29 @@ describe("eval renderer: viewport tail window for cell code", () => {
 		expect(rendered).toContain(lastLine);
 		expect(rendered).toContain("earlier line");
 		expect(rendered).not.toContain(firstLine);
+	});
+
+	it("identifies source-free Python cell actions while pending", () => {
+		const render = (args: Parameters<typeof evalToolRenderer.renderCall>[0]): string =>
+			Bun.stripANSI(
+				evalToolRenderer.renderCall(args, { expanded: false, isPartial: true }, theme).render(120).join("\n"),
+			);
+
+		expect(render({ action: "run", language: "py", cell: 2 })).toContain("Rerun Python cell 2");
+		expect(
+			render({
+				action: "edit",
+				language: "py",
+				cell: 2,
+				edits: [
+					{ old: "limit = 10", new: "limit = 20" },
+					{ old: "offset = 0", new: "offset = 20" },
+				],
+			}),
+		).toContain("Edit and rerun Python cell 2 (2 replacements)");
+		expect(render({ action: "replay", language: "py", from: 1, through: 3, reset: true })).toContain(
+			"Replay Python cells 1-3 after reset",
+		);
+		expect(render({ action: "list", language: "py" })).toContain("List stored Python cells");
 	});
 });

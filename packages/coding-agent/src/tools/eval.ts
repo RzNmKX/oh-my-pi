@@ -84,6 +84,9 @@ function enabledEvalLanguages(backends: EvalBackendsAllowance): EvalLanguageToke
 	return EVAL_LANGUAGE_ORDER.filter(lang => allowed[lang]);
 }
 
+const EVAL_ACTION_ORDER = ["execute", "run", "edit", "replay", "list"] as const;
+type EvalAction = (typeof EVAL_ACTION_ORDER)[number];
+
 const evalCellCommonFields = {
 	"title?": type("string").describe('short label shown in transcript (e.g. "imports", "load config")'),
 	"timeout?": type("number").describe("timeout for this eval call in seconds; 0 disables the cell timeout"),
@@ -96,71 +99,110 @@ const evalCellEditSchema = type({
 	new: type("string").describe("replacement text"),
 	"+": "reject",
 });
-const evalRunSchema = type({
-	action: "'run'",
-	language: "'py'",
-	cell: evalCellIndex,
-	...evalCellCommonFields,
-	"+": "reject",
-});
-const evalEditSchema = type({
-	action: "'edit'",
-	language: "'py'",
-	cell: evalCellIndex,
-	edits: evalCellEditSchema.array().atLeastLength(1).describe("atomic exact replacements applied in order"),
-	...evalCellCommonFields,
-	"+": "reject",
-});
-const evalReplaySchema = type({
-	action: "'replay'",
-	language: "'py'",
-	"from?": evalCellIndex.describe("first stored cell to replay; defaults to 1"),
-	"through?": evalCellIndex.describe("last stored cell to replay; defaults to the newest cell"),
-	...evalCellCommonFields,
-	"+": "reject",
-});
-const evalListSchema = type({
-	action: "'list'",
-	language: "'py'",
-	"+": "reject",
-});
-const evalExecuteSchema = type({
-	"action?": type("'execute'").describe("omit for a new cell"),
-	language: type("'py' | 'js'").describe(describeLanguageField(EVAL_LANGUAGE_ORDER)),
-	...evalCellCommonFields,
-	code: type("string").describe(describeCodeField(EVAL_LANGUAGE_ORDER)),
-	"+": "reject",
-});
 
-/**
- * Per-call input. Ordinary Python calls append stored cells; Python cell
- * actions can list, edit, rerun, or replay them. JavaScript remains single-cell.
- * The wire schema narrows languages per session.
- */
-export const evalSchema = evalExecuteSchema
-	.or(evalRunSchema)
-	.or(evalEditSchema)
-	.or(evalReplaySchema)
-	.or(evalListSchema);
-export type EvalToolParams = typeof evalSchema.infer;
-export type EvalExecuteParams = typeof evalExecuteSchema.infer;
-export type EvalCellInput = EvalExecuteParams;
+interface EvalSchemaInput {
+	action?: EvalAction;
+	language: EvalLanguageToken;
+	code?: string;
+	title?: string;
+	timeout?: number;
+	reset?: boolean;
+	cell?: number;
+	edits?: Array<{ old: string; new: string }>;
+	from?: number;
+	through?: number;
+}
 
-function buildEvalSchema(langs: readonly EvalLanguageToken[]): typeof evalSchema {
-	const executeSchema = type({
-		"action?": type("'execute'").describe("omit for a new cell"),
+function evalInputConstraint(params: EvalSchemaInput): string | undefined {
+	const action = params.action ?? "execute";
+	if (action !== "execute" && params.language !== "py") {
+		return `action "${action}" requires language "py"`;
+	}
+	switch (action) {
+		case "execute":
+			if (params.code === undefined) return '"code" is required for a new eval cell';
+			if (
+				params.cell !== undefined ||
+				params.edits !== undefined ||
+				params.from !== undefined ||
+				params.through !== undefined
+			) {
+				return '"cell", "edits", "from", and "through" are invalid for action "execute"';
+			}
+			return undefined;
+		case "run":
+			if (params.cell === undefined) return '"cell" is required for action "run"';
+			if (
+				params.code !== undefined ||
+				params.edits !== undefined ||
+				params.from !== undefined ||
+				params.through !== undefined
+			) {
+				return 'only "cell", "title", "timeout", and "reset" are valid for action "run"';
+			}
+			return undefined;
+		case "edit":
+			if (params.cell === undefined || params.edits === undefined) {
+				return '"cell" and "edits" are required for action "edit"';
+			}
+			if (params.code !== undefined || params.from !== undefined || params.through !== undefined) {
+				return '"code", "from", and "through" are invalid for action "edit"';
+			}
+			return undefined;
+		case "replay":
+			if (params.code !== undefined || params.cell !== undefined || params.edits !== undefined) {
+				return '"code", "cell", and "edits" are invalid for action "replay"';
+			}
+			return undefined;
+		case "list":
+			if (
+				params.code !== undefined ||
+				params.cell !== undefined ||
+				params.edits !== undefined ||
+				params.from !== undefined ||
+				params.through !== undefined ||
+				params.title !== undefined ||
+				params.timeout !== undefined ||
+				params.reset !== undefined
+			) {
+				return 'action "list" accepts only "action" and "language"';
+			}
+			return undefined;
+	}
+}
+
+function buildEvalSchema(langs: readonly EvalLanguageToken[]) {
+	const actions = langs.includes("py") ? EVAL_ACTION_ORDER : (["execute"] as const);
+	const schema = type({
+		"action?": type
+			.enumerated(...actions)
+			.describe("execute a new cell, or manage stored Python cells; omit for a new cell"),
 		language: type.enumerated(...langs).describe(describeLanguageField(langs)),
+		"code?": type("string").describe(describeCodeField(langs)),
+		"cell?": evalCellIndex,
+		"edits?": evalCellEditSchema.array().atLeastLength(1).describe("atomic exact replacements applied in order"),
+		"from?": evalCellIndex.describe("first stored cell to replay; defaults to 1"),
+		"through?": evalCellIndex.describe("last stored cell to replay; defaults to the newest cell"),
 		...evalCellCommonFields,
-		code: type("string").describe(describeCodeField(langs)),
 		"+": "reject",
 	});
-	if (!langs.includes("py")) return executeSchema as unknown as typeof evalSchema;
-	return executeSchema
-		.or(evalRunSchema)
-		.or(evalEditSchema)
-		.or(evalReplaySchema)
-		.or(evalListSchema) as unknown as typeof evalSchema;
+	return schema.narrow((params, ctx) => {
+		const constraint = evalInputConstraint(params);
+		return constraint === undefined || ctx.mustBe(constraint);
+	});
 }
+
+/**
+ * Single-object wire schema for provider compatibility. Cross-field narrowing
+ * preserves the action-specific contract without a provider-rejected root union.
+ */
+export const evalSchema = buildEvalSchema(EVAL_LANGUAGE_ORDER);
+export type EvalToolParams = typeof evalSchema.infer;
+export type EvalExecuteParams = Pick<EvalToolParams, "language" | "title" | "timeout" | "reset"> & {
+	action?: "execute";
+	code: string;
+};
+export type EvalCellInput = EvalExecuteParams;
 
 export type EvalToolResult = {
 	content: Array<{ type: "text"; text: string }>;
@@ -426,6 +468,42 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				code: "display(sorted(data['dependencies']))",
 			},
 		},
+		{
+			caption: "Rerun a stored Python cell without resending source",
+			call: {
+				action: "run",
+				language: "py",
+				cell: 2,
+			},
+		},
+		{
+			caption: "Edit and rerun a stored Python cell",
+			call: {
+				action: "edit",
+				language: "py",
+				cell: 2,
+				edits: [
+					{ old: "data = json.loads(read('package.json'))", new: "data = json.loads(read('tsconfig.json'))" },
+				],
+			},
+		},
+		{
+			caption: "Replay stored Python cells after resetting the kernel",
+			call: {
+				action: "replay",
+				language: "py",
+				from: 1,
+				through: 3,
+				reset: true,
+			},
+		},
+		{
+			caption: "List exact Python cell sources and provenance",
+			call: {
+				action: "list",
+				language: "py",
+			},
+		},
 	];
 	get examples(): readonly ToolExample<typeof evalSchema.infer>[] {
 		const langs = new Set(this.#enabledLanguages());
@@ -528,6 +606,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			switch (params.action) {
 				case "run": {
 					if (!pythonCellStore) throw new ToolError('Python cell actions require language: "py"');
+					if (params.cell === undefined) throw new ToolError('Python cell action "run" requires "cell"');
 					const cell = pythonCellStore.get(params.cell);
 					cells = [
 						{
@@ -544,6 +623,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				}
 				case "edit": {
 					if (!pythonCellStore) throw new ToolError('Python cell actions require language: "py"');
+					if (params.cell === undefined || params.edits === undefined) {
+						throw new ToolError('Python cell action "edit" requires "cell" and "edits"');
+					}
 					const cell = pythonCellStore.edit(params.cell, params.edits);
 					cells = [
 						{
@@ -574,17 +656,19 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				}
 				case "execute":
 				case undefined: {
+					if (params.code === undefined) throw new ToolError('Eval action "execute" requires "code"');
+					const code = params.code;
 					const cellTimeoutMs = toTimeoutMs(params.timeout);
 					let storedCell: PythonCellSnapshot | undefined;
 					if (params.language === "py") {
 						if (!pythonCellStore) throw new ToolError("Python cell storage is unavailable");
-						storedCell = pythonCellStore.append(params.code, { title: params.title, timeout: params.timeout });
+						storedCell = pythonCellStore.append(code, { title: params.title, timeout: params.timeout });
 					}
 					cells = [
 						{
 							index: storedCell ? storedCell.id - 1 : 0,
 							title: params.title,
-							code: params.code,
+							code,
 							timeoutMs: cellTimeoutMs,
 							reset: params.reset ?? false,
 							resolved,

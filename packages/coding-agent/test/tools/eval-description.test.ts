@@ -23,29 +23,51 @@ function makeSession(opts: {
 	} as unknown as ToolSession;
 }
 
-/** Pull the model-facing cell-schema fields (sorted `language` enum + descriptions) from the flat wire schema. */
-function wireCellFields(tool: EvalTool): {
+interface WireProperty {
+	const?: string;
+	enum?: string[];
+	description?: string;
+}
+
+interface EvalWireSchema {
+	type?: string;
+	anyOf?: unknown[];
+	properties?: {
+		action?: WireProperty;
+		language?: WireProperty;
+		code?: WireProperty;
+	};
+}
+
+/** Pull the provider-facing eval fields from its single root object schema. */
+function wireEvalFields(tool: EvalTool): {
+	rootType?: string;
+	hasRootUnion: boolean;
 	languages: string[];
+	actions: string[];
 	languageDescription?: string;
 	codeDescription?: string;
 } {
-	const wire = toolWireSchema(tool as unknown as AiTool) as {
-		properties?: {
-			language?: { enum?: string[]; const?: string; description?: string };
-			code?: { description?: string };
-		};
-	};
-	const props = wire.properties;
-	const language = props?.language;
+	const wire = toolWireSchema(tool as unknown as AiTool) as EvalWireSchema;
+	const language = wire.properties?.language;
+	const action = wire.properties?.action;
 	const languages = Array.isArray(language?.enum)
 		? [...language.enum].sort()
 		: typeof language?.const === "string"
 			? [language.const]
 			: [];
+	const actions = Array.isArray(action?.enum)
+		? [...action.enum]
+		: typeof action?.const === "string"
+			? [action.const]
+			: [];
 	return {
+		rootType: wire.type,
+		hasRootUnion: Array.isArray(wire.anyOf),
 		languages,
+		actions,
 		languageDescription: language?.description,
-		codeDescription: props?.code?.description,
+		codeDescription: wire.properties?.code?.description,
 	};
 }
 
@@ -96,6 +118,16 @@ describe("eval tool description", () => {
 		enabled = false;
 		expect(tool.description).not.toContain("CURRENT PRELUDE DOCUMENTATION");
 	});
+
+	it("documents stored Python cells only when Python is enabled", () => {
+		const python = getEvalToolDescription({ py: true, js: true });
+		expect(python).toContain("Every ordinary Python call stores one stable, 1-based cell.");
+		expect(python).toContain('Source changes → `action: "edit"`');
+		expect(python).toContain("`replay` runs an inclusive range in order");
+
+		const javascript = getEvalToolDescription({ py: false, js: true });
+		expect(javascript).not.toContain("Python cells:");
+	});
 });
 
 describe("eval tool dynamic schema", () => {
@@ -118,15 +150,47 @@ describe("eval tool dynamic schema", () => {
 		}
 	});
 
-	it("advertises exactly py and js in the wire schema", () => {
+	it("advertises one provider-compatible object schema with Python cell actions", () => {
 		const tool = new EvalTool(makeSession({}));
-		const fields = wireCellFields(tool);
+		const fields = wireEvalFields(tool);
+		expect(fields.rootType).toBe("object");
+		expect(fields.hasRootUnion).toBe(false);
 		expect(fields.languages).toEqual(["js", "py"]);
 		expect(fields.languageDescription).toBe('runtime: "py" for the IPython kernel, "js" for the persistent JS VM');
 		expect(fields.codeDescription).toBe("code to run in this eval call, verbatim. Use top-level await freely.");
+		expect(fields.actions).toEqual(["execute", "run", "edit", "replay", "list"]);
 		expect(tool.summary).toBe("Execute Python or JavaScript code in an in-process eval backend");
 		expect(tool.description).not.toMatch(/ruby|julia/i);
-		const exampleLangs = tool.examples.map(ex => ("call" in ex ? ex.call.language : null));
-		expect(exampleLangs).toEqual(["py", "py", "py"]);
+		const exampleActions = tool.examples.map(ex => ("call" in ex ? ex.call.action : null));
+		expect(exampleActions).toEqual([undefined, undefined, undefined, "run", "edit", "replay", "list"]);
+	});
+
+	it("enforces each action contract without a root schema union", () => {
+		const parameters = new EvalTool(makeSession({})).parameters;
+		expect(() => parameters.assert({ language: "py" })).toThrow(/"code" is required/);
+		expect(() => parameters.assert({ action: "run", language: "js", cell: 1 })).toThrow(
+			/action "run" requires language "py"/,
+		);
+		expect(() => parameters.assert({ action: "edit", language: "py", cell: 1 })).toThrow(
+			/"cell" and "edits" are required/,
+		);
+		expect(() => parameters.assert({ action: "list", language: "py", code: "x = 1" })).toThrow(
+			/accepts only "action" and "language"/,
+		);
+		expect(parameters.assert({ action: "run", language: "py", cell: 1 })).toEqual({
+			action: "run",
+			language: "py",
+			cell: 1,
+		});
+	});
+
+	it("omits Python cell actions when only JavaScript is enabled", () => {
+		const tool = new EvalTool(makeSession({ backends: { "eval.py": false, "eval.js": true } }));
+		const fields = wireEvalFields(tool);
+		expect(fields.rootType).toBe("object");
+		expect(fields.hasRootUnion).toBe(false);
+		expect(fields.languages).toEqual(["js"]);
+		expect(fields.actions).toEqual(["execute"]);
+		expect(tool.description).not.toContain("Python cells:");
 	});
 });
