@@ -12,6 +12,12 @@ import { jsBackend, pythonBackend } from "../eval";
 import type { ExecutorBackend, ExecutorBackendResult } from "../eval/backend";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../eval/bridge-timeout";
 import { IdleTimeout } from "../eval/idle-timeout";
+import {
+	getPythonCellStore,
+	type PythonCellRunStatus,
+	type PythonCellSnapshot,
+	type PythonCellStore,
+} from "../eval/py/cell-store";
 import { getEnabledEvalPreludes } from "../eval/preludes";
 import type { BackendProbeOptions } from "../eval/probe";
 import { defaultEvalSessionId } from "../eval/session-id";
@@ -84,35 +90,76 @@ const evalCellCommonFields = {
 	"reset?": type("boolean").describe("wipe this language's kernel before running. Other languages are untouched."),
 };
 
-/**
- * Per-call input: a single cell. State persists within a language across
- * separate eval calls and across tool calls, so each call is one logical step
- * and later calls reuse what earlier ones defined. This static schema carries
- * the full language union for typing; {@link buildEvalSchema} narrows the wire
- * copy per session so disabled backends are never advertised to the model.
- */
-export const evalSchema = type({
+const evalCellIndex = type("number.integer >= 1").describe("stable 1-based Python cell index");
+const evalCellEditSchema = type({
+	old: type("string").describe("exact text to replace; must occur exactly once"),
+	new: type("string").describe("replacement text"),
+	"+": "reject",
+});
+const evalRunSchema = type({
+	action: "'run'",
+	language: "'py'",
+	cell: evalCellIndex,
+	...evalCellCommonFields,
+	"+": "reject",
+});
+const evalEditSchema = type({
+	action: "'edit'",
+	language: "'py'",
+	cell: evalCellIndex,
+	edits: evalCellEditSchema.array().atLeastLength(1).describe("atomic exact replacements applied in order"),
+	...evalCellCommonFields,
+	"+": "reject",
+});
+const evalReplaySchema = type({
+	action: "'replay'",
+	language: "'py'",
+	"from?": evalCellIndex.describe("first stored cell to replay; defaults to 1"),
+	"through?": evalCellIndex.describe("last stored cell to replay; defaults to the newest cell"),
+	...evalCellCommonFields,
+	"+": "reject",
+});
+const evalListSchema = type({
+	action: "'list'",
+	language: "'py'",
+	"+": "reject",
+});
+const evalExecuteSchema = type({
+	"action?": type("'execute'").describe("omit for a new cell"),
 	language: type("'py' | 'js'").describe(describeLanguageField(EVAL_LANGUAGE_ORDER)),
 	...evalCellCommonFields,
 	code: type("string").describe(describeCodeField(EVAL_LANGUAGE_ORDER)),
+	"+": "reject",
 });
-export type EvalToolParams = typeof evalSchema.infer;
-export type EvalCellInput = EvalToolParams;
 
 /**
- * Build a session-scoped copy of the eval schema whose `language` enum and field
- * descriptions advertise only the runtimes enabled for this session. Disabled
- * backends never reach the model: the wire schema, BM25 discovery corpus, and
- * tool description stay in lockstep with {@link resolveEvalBackends}. The static
- * {@link evalSchema} (full union) remains the type-level source of truth.
+ * Per-call input. Ordinary Python calls append stored cells; Python cell
+ * actions can list, edit, rerun, or replay them. JavaScript remains single-cell.
+ * The wire schema narrows languages per session.
  */
+export const evalSchema = evalExecuteSchema
+	.or(evalRunSchema)
+	.or(evalEditSchema)
+	.or(evalReplaySchema)
+	.or(evalListSchema);
+export type EvalToolParams = typeof evalSchema.infer;
+export type EvalExecuteParams = typeof evalExecuteSchema.infer;
+export type EvalCellInput = EvalExecuteParams;
+
 function buildEvalSchema(langs: readonly EvalLanguageToken[]): typeof evalSchema {
-	const schema = type({
+	const executeSchema = type({
+		"action?": type("'execute'").describe("omit for a new cell"),
 		language: type.enumerated(...langs).describe(describeLanguageField(langs)),
-		code: type("string").describe(describeCodeField(langs)),
 		...evalCellCommonFields,
+		code: type("string").describe(describeCodeField(langs)),
+		"+": "reject",
 	});
-	return schema as unknown as typeof evalSchema;
+	if (!langs.includes("py")) return executeSchema as unknown as typeof evalSchema;
+	return executeSchema
+		.or(evalRunSchema)
+		.or(evalEditSchema)
+		.or(evalReplaySchema)
+		.or(evalListSchema) as unknown as typeof evalSchema;
 }
 
 export type EvalToolResult = {
@@ -205,6 +252,7 @@ interface ResolvedEvalCell {
 	timeoutMs: number;
 	reset: boolean;
 	resolved: ResolvedBackend;
+	pythonCellId?: number;
 }
 
 /** Settlement handed from a managed eval job to its foreground waiter. */
@@ -253,16 +301,47 @@ function formatEvalInputLanguage(value: string): string {
 	if (value === "js" || value === "javascript") return "javascript";
 	return value;
 }
+interface EvalToolArgsPreview {
+	action?: "execute" | "run" | "edit" | "replay" | "list";
+	language?: EvalLanguageToken;
+	code?: string;
+	title?: string;
+	cell?: number;
+	edits?: Array<{ old?: string; new?: string }>;
+	from?: number;
+	through?: number;
+}
 
 export class EvalTool implements AgentTool<typeof evalSchema> {
 	readonly name = "eval";
 	readonly approval = "exec" as const;
 	readonly formatApprovalDetails = (args: unknown): string[] => {
-		const params = args as Partial<EvalToolParams>;
+		const params = args as EvalToolArgsPreview;
 		const language =
 			typeof params.language === "string" ? formatEvalInputLanguage(params.language) : "javascript (default)";
-		const code = typeof params.code === "string" ? params.code : "";
-		return [`Language: ${language}`, `Code:\n${truncateForPrompt(code)}`];
+		const lines = [`Language: ${language}`];
+		switch (params.action) {
+			case "list":
+				lines.push("Action: list stored Python cells");
+				break;
+			case "run":
+				lines.push(`Action: rerun Python cell ${params.cell ?? "?"}`);
+				break;
+			case "edit":
+				lines.push(
+					`Action: edit and rerun Python cell ${params.cell ?? "?"}`,
+					`Edits:\n${truncateForPrompt(JSON.stringify(params.edits ?? [], null, 2))}`,
+				);
+				break;
+			case "replay":
+				lines.push(`Action: replay Python cells ${params.from ?? 1}–${params.through ?? "latest"}`);
+				break;
+			case "execute":
+			case undefined:
+				lines.push(`Code:\n${truncateForPrompt(params.code ?? "")}`);
+				break;
+		}
+		return lines;
 	};
 	get summary(): string {
 		return summarizeEvalLanguages(this.#enabledLanguages());
@@ -364,10 +443,23 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	}
 	readonly concurrency = "exclusive";
 	readonly strict = true;
-	readonly intent = (args: Partial<typeof evalSchema.infer>): string | undefined => {
-		const title = typeof args.title === "string" ? args.title : undefined;
-		const language = typeof args.language === "string" ? formatEvalInputLanguage(args.language) : "javascript";
-		return title || `running ${language}`;
+	readonly intent = (args: EvalToolArgsPreview): string | undefined => {
+		if (args.title) return args.title;
+		switch (args.action) {
+			case "list":
+				return "listing Python cells";
+			case "run":
+				return `rerunning Python cell ${args.cell ?? "?"}`;
+			case "edit":
+				return `editing Python cell ${args.cell ?? "?"}`;
+			case "replay":
+				return `replaying Python cells ${args.from ?? 1}–${args.through ?? "latest"}`;
+			case "execute":
+			case undefined: {
+				const language = typeof args.language === "string" ? formatEvalInputLanguage(args.language) : "javascript";
+				return `running ${language}`;
+			}
+		}
 	};
 
 	readonly #proxyExecutor?: EvalProxyExecutor;
@@ -405,27 +497,106 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			throw new ToolError("Eval tool requires a session when not using proxy executor");
 		}
 		const session = this.session;
-		const excludeWebP = webpExclusionForModel(session.getActiveModel?.());
+		const pythonCellStore = params.language === "py" ? getPythonCellStore(session) : undefined;
+		if (params.action === "list") {
+			if (!pythonCellStore) throw new ToolError('Python cell actions require language: "py"');
+			const storedCells = pythonCellStore.list();
+			const text =
+				storedCells.length === 0
+					? `No stored Python cells (kernel epoch ${pythonCellStore.epoch}).`
+					: [
+							`Python cells (kernel epoch ${pythonCellStore.epoch}; ${storedCells.length} stored):`,
+							...storedCells.map(cell => {
+								const title = cell.title ? ` · ${cell.title}` : "";
+								return `\n--- cell ${cell.id} [${cell.state}; revision ${cell.revision}; runs ${cell.runCount}]${title} ---\n${cell.code}`;
+							}),
+						].join("\n");
+			return { content: [{ type: "text", text }], details: undefined };
+		}
 
+		const excludeWebP = webpExclusionForModel(session.getActiveModel?.());
+		const toTimeoutMs = (timeout: number | undefined): number =>
+			timeout === 0 ? 0 : clampTimeout("eval", timeout, session.settings.get("tools.maxTimeout")) * 1000;
+		const probeTimeoutMs = toTimeoutMs(params.timeout);
 		const cellLanguage: EvalLanguage = params.language === "py" ? "python" : "js";
 		// Bound backend discovery by the eval cell's own timeout and abort signal:
 		// the cell IdleTimeout is armed only later in #runCells, so a hung runtime
 		// probe would otherwise wedge the whole turn (issue #9466).
-		const cellTimeoutMs =
-			params.timeout === 0
-				? 0
-				: clampTimeout("eval", params.timeout, session.settings.get("tools.maxTimeout")) * 1000;
-		const resolved = await resolveBackend(session, cellLanguage, { signal, timeoutMs: cellTimeoutMs });
-		const cells: ResolvedEvalCell[] = [
-			{
-				index: 0,
-				title: params.title,
-				code: params.code,
-				timeoutMs: cellTimeoutMs,
-				reset: params.reset ?? false,
-				resolved,
-			},
-		];
+		const resolved = await resolveBackend(session, cellLanguage, { signal, timeoutMs: probeTimeoutMs });
+		let cells: ResolvedEvalCell[];
+		try {
+			switch (params.action) {
+				case "run": {
+					if (!pythonCellStore) throw new ToolError('Python cell actions require language: "py"');
+					const cell = pythonCellStore.get(params.cell);
+					cells = [
+						{
+							index: cell.id - 1,
+							title: params.title ?? cell.title,
+							code: cell.code,
+							timeoutMs: toTimeoutMs(params.timeout ?? cell.timeout),
+							reset: params.reset ?? false,
+							resolved,
+							pythonCellId: cell.id,
+						},
+					];
+					break;
+				}
+				case "edit": {
+					if (!pythonCellStore) throw new ToolError('Python cell actions require language: "py"');
+					const cell = pythonCellStore.edit(params.cell, params.edits);
+					cells = [
+						{
+							index: cell.id - 1,
+							title: params.title ?? cell.title,
+							code: cell.code,
+							timeoutMs: toTimeoutMs(params.timeout ?? cell.timeout),
+							reset: params.reset ?? false,
+							resolved,
+							pythonCellId: cell.id,
+						},
+					];
+					break;
+				}
+				case "replay": {
+					if (!pythonCellStore) throw new ToolError('Python cell actions require language: "py"');
+					const storedCells = pythonCellStore.range(params.from, params.through);
+					cells = storedCells.map((cell, index) => ({
+						index: cell.id - 1,
+						title: cell.title,
+						code: cell.code,
+						timeoutMs: toTimeoutMs(params.timeout ?? cell.timeout),
+						reset: index === 0 && (params.reset ?? false),
+						resolved,
+						pythonCellId: cell.id,
+					}));
+					break;
+				}
+				case "execute":
+				case undefined: {
+					const cellTimeoutMs = toTimeoutMs(params.timeout);
+					let storedCell: PythonCellSnapshot | undefined;
+					if (params.language === "py") {
+						if (!pythonCellStore) throw new ToolError("Python cell storage is unavailable");
+						storedCell = pythonCellStore.append(params.code, { title: params.title, timeout: params.timeout });
+					}
+					cells = [
+						{
+							index: storedCell ? storedCell.id - 1 : 0,
+							title: params.title,
+							code: params.code,
+							timeoutMs: cellTimeoutMs,
+							reset: params.reset ?? false,
+							resolved,
+							pythonCellId: storedCell?.id,
+						},
+					];
+					break;
+				}
+			}
+		} catch (error) {
+			throw new ToolError(error instanceof Error ? error.message : String(error));
+		}
 		const languages = uniqueEvalLanguages(cells);
 		const notice = detailsNotice(cells);
 		const sessionAbortController = new AbortController();
@@ -446,6 +617,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				excludeWebP,
 				signal: runSignal,
 				sessionAbortController,
+				pythonCellStore,
 				emitUpdate,
 			});
 			return session.trackEvalExecution?.(execution, sessionAbortController) ?? execution;
@@ -473,7 +645,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		const autoBackgroundWaitMs = resolveAutoBackgroundWaitMs(thresholdMs, clampedCellTimeoutMs);
 		const startBackgrounded = autoBackgroundWaitMs === 0;
 
-		const rawLabel = params.title?.trim() || params.code.trim().split("\n", 1)[0] || "eval cell";
+		const sourceLabel = cells.length === 1 ? cells[0].code.trim().split("\n", 1)[0] : `replay ${cells.length} cells`;
+		const rawLabel = params.title?.trim() || sourceLabel || "eval cell";
 		const label = rawLabel.length > 120 ? `${rawLabel.slice(0, 117)}...` : rawLabel;
 
 		let latestText = "";
@@ -612,9 +785,20 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		excludeWebP: boolean | undefined;
 		signal: AbortSignal | undefined;
 		sessionAbortController: AbortController;
+		pythonCellStore?: PythonCellStore;
 		emitUpdate?: (text: string, details: EvalToolDetails) => void;
 	}): Promise<AgentToolResult<EvalToolDetails | undefined>> {
-		const { session, cells, languages, notice, excludeWebP, signal, sessionAbortController, emitUpdate } = options;
+		const {
+			session,
+			cells,
+			languages,
+			notice,
+			excludeWebP,
+			signal,
+			sessionAbortController,
+			pythonCellStore,
+			emitUpdate,
+		} = options;
 		let outputSink: OutputSink | undefined;
 		let outputSummary: OutputSummary | undefined;
 		let outputDumped = false;
@@ -688,7 +872,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			const kernelOwnerId = session.getEvalKernelOwnerId?.() ?? undefined;
 			const { path: artifactPath, id: artifactId } = (await session.allocateOutputArtifact?.("eval")) ?? {};
 			session.assertEvalExecutionAllowed?.();
-			outputSink = new OutputSink({
+			const cellOutputSink = new OutputSink({
 				artifactPath,
 				artifactId,
 				headBytes: resolveOutputSinkHeadBytes(session.settings),
@@ -702,6 +886,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					pushUpdate();
 				},
 			});
+			outputSink = cellOutputSink;
 			const sessionId = session.getEvalSessionId?.() ?? defaultEvalSessionId(session);
 
 			for (let i = 0; i < cells.length; i++) {
@@ -738,6 +923,11 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				pushUpdate();
 
 				const startTime = Date.now();
+				if (cell.reset && pythonCellStore) pythonCellStore.beginKernelEpoch();
+				const runToken = cell.pythonCellId ? pythonCellStore?.startRun(cell.pythonCellId) : undefined;
+				const finishStoredRun = (status: Exclude<PythonCellRunStatus, "running">): void => {
+					if (runToken) pythonCellStore?.finishRun(runToken, status);
+				};
 				let result: ExecutorBackendResult;
 				try {
 					result = await backend.execute(cell.code, {
@@ -750,7 +940,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						idleTimeoutMs,
 						reset: cell.reset,
 						onChunk: chunk => {
-							outputSink!.push(chunk);
+							cellOutputSink.push(chunk);
 						},
 						onStatus: event => {
 							if (event.op === EVAL_TIMEOUT_PAUSE_OP) {
@@ -766,11 +956,20 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							pushUpdate();
 						},
 					});
+				} catch (error) {
+					finishStoredRun(combinedSignal.aborted ? "cancelled" : "error");
+					throw error;
 				} finally {
 					idle?.dispose();
 					activeLiveCell = undefined;
 				}
 				const durationMs = Date.now() - startTime;
+				const storedRunStatus: Exclude<PythonCellRunStatus, "running"> = result.cancelled
+					? "cancelled"
+					: result.exitCode !== 0 && result.exitCode !== undefined
+						? "error"
+						: "complete";
+				finishStoredRun(storedRunStatus);
 
 				const cellStatusEvents: EvalStatusEvent[] = [];
 				const cellDisplayOutputs: EvalDisplayOutput[] = [];

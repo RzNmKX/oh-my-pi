@@ -55,6 +55,7 @@ describe("eval renderer: display-only streaming formatting", () => {
 		let executed = "";
 		const tool = new EvalTool(null, {
 			proxyExecutor: async params => {
+				if (!("code" in params)) throw new Error("Expected an execute call");
 				executed = params.code;
 				return { content: [{ type: "text", text: "ok" }], details: undefined };
 			},
