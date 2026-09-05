@@ -559,7 +559,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							`Python cells (kernel epoch ${pythonCellStore.epoch}; ${storedCells.length} stored):`,
 							...storedCells.map(cell => {
 								const title = cell.title ? ` · ${cell.title}` : "";
-								return `\n--- cell ${cell.id} [${cell.state}; revision ${cell.revision}; runs ${cell.runCount}]${title} ---\n${cell.code}`;
+								const output = cell.output?.length ? cell.output : "(no output)";
+								return `\n--- cell ${cell.id} [${cell.state}; revision ${cell.revision}; runs ${cell.runCount}]${title} ---\n${cell.code}\n--- output ---\n${output}`;
 							}),
 						].join("\n");
 			return { content: [{ type: "text", text }], details: undefined };
@@ -984,8 +985,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				const startTime = Date.now();
 				if (cell.reset && pythonCellStore) pythonCellStore.beginKernelEpoch();
 				const runToken = cell.pythonCellId ? pythonCellStore?.startRun(cell.pythonCellId) : undefined;
-				const finishStoredRun = (status: Exclude<PythonCellRunStatus, "running">): void => {
-					if (runToken) pythonCellStore?.finishRun(runToken, status);
+				const finishStoredRun = (status: Exclude<PythonCellRunStatus, "running">, output?: string): void => {
+					if (runToken) pythonCellStore?.finishRun(runToken, status, output);
 				};
 				let result: ExecutorBackendResult;
 				try {
@@ -1028,7 +1029,6 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					: result.exitCode !== 0 && result.exitCode !== undefined
 						? "error"
 						: "complete";
-				finishStoredRun(storedRunStatus);
 
 				const cellStatusEvents: EvalStatusEvent[] = [];
 				const cellDisplayOutputs: EvalDisplayOutput[] = [];
@@ -1082,6 +1082,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					stdoutTrimmed && visibleDisplayText
 						? `${stdoutTrimmed}\n\n${visibleDisplayText}`
 						: stdoutTrimmed || visibleDisplayText;
+				finishStoredRun(storedRunStatus, cellOutput);
 				cellResult.output = cellOutput;
 				cellResult.exitCode = result.exitCode;
 				cellResult.durationMs = durationMs;

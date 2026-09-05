@@ -14,6 +14,7 @@ export interface PythonCellSnapshot {
 	revision: number;
 	runCount: number;
 	state: PythonCellState;
+	output?: string;
 }
 
 export interface PythonCellRunToken {
@@ -28,6 +29,7 @@ interface PythonCellRun {
 	order: number;
 	revision: number;
 	status: PythonCellRunStatus;
+	output?: string;
 }
 
 interface StoredPythonCell {
@@ -113,10 +115,11 @@ export class PythonCellStore {
 		return token;
 	}
 
-	finishRun(token: PythonCellRunToken, status: Exclude<PythonCellRunStatus, "running">): void {
+	finishRun(token: PythonCellRunToken, status: Exclude<PythonCellRunStatus, "running">, output?: string): void {
 		const cell = this.#requireCell(token.cellId);
 		if (cell.lastRun?.order !== token.order) return;
 		cell.lastRun.status = status;
+		cell.lastRun.output = output;
 	}
 
 	list(): PythonCellSnapshot[] {
@@ -139,6 +142,7 @@ export class PythonCellStore {
 			revision: cell.revision,
 			runCount: cell.runCount,
 			state: this.#state(cell),
+			output: cell.lastRun?.output,
 		};
 	}
 

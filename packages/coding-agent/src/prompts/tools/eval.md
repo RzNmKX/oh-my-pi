@@ -15,7 +15,7 @@ Python cells:
 - `run` reruns a stored cell without resending source.
 - `edit` applies exact replacements atomically, then runs the revision.
 - `replay` runs an inclusive range in order; `reset: true` resets once before its first cell.
-- `list` returns exact source, revision, run count, and kernel provenance.
+- `list` returns exact source, last output, revision, run count, and kernel provenance. `output()` reads task/agent artifacts, not cells.
 - Source changes → `action: "edit"`; NEVER reconstruct a whole cell unless unique exact matching requires it.
 
 ```json

@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added automatic Python eval cell storage with stable IDs, source-free reruns, atomic edits, ordered replay, and reset-safe provenance.
+- Added automatic Python eval cell storage with stable IDs, source-free reruns, atomic edits, ordered replay, reset-safe provenance, and last-run output on list.
 
 ### Fixed
 

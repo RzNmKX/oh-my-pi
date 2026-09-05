@@ -70,8 +70,10 @@ describe("EvalTool Python cells", () => {
 		const text = listed.content[0]?.type === "text" ? listed.content[0].text : "";
 
 		expect(executions.map(execution => execution.code)).toEqual(["value = 1", "value += 1", "value = 1"]);
-		expect(text).toContain("--- cell 1 [complete; revision 1; runs 2] · setup ---\nvalue = 1");
-		expect(text).toContain("--- cell 2 [stale; revision 1; runs 1] ---\nvalue += 1");
+		expect(text).toContain(
+			"--- cell 1 [complete; revision 1; runs 2] · setup ---\nvalue = 1\n--- output ---\nvalue = 1",
+		);
+		expect(text).toContain("--- cell 2 [stale; revision 1; runs 1] ---\nvalue += 1\n--- output ---\nvalue += 1");
 	});
 
 	it("edits transactionally with unique exact replacements and runs the revised source", async () => {

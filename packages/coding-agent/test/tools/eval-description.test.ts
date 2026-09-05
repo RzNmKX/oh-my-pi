@@ -124,6 +124,8 @@ describe("eval tool description", () => {
 		expect(python).toContain("Every ordinary Python call stores one stable, 1-based cell.");
 		expect(python).toContain('Source changes → `action: "edit"`');
 		expect(python).toContain("`replay` runs an inclusive range in order");
+		expect(python).toContain("`list` returns exact source, last output, revision, run count, and kernel provenance.");
+		expect(python).toContain("`output()` reads task/agent artifacts, not cells.");
 
 		const javascript = getEvalToolDescription({ py: false, js: true });
 		expect(javascript).not.toContain("Python cells:");
