@@ -174,9 +174,35 @@ describe("eval tool dynamic schema", () => {
 		expect(() => parameters.assert({ action: "edit", language: "py", cell: 1 })).toThrow(
 			/"cell" and "edits" are required/,
 		);
-		expect(() => parameters.assert({ action: "list", language: "py", code: "x = 1" })).toThrow(
-			/accepts only "action" and "language"/,
-		);
+		expect(() => parameters.assert({ action: "run", language: "py", cell: 0 })).toThrow(/"cell" is required/);
+		expect(
+			parameters.assert({
+				language: "py",
+				code: "value = 41",
+				cell: 0,
+				from: 0,
+				through: 0,
+				edits: [],
+			}),
+		).toMatchObject({ language: "py", code: "value = 41" });
+		const extras = {
+			code: "x = 1",
+			from: 1,
+			through: 3,
+			edits: [{ old: "x = 1", new: "x = 2" }],
+			title: "setup",
+			timeout: 30,
+			reset: false,
+		};
+		expect(parameters.assert({ action: "run", language: "py", cell: 1, ...extras })).toMatchObject({
+			action: "run",
+			language: "py",
+			cell: 1,
+		});
+		expect(parameters.assert({ action: "list", language: "py", ...extras })).toMatchObject({
+			action: "list",
+			language: "py",
+		});
 		expect(parameters.assert({ action: "run", language: "py", cell: 1 })).toEqual({
 			action: "run",
 			language: "py",

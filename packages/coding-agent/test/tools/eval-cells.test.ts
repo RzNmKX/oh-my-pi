@@ -51,8 +51,22 @@ describe("EvalTool Python cells", () => {
 
 		await tool.execute("cell-1", { language: "py", code: "value = 1", title: "setup" });
 		await tool.execute("cell-2", { language: "py", code: "value += 1" });
-		await tool.execute("run-1", { action: "run", language: "py", cell: 1 });
-		const listed = await tool.execute("list", { action: "list", language: "py" });
+		await tool.execute("run-1", {
+			action: "run",
+			language: "py",
+			cell: 1,
+			code: "this must not execute",
+			from: 1,
+			through: 2,
+			edits: [{ old: "value = 1", new: "value = 99" }],
+		});
+		const listed = await tool.execute("list", {
+			action: "list",
+			language: "py",
+			code: "this must not execute",
+			cell: 1,
+			edits: [{ old: "value = 1", new: "value = 99" }],
+		});
 		const text = listed.content[0]?.type === "text" ? listed.content[0].text : "";
 
 		expect(executions.map(execution => execution.code)).toEqual(["value = 1", "value += 1", "value = 1"]);

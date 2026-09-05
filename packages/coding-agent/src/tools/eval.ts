@@ -93,7 +93,7 @@ const evalCellCommonFields = {
 	"reset?": type("boolean").describe("wipe this language's kernel before running. Other languages are untouched."),
 };
 
-const evalCellIndex = type("number.integer >= 1").describe("stable 1-based Python cell index");
+const evalCellIndex = type("number.integer").describe("stable 1-based Python cell index");
 const evalCellEditSchema = type({
 	old: type("string").describe("exact text to replace; must occur exactly once"),
 	new: type("string").describe("replacement text"),
@@ -113,6 +113,14 @@ interface EvalSchemaInput {
 	through?: number;
 }
 
+/** 1-based stored-cell index. `0`/non-integers are provider unset sentinels. */
+function storedCellIndex(value: number | undefined): number | undefined {
+	if (value === undefined || !Number.isInteger(value) || value < 1) return undefined;
+	return value;
+}
+
+/** Required fields per action. Unused sibling properties are ignored: provider
+ *  wire schemas, especially strict mode, force models to send every key. */
 function evalInputConstraint(params: EvalSchemaInput): string | undefined {
 	const action = params.action ?? "execute";
 	if (action !== "execute" && params.language !== "py") {
@@ -121,52 +129,17 @@ function evalInputConstraint(params: EvalSchemaInput): string | undefined {
 	switch (action) {
 		case "execute":
 			if (params.code === undefined) return '"code" is required for a new eval cell';
-			if (
-				params.cell !== undefined ||
-				params.edits !== undefined ||
-				params.from !== undefined ||
-				params.through !== undefined
-			) {
-				return '"cell", "edits", "from", and "through" are invalid for action "execute"';
-			}
 			return undefined;
 		case "run":
-			if (params.cell === undefined) return '"cell" is required for action "run"';
-			if (
-				params.code !== undefined ||
-				params.edits !== undefined ||
-				params.from !== undefined ||
-				params.through !== undefined
-			) {
-				return 'only "cell", "title", "timeout", and "reset" are valid for action "run"';
-			}
+			if (storedCellIndex(params.cell) === undefined) return '"cell" is required for action "run"';
 			return undefined;
 		case "edit":
-			if (params.cell === undefined || params.edits === undefined) {
+			if (storedCellIndex(params.cell) === undefined || params.edits === undefined || params.edits.length === 0) {
 				return '"cell" and "edits" are required for action "edit"';
-			}
-			if (params.code !== undefined || params.from !== undefined || params.through !== undefined) {
-				return '"code", "from", and "through" are invalid for action "edit"';
 			}
 			return undefined;
 		case "replay":
-			if (params.code !== undefined || params.cell !== undefined || params.edits !== undefined) {
-				return '"code", "cell", and "edits" are invalid for action "replay"';
-			}
-			return undefined;
 		case "list":
-			if (
-				params.code !== undefined ||
-				params.cell !== undefined ||
-				params.edits !== undefined ||
-				params.from !== undefined ||
-				params.through !== undefined ||
-				params.title !== undefined ||
-				params.timeout !== undefined ||
-				params.reset !== undefined
-			) {
-				return 'action "list" accepts only "action" and "language"';
-			}
 			return undefined;
 	}
 }
@@ -180,7 +153,7 @@ function buildEvalSchema(langs: readonly EvalLanguageToken[]) {
 		language: type.enumerated(...langs).describe(describeLanguageField(langs)),
 		"code?": type("string").describe(describeCodeField(langs)),
 		"cell?": evalCellIndex,
-		"edits?": evalCellEditSchema.array().atLeastLength(1).describe("atomic exact replacements applied in order"),
+		"edits?": evalCellEditSchema.array().describe("atomic exact replacements applied in order"),
 		"from?": evalCellIndex.describe("first stored cell to replay; defaults to 1"),
 		"through?": evalCellIndex.describe("last stored cell to replay; defaults to the newest cell"),
 		...evalCellCommonFields,
@@ -606,8 +579,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			switch (params.action) {
 				case "run": {
 					if (!pythonCellStore) throw new ToolError('Python cell actions require language: "py"');
-					if (params.cell === undefined) throw new ToolError('Python cell action "run" requires "cell"');
-					const cell = pythonCellStore.get(params.cell);
+					const cellId = storedCellIndex(params.cell);
+					if (cellId === undefined) throw new ToolError('Python cell action "run" requires "cell"');
+					const cell = pythonCellStore.get(cellId);
 					cells = [
 						{
 							index: cell.id - 1,
@@ -623,10 +597,11 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				}
 				case "edit": {
 					if (!pythonCellStore) throw new ToolError('Python cell actions require language: "py"');
-					if (params.cell === undefined || params.edits === undefined) {
+					const cellId = storedCellIndex(params.cell);
+					if (cellId === undefined || params.edits === undefined || params.edits.length === 0) {
 						throw new ToolError('Python cell action "edit" requires "cell" and "edits"');
 					}
-					const cell = pythonCellStore.edit(params.cell, params.edits);
+					const cell = pythonCellStore.edit(cellId, params.edits);
 					cells = [
 						{
 							index: cell.id - 1,
@@ -642,7 +617,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				}
 				case "replay": {
 					if (!pythonCellStore) throw new ToolError('Python cell actions require language: "py"');
-					const storedCells = pythonCellStore.range(params.from, params.through);
+					const storedCells = pythonCellStore.range(storedCellIndex(params.from), storedCellIndex(params.through));
 					cells = storedCells.map((cell, index) => ({
 						index: cell.id - 1,
 						title: cell.title,
