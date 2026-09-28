@@ -21,6 +21,14 @@ export function getDefaultModelDiscoveryBaseUrl(providerId: string): string | un
 /** Resolve the cache namespace used by a provider's model-manager options without constructing those options. */
 export function resolveModelCacheProviderId(providerId: string, options: ModelCacheProviderIdOptions = {}): string {
 	switch (providerId) {
+		case "amazon-bedrock":
+		case "amazon-bedrock-openai": {
+			// Discovered catalogs are per AWS identity/region; scope the cache so a
+			// profile switch never serves another account's model list.
+			const profile = Bun.env.AWS_PROFILE || "default";
+			const region = Bun.env.AWS_REGION || Bun.env.AWS_DEFAULT_REGION || "us-east-1";
+			return `${providerId}:discovery-v1:${Bun.hash(`${profile}\u0000${region}`).toString(36)}`;
+		}
 		case "cursor":
 			return "cursor:max-mode-v2";
 		case "litellm": {

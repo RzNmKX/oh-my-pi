@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added `createBedrockSignedGetJson` (`@oh-my-pi/pi-ai/providers/amazon-bedrock-discovery`), a SigV4-signed JSON GET on the shared AWS credential chain that the Bedrock and Bedrock Mantle model discovery uses.
 - Added Palantir Foundry to the API-key login provider catalog (`omp login palantir-foundry`), plus a `responses` API-key validation strategy for gateways that only speak `/responses`. Foundry's chat-completions surface rejects the legacy `max_tokens`/`temperature` probe and it serves no `/models` endpoint, so the pasted token is validated with a minimal Responses ping.
 
 ### Fixed

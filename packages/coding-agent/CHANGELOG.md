@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added live Amazon Bedrock and Bedrock Mantle model discovery to the model registry, so newly released models the AWS identity can invoke (for example Claude Opus 5.5 and GPT-6 Sol) appear without a catalog release. Discovery uses the same `AWS_PROFILE`/`AWS_REGION` credentials as inference.
 - Added standalone `CLAUDE.md` discovery: the Claude provider now walks up from cwd for a project-root `CLAUDE.md` (as Claude Code does) in addition to `.claude/CLAUDE.md`, so a repo carrying only a root-level `CLAUDE.md` no longer starts with zero project context. Context files gained an optional `scope` dedupe field, which keeps a root `CLAUDE.md` alongside `AGENTS.md` at the same depth instead of shadowing it; `.claude/CLAUDE.md` keeps its existing precedence over `AGENTS.md`.
 - Added `PALANTIR_API_KEY` to the documented provider environment variables (`omp --help`) for authenticated Palantir Foundry catalog discovery and native OpenAI, Anthropic, Google, and xAI proxy routing.
 

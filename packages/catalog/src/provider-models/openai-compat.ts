@@ -94,7 +94,7 @@ function toInputCapabilities(value: unknown): ("text" | "image")[] {
 	return supportsImage ? ["text", "image"] : ["text"];
 }
 
-async function fetchModelsDevPayload(fetchImpl: FetchImpl = discoveryFetch(), signal?: AbortSignal): Promise<unknown> {
+export async function fetchModelsDevPayload(fetchImpl: FetchImpl = discoveryFetch(), signal?: AbortSignal): Promise<unknown> {
 	const response = await fetchImpl(MODELS_DEV_URL, {
 		method: "GET",
 		headers: { Accept: "application/json" },
@@ -5107,20 +5107,33 @@ function resolveGoogleVertexApi(modelId: string, raw: ModelsDevModel): { api: Ap
 	return { api: "google-vertex", baseUrl: GOOGLE_VERTEX_BASE_URL };
 }
 
+const MODELS_DEV_BEDROCK_BASE_DESCRIPTOR: ModelsDevProviderDescriptor = {
+	modelsDevKey: "amazon-bedrock",
+	providerId: "amazon-bedrock",
+	api: "bedrock-converse-stream",
+	baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+	filterModel: (id, m) => {
+		if (m.tool_call !== true) return false;
+		if (id.startsWith("ai21.jamba")) return false;
+		if (id.startsWith("amazon.titan-text-express") || id.startsWith("mistral.mistral-7b-instruct-v0")) return false;
+		return true;
+	},
+};
+
+/**
+ * Maps models.dev `amazon-bedrock` rows verbatim (no cross-region id rewriting).
+ * Runtime Bedrock discovery uses these as metadata references keyed by the exact
+ * inference-profile / foundation-model id the account reports.
+ */
+export function mapBedrockModelsDevReferences(payload: unknown): ModelSpec<Api>[] {
+	if (!isRecord(payload)) return [];
+	return mapModelsDevToModels(payload, [MODELS_DEV_BEDROCK_BASE_DESCRIPTOR]);
+}
+
 const MODELS_DEV_PROVIDER_DESCRIPTORS_BEDROCK: readonly ModelsDevProviderDescriptor[] = [
 	// --- Amazon Bedrock ---
 	{
-		modelsDevKey: "amazon-bedrock",
-		providerId: "amazon-bedrock",
-		api: "bedrock-converse-stream",
-		baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
-		filterModel: (id, m) => {
-			if (m.tool_call !== true) return false;
-			if (id.startsWith("ai21.jamba")) return false;
-			if (id.startsWith("amazon.titan-text-express") || id.startsWith("mistral.mistral-7b-instruct-v0"))
-				return false;
-			return true;
-		},
+		...MODELS_DEV_BEDROCK_BASE_DESCRIPTOR,
 		transformModel: (model, modelId, m) => {
 			const crossRegionId = bedrockCrossRegionId(modelId);
 			const bedrockModel: ModelSpec<Api> = {

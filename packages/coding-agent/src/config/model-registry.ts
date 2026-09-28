@@ -1,6 +1,7 @@
 import { execSync } from "node:child_process";
 import * as path from "node:path";
 import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { createBedrockSignedGetJson } from "@oh-my-pi/pi-ai/providers/amazon-bedrock-discovery";
 import type {
 	Api,
 	Context,
@@ -12,6 +13,10 @@ import type {
 } from "@oh-my-pi/pi-ai/types";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import {
+	amazonBedrockModelManagerOptions,
+	amazonBedrockOpenAIModelManagerOptions,
+} from "@oh-my-pi/pi-catalog/discovery/amazon-bedrock";
 import { isVertexExpressOpenAIUrl } from "@oh-my-pi/pi-catalog/hosts";
 import { readModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import {
@@ -35,6 +40,8 @@ import {
 } from "@oh-my-pi/pi-catalog/variant-collapse";
 
 const SPECIAL_MODEL_MANAGER_PROVIDER_IDS: readonly string[] = [
+	"amazon-bedrock",
+	"amazon-bedrock-openai",
 	"google-antigravity",
 	"google-gemini-cli",
 	"openai-codex",
@@ -72,7 +79,7 @@ import {
 	inheritReferenceThinking,
 	resolveModelReference,
 } from "@oh-my-pi/pi-catalog/identity";
-import { isBunTestRuntime, isRecord, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
+import { $env, isBunTestRuntime, isRecord, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
 import { parseModelString, resolveProviderModelReference } from "../config/model-resolver";
 import { generateCodexAttestation } from "../live/attestation";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
@@ -1848,6 +1855,32 @@ export class ModelRegistry {
 			resolveKey: (value: string | undefined) => string | undefined;
 			createOptions: (key: string) => ModelManagerOptions<Api>;
 		}> = [
+			{
+				// SigV4 providers: the resolved "key" is only the `<authenticated>`
+				// credential-chain sentinel; discovery signs with the AWS chain itself.
+				providerId: "amazon-bedrock",
+				authoritative: false,
+				resolveKey: value => value,
+				createOptions: () =>
+					amazonBedrockModelManagerOptions({
+						getJson: createBedrockSignedGetJson({ fetch: this.#fetch }),
+						region: $env.AWS_REGION || $env.AWS_DEFAULT_REGION || "us-east-1",
+						cacheProviderId: resolveModelCacheProviderId("amazon-bedrock"),
+						fetch: this.#fetch,
+					}),
+			},
+			{
+				providerId: "amazon-bedrock-openai",
+				authoritative: false,
+				resolveKey: value => value,
+				createOptions: () =>
+					amazonBedrockOpenAIModelManagerOptions({
+						getJson: createBedrockSignedGetJson({ fetch: this.#fetch }),
+						region: $env.AWS_REGION || $env.AWS_DEFAULT_REGION || "us-east-1",
+						cacheProviderId: resolveModelCacheProviderId("amazon-bedrock-openai"),
+						fetch: this.#fetch,
+					}),
+			},
 			{
 				providerId: "google-antigravity",
 				authoritative: false,
