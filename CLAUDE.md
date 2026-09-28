@@ -48,10 +48,12 @@ disagree on the version sentinel.
 
 ```sh
 # 1. Rebuild the native addon (Rust/napi-rs; ~1-2 min, needs the toolchain)
-bun --cwd packages/natives run build
+(cd packages/natives && bun run build)
 
-# 2. Rebuild omp so it embeds the fresh native
-bun --cwd packages/coding-agent run build
+# 2. Rebuild omp so it embeds the fresh native. Run it FROM the package dir:
+#    `bun --cwd packages/coding-agent run build` from the repo root exits 0
+#    without compiling, leaving a stale dist/omp.exe. Check its mtime.
+(cd packages/coding-agent && bun run build)
 
 # 3. Copy the fresh binary over the live one
 cp packages/coding-agent/dist/omp.exe ~/.bun/bin/omp.exe
