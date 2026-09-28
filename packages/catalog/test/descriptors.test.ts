@@ -34,6 +34,12 @@ describe("catalog provider descriptors", () => {
 		expect(typeof options?.fetchDynamicModels).toBe("function");
 	});
 
+	test("Palantir discovery preserves protocol-specific model routes", () => {
+		const palantir = PROVIDER_DESCRIPTORS.find(descriptor => descriptor.providerId === "palantir-foundry");
+
+		expect(palantir?.usesPerModelBaseUrls).toBe(true);
+	});
+
 	test("every descriptor has a default model and a factory that preserves provider identity", () => {
 		for (const descriptor of PROVIDER_DESCRIPTORS) {
 			expect(descriptor.defaultModel).toBeTruthy();

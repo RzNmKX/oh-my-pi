@@ -305,6 +305,8 @@ export interface OpenAICompat {
 	extraBody?: Record<string, unknown>;
 	/** Request-session header that should mirror the normalized prompt-cache key. Default: unset. */
 	promptCacheSessionHeader?: "x-grok-conv-id";
+	/** Whether Responses payloads may include OpenAI's `prompt_cache_key`. Default: true. */
+	supportsPromptCacheKey?: boolean;
 	/** Whether chat-completions payloads should include provider-specific prompt-cache markers. */
 	cacheControlFormat?: "anthropic" | undefined;
 	/**
@@ -694,6 +696,7 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 /** Fully-resolved Responses-API compat view (same contract as `ResolvedOpenAICompat`). */
 export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompat {
 	supportsLongPromptCacheRetention: boolean;
+	supportsPromptCacheKey: boolean;
 	strictResponsesPairing: boolean;
 	supportsImageDetailOriginal: boolean;
 	supportsObfuscationOptOut: boolean;

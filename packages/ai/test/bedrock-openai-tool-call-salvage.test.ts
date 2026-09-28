@@ -11,8 +11,9 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { streamBedrockOpenAI } from "@oh-my-pi/pi-ai/providers/amazon-bedrock-openai";
 import { clearAwsCredentialCache } from "@oh-my-pi/pi-ai/providers/aws-credentials";
 import type { AssistantMessage, Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
-const model: Model<"bedrock-openai-responses"> = {
+const model: Model<"bedrock-openai-responses"> = buildModel({
 	id: "openai.gpt-5.5",
 	name: "GPT-5.5 (Bedrock)",
 	api: "bedrock-openai-responses",
@@ -23,8 +24,7 @@ const model: Model<"bedrock-openai-responses"> = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	contextWindow: 272000,
 	maxTokens: 128000,
-	compat: undefined,
-};
+});
 function sseResponse(events: unknown[]): Response {
 	const body = `${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`;
 	return new Response(new TextEncoder().encode(body), {
@@ -122,9 +122,7 @@ describe("bedrock-openai tool-call finalization salvage", () => {
 	});
 
 	it("does not salvage a non-server_error failure even after a complete tool call", async () => {
-		const message = await runStream(
-			failingStream({ code: "rate_limit_exceeded", message: "Slow down." }, true),
-		);
+		const message = await runStream(failingStream({ code: "rate_limit_exceeded", message: "Slow down." }, true));
 
 		expect(message.stopReason).toBe("error");
 		expect(message.errorMessage).toContain("rate_limit_exceeded");

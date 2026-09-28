@@ -5,7 +5,7 @@
 ### Added
 
 - Added standalone `CLAUDE.md` discovery: the Claude provider now walks up from cwd for a project-root `CLAUDE.md` (as Claude Code does) in addition to `.claude/CLAUDE.md`, so a repo carrying only a root-level `CLAUDE.md` no longer starts with zero project context. Context files gained an optional `scope` dedupe field, which keeps a root `CLAUDE.md` alongside `AGENTS.md` at the same depth instead of shadowing it; `.claude/CLAUDE.md` keeps its existing precedence over `AGENTS.md`.
-- Added `PALANTIR_API_KEY` to the documented provider environment variables (`omp --help`), for the new `palantir-foundry` provider.
+- Added `PALANTIR_API_KEY` to the documented provider environment variables (`omp --help`) for authenticated Palantir Foundry catalog discovery and native OpenAI, Anthropic, Google, and xAI proxy routing.
 
 ## [17.1.6] - 2026-07-27
 
@@ -23,6 +23,7 @@
 ### Fixed
 
 - Fixed a disabled higher-priority MCP server no longer disabling a same-named lower-priority one: disabled servers are now suppressed after key-level dedupe instead of dropped before it, so a project `foo` with `enabled: false` keeps the user-level `foo` off while still not starving a differently-named equivalent connection.
+- Fixed Palantir Foundry runtime discovery treating the first bundled model's Anthropic endpoint as a provider-wide base URL, which made GPT-6 Astra, GPT-5.6, Gemini, and Grok requests call the wrong proxy route and fail with HTTP 404. Providers that declare protocol-specific model routes now use those discovered routes unless the user supplied an explicit provider override.
 - Fixed the MCP tool-name collision winner flipping when the current owner reconnects: the winner is now chosen by a stable server+tool key instead of tool-array insertion order, which reconnects reorder.
 - Fixed MCP resources with custom URI schemes being treated as missing filesystem paths. `read` and `omp read` now resolve server-advertised native resource URIs such as `ags://capabilities/current-host`, while preserving the existing `mcp://<resource-uri>` form.
 - Fixed three gaps in native MCP resource URI resolution: server-advertised URIs whose path is exactly `/` (e.g. `catalog://root/`) are now preserved byte-for-byte instead of losing the trailing slash to reconstruction; opaque resource URIs (`urn:example:document`, `custom:item`) are recognized by the `read` and `omp read` resolver gates instead of falling through to filesystem handling; and a failing `resources/templates/list` no longer discards a successful `resources/list`, which previously produced a false missing-resource error.

@@ -561,6 +561,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		cacheControlFormat: isOpenRouter && spec.id.startsWith("anthropic/") ? "anthropic" : undefined,
 		supportsPromptCacheBreakpoints,
 		promptCacheBreakpointTtl: supportsPromptCacheBreakpoints ? "30m" : undefined,
+		supportsPromptCacheKey: true,
 		openRouterRouting: undefined,
 		vercelGatewayRouting: undefined,
 		isOpenRouterHost: isOpenRouter,
@@ -662,6 +663,7 @@ export function buildOpenAIResponsesCompat(spec: OpenAIResponsesSpecLike): Resol
 		supportsLongPromptCacheRetention: isOpenAIUrl,
 		supportsPromptCacheBreakpoints,
 		promptCacheBreakpointTtl: supportsPromptCacheBreakpoints ? "30m" : undefined,
+		supportsPromptCacheKey: true,
 		// Azure OpenAI and GitHub Copilot Responses paths require tool results
 		// to strictly match prior tool calls when building Responses inputs.
 		strictResponsesPairing: isAzure || spec.provider === "github-copilot",
@@ -744,6 +746,7 @@ type ResponsesOnlyCompat = Omit<ResolvedOpenAIResponsesCompat, keyof ResolvedOpe
 function pickResponsesOnly(compat: ResolvedOpenAIResponsesCompat): ResponsesOnlyCompat {
 	return {
 		supportsLongPromptCacheRetention: compat.supportsLongPromptCacheRetention,
+		supportsPromptCacheKey: compat.supportsPromptCacheKey,
 		strictResponsesPairing: compat.strictResponsesPairing,
 		supportsImageDetailOriginal: compat.supportsImageDetailOriginal,
 		supportsObfuscationOptOut: compat.supportsObfuscationOptOut,

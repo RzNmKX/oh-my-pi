@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { getSupportedEfforts, requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
+import { BEDROCK_OPENAI_STATIC_MODELS } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
 import type { Api, ModelSpec, Provider } from "@oh-my-pi/pi-catalog/types";
 import { applyGeneratedModelPolicies, linkOpenAIPromotionTargets } from "../scripts/generated-policies";
 
@@ -33,6 +36,33 @@ function createSpec<TApi extends Api>(overrides: {
 }
 
 describe("generated model policies", () => {
+	it("preserves Astra's Oregon route, limits and five effort tiers through policy and build", () => {
+		const models = structuredClone([...BEDROCK_OPENAI_STATIC_MODELS]);
+		applyGeneratedModelPolicies(models);
+		const astra = buildModel(models.find(model => model.id === "openai.gpt-6-astra")!);
+		const sol = buildModel(models.find(model => model.id === "openai.gpt-5.6-sol")!);
+
+		expect(astra).toMatchObject({
+			id: "openai.gpt-6-astra",
+			name: "GPT-6 Astra (Bedrock)",
+			provider: "amazon-bedrock-openai",
+			api: "bedrock-openai-responses",
+			baseUrl: "https://bedrock-mantle.us-west-2.api.aws",
+			reasoning: true,
+			input: ["text", "image"],
+			contextWindow: 1_050_000,
+			maxTokens: 128_000,
+			cost: { input: 11, output: 55, cacheRead: 1.1, cacheWrite: 13.75 },
+		});
+		const efforts = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
+		expect(astra.thinking).toEqual({ mode: "effort", efforts });
+		expect(getSupportedEfforts(astra)).toEqual(efforts);
+		for (const effort of efforts) {
+			expect(requireSupportedEffort(astra, effort)).toBe(effort);
+		}
+		expect(sol.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws");
+	});
+
 	it("re-bakes thinking metadata and applies parsed catalog corrections", () => {
 		const models: ModelSpec<Api>[] = [
 			createSpec({

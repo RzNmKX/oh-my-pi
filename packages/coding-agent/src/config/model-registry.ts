@@ -1211,11 +1211,11 @@ export class ModelRegistry {
 		});
 	}
 
-	#descriptorBaseUrl(providerId: string): string | undefined {
+	#descriptorBaseUrl(providerId: string, inferFromModels = true): string | undefined {
 		return (
 			this.#runtimeProviderOverrides.get(providerId)?.baseUrl ??
 			this.#providerOverrides.get(providerId)?.baseUrl ??
-			(this.#hasFullSnapshot ? this.getProviderBaseUrl(providerId) : undefined)
+			(inferFromModels && this.#hasFullSnapshot ? this.getProviderBaseUrl(providerId) : undefined)
 		);
 	}
 
@@ -1923,7 +1923,10 @@ export class ModelRegistry {
 					this.#providerOverrides.has(descriptor.providerId) ||
 					this.#keylessProviders.has(descriptor.providerId));
 			if (isAuthenticated(apiKey) || descriptor.allowUnauthenticated || hasExplicitVllmConfig) {
-				const discoveryBaseUrl = this.#descriptorBaseUrl(descriptor.providerId);
+				const discoveryBaseUrl = this.#descriptorBaseUrl(
+					descriptor.providerId,
+					descriptor.usesPerModelBaseUrls !== true,
+				);
 				options.push(
 					descriptor.createModelManagerOptions({
 						apiKey: isDiscoveryBearerApiKey(apiKey) ? apiKey : undefined,

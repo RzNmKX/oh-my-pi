@@ -1136,7 +1136,7 @@ export function buildParams(
 	}
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
-	const promptCacheKey = getOpenAIPromptCacheKey(options);
+	const promptCacheKey = model.compat.supportsPromptCacheKey ? getOpenAIPromptCacheKey(options) : undefined;
 	const modelId = applyWireModelIdTransform(
 		model.requestModelId ?? model.id,
 		model.compat.wireModelIdMode,

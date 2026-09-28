@@ -23,3 +23,7 @@ test("lightweight cache resolver matches scoped descriptor inputs", () => {
 		expect(resolveModelCacheProviderId(providerId, config)).toBe(options.cacheProviderId ?? providerId);
 	}
 });
+
+test("Palantir invalidates caches created before per-model route preservation", () => {
+	expect(resolveModelCacheProviderId("palantir-foundry")).toBe("palantir-foundry:per-model-routes-v1");
+});

@@ -3,11 +3,10 @@ import type { OAuthLoginCallbacks } from "./oauth/types";
 import type { ProviderDefinition } from "./types";
 
 /**
- * Palantir Foundry's XOS LLM proxy: an OpenAI-compatible gateway that fronts
- * OpenAI models on an enterprise enrollment. It serves `/responses` and
- * `/chat/completions` but publishes no `/models` endpoint, and its
- * chat-completions surface rejects the legacy `max_tokens`/`temperature` probe,
- * so the key is validated with a minimal Responses ping.
+ * Palantir Foundry's XOS LLM proxy fronts multiple provider-native protocols
+ * under one enterprise enrollment. Catalog discovery uses Foundry GraphQL, but
+ * token validation stays on the OpenAI Responses proxy because the gateway does
+ * not publish a conventional `/models` endpoint.
  */
 export const loginPalantirFoundry = createApiKeyLogin({
 	providerLabel: "Palantir Foundry",

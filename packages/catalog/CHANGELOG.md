@@ -4,12 +4,14 @@
 
 ### Added
 
-- Added the `palantir-foundry` provider: Palantir Foundry's XOS LLM proxy (`https://xos.bpx.com/api/v2/llm/proxy/openai/v1`, `PALANTIR_API_KEY`) serving `gpt-5.6-sol`/`-terra`/`-luna` over the OpenAI Responses API. The proxy publishes no `/models` endpoint, so the three models are seeded statically with proxy-reported limits (1,050,000 context / 128,000 output) and its four-tier `low..xhigh` effort ladder — it rejects both `minimal` and `max`, so the GPT-5.6 five-tier normalization is bypassed for this provider. Freeform `apply_patch` custom tools and image input are enabled (both verified against the live proxy).
-- Restored the static `amazon-bedrock-openai` GPT-5.6 seed (`openai.gpt-5.6-sol`/`-terra`/`-luna` on `bedrock-mantle`, 272K context / 64K output). That provider authenticates with SigV4 and has no catalog endpoint, so without an explicit seed its GPT-5.6 rows never reach `models.json`.
+- Added `amazon-bedrock-openai/openai.gpt-6-astra` with its Oregon Mantle endpoint, 1.05M context, 128K output, text/image input, and verified `low` through `max` reasoning. Catalog pricing uses AWS Standard in-region rates for inputs up to 272K tokens; AWS charges higher rates above that threshold.
+- Added authoritative `palantir-foundry` discovery from Foundry's authenticated `languageModelsV4` GraphQL catalog. Refreshes query every visible Palantir-provided row, use the authenticated service user's home project for attribution, and expose supported models with verified native transports across OpenAI/xAI Responses, Anthropic Messages, and Google Generative AI. Requests use full language-model RIDs, catalog limits, and canonical same-model pricing, including GPT-6 Astra's 1.05M context window, 128K output limit, and `low` through `max` reasoning ladder; generic-only rows that Palantir rejects on every supported direct proxy remain unselectable.
+- Restored the static `amazon-bedrock-openai` GPT-5.6 seed (`openai.gpt-5.6-sol`/`-terra`/`-luna` on `bedrock-mantle`, 272K context / 64K output). OMP uses static seeds for this SigV4 provider rather than its signed catalog endpoint, so without an explicit seed its GPT-5.6 rows never reach `models.json`.
 
 ### Fixed
 
 - Fixed every `amazon-bedrock-openai` request throwing `undefined is not an object (evaluating 'model.compat.supportsSamplingParams')`: the `bedrock-openai-responses` API was missing from `buildCompat`, so those models were built with `compat: undefined`. The api now resolves the OpenAI Responses compat record like the other Responses surfaces (`CompatOf`/`CompatConfigOf` widened to match), which unbreaks the provider's pre-existing `openai.gpt-5.5` row as well.
+- Fixed Palantir Foundry discovery collapsing every model onto the first bundled model's base URL, which routed OpenAI, Google, and xAI models through the Anthropic proxy. Multi-route providers now preserve each discovered model's protocol-specific endpoint, and the versioned Foundry cache namespace immediately discards poisoned rows from older builds.
 
 ## [17.1.6] - 2026-07-27
 

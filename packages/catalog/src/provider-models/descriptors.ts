@@ -38,6 +38,7 @@ import {
 	opencodeGoModelManagerOptions,
 	opencodeZenModelManagerOptions,
 	openrouterModelManagerOptions,
+	palantirFoundryModelManagerOptions,
 	qianfanModelManagerOptions,
 	qwenPortalModelManagerOptions,
 	sakanaModelManagerOptions,
@@ -351,11 +352,13 @@ export const CATALOG_PROVIDERS = [
 		catalogDiscovery: { label: "OpenRouter", allowUnauthenticated: true },
 	},
 	{
-		// Foundry's proxy publishes no `/models` endpoint, so the catalog is the
-		// static seed in openai-compat.ts and there is no model manager to run.
 		id: "palantir-foundry",
 		defaultModel: "gpt-5.6-sol",
 		envVars: ["PALANTIR_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => palantirFoundryModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
+		usesPerModelBaseUrls: true,
+		catalogDiscovery: { label: "Palantir Foundry" },
 	},
 	{
 		id: "qianfan",
@@ -552,6 +555,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = CATALOG_ENTRY
 			createModelManagerOptions: provider.createModelManagerOptions,
 			allowUnauthenticated: provider.allowUnauthenticated,
 			dynamicModelsAuthoritative: provider.dynamicModelsAuthoritative,
+			usesPerModelBaseUrls: provider.usesPerModelBaseUrls,
 			catalogDiscovery: provider.catalogDiscovery
 				? { ...provider.catalogDiscovery, envVars: provider.catalogDiscovery.envVars ?? provider.envVars ?? [] }
 				: undefined,

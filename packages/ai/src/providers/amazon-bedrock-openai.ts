@@ -13,10 +13,9 @@
  *  - No OpenAI SDK dependency; raw fetch + SSE parsing
  */
 
+import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { extractHttpStatusFromError, fetchWithRetry, readSseEvents } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
-import type { ResponseInput, ResponseStreamEvent } from "./openai-responses-wire";
-import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type {
 	AssistantMessage,
 	Context,
@@ -35,6 +34,7 @@ import { notifyRawSseEvent } from "../utils/sse-debug";
 import { mapToOpenAIResponsesToolChoice } from "../utils/tool-choice";
 import { resolveAwsCredentials } from "./aws-credentials";
 import { signRequest } from "./aws-sigv4";
+import type { ResponseCreateParamsStreaming, ResponseInput, ResponseStreamEvent } from "./openai-responses-wire";
 import {
 	appendResponsesToolResultMessages,
 	applyCommonResponsesSamplingParams,
@@ -43,6 +43,7 @@ import {
 	convertResponsesInputContent,
 	createInitialResponsesAssistantMessage,
 	processResponsesStream,
+	type ResponsesSamplingParamsExtras,
 	repairOrphanResponsesToolCalls,
 	repairOrphanResponsesToolOutputs,
 } from "./openai-shared";
@@ -94,7 +95,7 @@ const BEDROCK_OPENAI_COMPAT = {
 export interface BedrockOpenAIOptions extends StreamOptions {
 	region?: string;
 	profile?: string;
-	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
+	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
 	toolChoice?: ToolChoice;
 }
@@ -119,11 +120,11 @@ export const streamBedrockOpenAI: StreamFunction<"bedrock-openai-responses"> = (
 		const onSseEvent = options.onSseEvent;
 
 		try {
-			// bedrock-mantle hosts gpt-5.5 in us-east-1 (OpenAI Responses API path).
-			// Do NOT inherit AWS_REGION — a shell pointing at any other region routes to a
-			// regional endpoint that returns 404 "model does not exist". Pin us-east-1 unless
-			// an explicit option overrides it (future regions / tests).
-			const region = options.region || "us-east-1";
+			// Mantle availability is regional: use the catalog endpoint, not AWS_REGION.
+			// Explicit SDK options may override the model's region.
+			const region =
+				options.region || new URL(model.baseUrl).hostname.match(/^bedrock-mantle\.([a-z0-9-]+)\.api\.aws$/)?.[1];
+			if (!region) throw new Error(`Invalid Bedrock Mantle endpoint: ${model.baseUrl}`);
 			const messages = convertConversationMessages(model, context);
 			const params = buildRequestParams(model, context, messages, options);
 			options.onPayload?.(params);
@@ -322,14 +323,16 @@ function buildRequestParams(
 		store: false,
 	};
 
-	// Sampling params
-	applyCommonResponsesSamplingParams(params as any, options, model);
+	// Mantle uses the Responses wire shape, with its own API discriminator.
+	const responseParams = params as ResponseCreateParamsStreaming & ResponsesSamplingParamsExtras;
+	applyCommonResponsesSamplingParams(responseParams, options, model);
 
 	// Reasoning params — request encrypted content for multi-turn continuity.
 	// Provide fallback compat so tests/direct invocations don't crash when
 	// model.compat is undefined.
 	const modelWithCompat = model.compat ? model : { ...model, compat: BEDROCK_OPENAI_COMPAT };
-	applyResponsesReasoningParams(params as any, modelWithCompat as any, options, messages, undefined, true, false);
+	const responseModel = modelWithCompat as unknown as Model<"openai-responses">;
+	applyResponsesReasoningParams(responseParams, responseModel, options, undefined, true, false);
 
 	// Tools
 	if (context.tools) {

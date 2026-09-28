@@ -29,6 +29,8 @@ export interface ProviderDescriptor {
 	allowUnauthenticated?: boolean;
 	/** When true, successful runtime discovery replaces bundled provider models instead of merging fallback-only IDs. */
 	dynamicModelsAuthoritative?: boolean;
+	/** Models within this provider use distinct API-specific base URLs; never infer one provider-wide URL from a model. */
+	usesPerModelBaseUrls?: boolean;
 	/** Catalog discovery configuration. Only providers with this field participate in generate-models.ts. */
 	catalogDiscovery?: CatalogDiscoveryConfig;
 }
@@ -69,6 +71,8 @@ export interface ProviderCatalogEntry {
 	readonly allowUnauthenticated?: boolean;
 	/** When true, successful runtime discovery replaces bundled provider models. */
 	readonly dynamicModelsAuthoritative?: boolean;
+	/** Models within this provider use distinct API-specific base URLs. */
+	readonly usesPerModelBaseUrls?: boolean;
 	/** Catalog discovery configuration for generate-models.ts. */
 	readonly catalogDiscovery?: CatalogDiscoveryConfig;
 	/**

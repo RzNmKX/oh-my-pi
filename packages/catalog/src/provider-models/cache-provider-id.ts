@@ -35,6 +35,10 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 			const scope = `${options.apiKey ?? ""}\u0000${discoveryBaseUrl}`;
 			return `${providerId}:models-v1:${Bun.hash(scope).toString(36)}`;
 		}
+		case "palantir-foundry":
+			// v1 caches preserve each discovered model's API-specific Foundry route.
+			// Older rows were poisoned by a provider-wide Anthropic base URL.
+			return "palantir-foundry:per-model-routes-v1";
 		case "openrouter":
 			return "openrouter:pseudo-api";
 		case "vllm": {

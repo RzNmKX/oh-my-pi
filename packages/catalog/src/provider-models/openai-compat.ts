@@ -4,6 +4,7 @@ import {
 	type OpenAICompatibleModelMapperContext,
 	type OpenAICompatibleModelRecord,
 } from "../discovery/openai-compatible";
+import { fetchPalantirFoundryModels, PALANTIR_FOUNDRY_BASE_URL } from "../discovery/palantir-foundry";
 import { Effort, THINKING_EFFORTS } from "../effort";
 import { FIREWORKS_FAST_SUFFIX, toFireworksPublicModelId } from "../fireworks-model-id";
 import { getBundledModelReferenceIndex } from "../identity/bundled";
@@ -3356,92 +3357,67 @@ export function metaModelManagerOptions(config?: MetaModelManagerConfig): ModelM
 // 15.85 Palantir Foundry (XOS) LLM proxy
 // ---------------------------------------------------------------------------
 
-/**
- * BPX's Palantir Foundry enrollment fronts OpenAI models on its own
- * OpenAI-compatible proxy, reached with a Foundry bearer token. `GET /models`
- * is a 404 there — the proxy publishes no catalog — so these static entries are
- * the whole provider surface and there is no dynamic discovery to reconcile.
- *
- * Every limit below is what the live proxy reports about itself rather than an
- * assumption: overflowing the window returns
- * `LanguageModelService:ContextWindowExceeded` carrying
- * `contextWindow=1050000, maxTokens=128000`, and an out-of-range effort is
- * rejected with the supported set (`none, low, medium, high, xhigh`) — both
- * `minimal` and `max` are refused, so the ladder stops at xhigh. Requests are
- * served by an Azure OpenAI backend (`modelBackendId=AZURE_OPEN_AI`) that
- * speaks the stock Responses shape: streaming, function tools, `store: false`,
- * `include: ["reasoning.encrypted_content"]`, and `reasoning.summary` all
- * verified live; only `reasoning.mode` (pro) is rejected.
- *
- * The proxy does not expose pricing, so cost carries the first-party OpenAI
- * list price for the same SKU — keeping session cost accounting meaningful
- * without inventing numbers.
- */
-export const PALANTIR_FOUNDRY_BASE_URL = "https://xos.bpx.com/api/v2/llm/proxy/openai/v1";
-
-const PALANTIR_FOUNDRY_CONTEXT_WINDOW = 1_050_000;
-const PALANTIR_FOUNDRY_MAX_TOKENS = 128_000;
-
-/** Proxy-supported effort ladder: no `minimal` below, no `max` above. */
-const PALANTIR_FOUNDRY_THINKING: ThinkingConfig = {
-	mode: "effort",
-	efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
-};
-
-function createPalantirFoundryModel(
-	id: string,
-	name: string,
-	cost: ModelSpec<"openai-responses">["cost"],
-): ModelSpec<"openai-responses"> {
-	return {
-		id,
-		name,
-		api: "openai-responses",
-		provider: "palantir-foundry",
-		baseUrl: PALANTIR_FOUNDRY_BASE_URL,
-		reasoning: true,
-		input: ["text", "image"],
-		cost: { ...cost },
-		contextWindow: PALANTIR_FOUNDRY_CONTEXT_WINDOW,
-		maxTokens: PALANTIR_FOUNDRY_MAX_TOKENS,
-		thinking: { ...PALANTIR_FOUNDRY_THINKING },
-		applyPatchToolType: "freeform",
-	};
+export interface PalantirFoundryModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
-export const PALANTIR_FOUNDRY_STATIC_MODELS: readonly ModelSpec<"openai-responses">[] = [
-	createPalantirFoundryModel("gpt-5.6-sol", "GPT-5.6 Sol (Foundry)", {
-		input: 5,
-		output: 30,
-		cacheRead: 0.5,
-		cacheWrite: 6.25,
-	}),
-	createPalantirFoundryModel("gpt-5.6-terra", "GPT-5.6 Terra (Foundry)", {
-		input: 2.5,
-		output: 15,
-		cacheRead: 0.25,
-		cacheWrite: 3.125,
-	}),
-	createPalantirFoundryModel("gpt-5.6-luna", "GPT-5.6 Luna (Foundry)", {
-		input: 1,
-		output: 6,
-		cacheRead: 0.1,
-		cacheWrite: 1.25,
-	}),
-];
+/**
+ * Palantir's OpenAI proxy does not expose `/models`; Agent Studio publishes
+ * the authoritative enrollment catalog through its GraphQL bulk endpoint.
+ * Discovery resolves the service user's home project for attribution, then
+ * retains only models that advertise the OpenAI Responses transport.
+ */
+export function palantirFoundryModelManagerOptions(
+	config?: PalantirFoundryModelManagerConfig,
+): ModelManagerOptions<Api> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? PALANTIR_FOUNDRY_BASE_URL;
+	return {
+		providerId: "palantir-foundry",
+		cacheProviderId: resolveModelCacheProviderId("palantir-foundry"),
+		dynamicModelsAuthoritative: true,
+		...(apiKey
+			? {
+					fetchDynamicModels: () =>
+						fetchPalantirFoundryModels({
+							apiKey,
+							baseUrl,
+							fetch: config?.fetch,
+						}),
+				}
+			: undefined),
+	};
+}
 
 // ---------------------------------------------------------------------------
 // 15.9 Amazon Bedrock OpenAI (bedrock-mantle)
 // ---------------------------------------------------------------------------
 
 /**
- * Static seed for the GPT-5.6 SKUs on Bedrock's `bedrock-mantle` endpoint. The
- * `amazon-bedrock-openai` provider authenticates with SigV4 and exposes no
- * catalog endpoint, so models must be seeded explicitly or they never reach
- * models.json. Pricing is AWS Bedrock GA (2026-07-13); context/output limits
- * are the Bedrock-imposed 272K/64K, not the larger OpenAI-direct window.
+ * Static models for Bedrock's SigV4-authenticated `bedrock-mantle` endpoint.
+ * Mantle exposes a signed `/v1/models` catalog; OMP currently uses these seeds
+ * rather than credentialed catalog discovery. GPT-5.6 pricing is AWS Bedrock GA
+ * (2026-07-13), with Bedrock-imposed 272K/64K context/output limits.
  */
-export const BEDROCK_OPENAI_GPT56_MODELS: readonly ModelSpec<"bedrock-openai-responses">[] = [
+export const BEDROCK_OPENAI_STATIC_MODELS: readonly ModelSpec<"bedrock-openai-responses">[] = [
+	{
+		id: "openai.gpt-6-astra",
+		name: "GPT-6 Astra (Bedrock)",
+		api: "bedrock-openai-responses",
+		provider: "amazon-bedrock-openai",
+		baseUrl: "https://bedrock-mantle.us-west-2.api.aws",
+		reasoning: true,
+		input: ["text", "image"],
+		// AWS in-region Standard rates for <=272K input tokens. Above 272K,
+		// input/output/cache-read/cache-write rates are 22/82.5/2.2/27.5 USD/M.
+		// https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-astra.html
+		cost: { input: 11, output: 55, cacheRead: 1.1, cacheWrite: 13.75 },
+		contextWindow: 1_050_000,
+		maxTokens: 128_000,
+		thinking: { mode: "effort", efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max] },
+	},
 	{
 		id: "openai.gpt-5.6-sol",
 		name: "GPT-5.6 Sol (Bedrock)",

@@ -6,6 +6,11 @@
 
 - Added Palantir Foundry to the API-key login provider catalog (`omp login palantir-foundry`), plus a `responses` API-key validation strategy for gateways that only speak `/responses`. Foundry's chat-completions surface rejects the legacy `max_tokens`/`temperature` probe and it serves no `/models` endpoint, so the pasted token is validated with a minimal Responses ping.
 
+### Fixed
+
+- Fixed Bedrock Mantle routing and SigV4 signing to use each model's catalog region, enabling GPT-6 Astra in Oregon without moving existing models out of Virginia. Explicit SDK region overrides remain supported, and Astra accepts `max` reasoning.
+- Fixed Palantir native proxy compatibility: Gemini requests use bearer authentication and full catalog RIDs, Claude omits unsupported context-management fields, and OpenAI Responses models can suppress `prompt_cache_key` on xAI-compatible proxies.
+
 ## [17.1.6] - 2026-07-27
 
 ### Added
