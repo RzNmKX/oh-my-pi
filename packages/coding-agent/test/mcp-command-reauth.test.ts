@@ -43,6 +43,9 @@ function restoreEnvValue(name: string, value: string | undefined): void {
 }
 function createController(authStorage: AuthStorage, mcpManagerOverrides: Record<string, unknown> = {}) {
 	const showError = vi.fn();
+	const showStatus = vi.fn();
+	const present = vi.fn();
+	const editor: { onEscape?: () => void } = {};
 	const prepareConfig = vi.fn(async (config: MCPServerConfig) => config);
 	const mcpManager = {
 		prepareConfig,
@@ -55,11 +58,12 @@ function createController(authStorage: AuthStorage, mcpManagerOverrides: Record<
 	};
 	const controller = new MCPCommandController({
 		chatContainer: { addChild: vi.fn() },
-		present: vi.fn(),
+		present,
+		presentCommandOutput: present,
 		ui: { requestRender: vi.fn() },
-		editor: {},
+		editor,
 		showError,
-		showStatus: vi.fn(),
+		showStatus,
 		oauthManualInput: {
 			hasPending: vi.fn(() => false),
 			pendingProviderId: undefined,
@@ -72,7 +76,7 @@ function createController(authStorage: AuthStorage, mcpManagerOverrides: Record<
 		mcpManager,
 	} as never);
 
-	return { controller, showError, prepareConfig, mcpManager };
+	return { controller, showError, showStatus, present, editor, prepareConfig, mcpManager };
 }
 
 describe("/mcp auth commands", () => {
@@ -174,6 +178,178 @@ describe("/mcp auth commands", () => {
 		expect(savedServer?.auth).toBeUndefined();
 	});
 
+	test("uses the registration endpoint discovered from a pathful issuer", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.reload();
+		const resourceMetadataUrl = "https://gateway.example.com/.well-known/oauth-protected-resource/my-service/mcp";
+		vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(
+			new Error(`HTTP 401: WWW-Authenticate: Bearer resource_metadata="${resourceMetadataUrl}"`),
+		);
+		const registrationRequests: string[] = [];
+		const fetchMock = Object.assign(
+			async (input: string | URL | Request, init?: RequestInit | BunFetchRequestInit): Promise<Response> => {
+				const url = String(input);
+				if (url === resourceMetadataUrl) {
+					return new Response(
+						JSON.stringify({
+							resource: "https://gateway.example.com/my-service/mcp",
+							authorization_servers: ["https://auth.example.com/auth/v1"],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url === "https://auth.example.com/.well-known/oauth-authorization-server/auth/v1") {
+					return new Response(
+						JSON.stringify({
+							issuer: "https://auth.example.com/auth/v1",
+							authorization_endpoint: "https://auth.example.com/auth/v1/oauth/authorize",
+							token_endpoint: "https://auth.example.com/auth/v1/oauth/token",
+							registration_endpoint: "https://auth.example.com/auth/v1/oauth/register",
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url === "https://auth.example.com/auth/v1/oauth/register" && init?.method === "POST") {
+					registrationRequests.push(url);
+					return new Response(JSON.stringify({ client_id: "pathful-dcr-client" }), {
+						status: 201,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return new Response("not found", { status: 404 });
+			},
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockImplementation(async function (
+			this: oauthFlow.MCPOAuthFlow,
+		) {
+			const { url } = await this.generateAuthUrl("state", "http://127.0.0.1:53192/callback");
+			expect(new URL(url).searchParams.get("client_id")).toBe("pathful-dcr-client");
+			return {
+				access: "fresh-access",
+				refresh: "fresh-refresh",
+				expires: Date.now() + 3_600_000,
+			};
+		});
+		const { controller, showError } = createController(authStorage);
+
+		await controller.handle("/mcp reauth envserver");
+
+		expect(showError).not.toHaveBeenCalled();
+		expect(registrationRequests).toEqual(["https://auth.example.com/auth/v1/oauth/register"]);
+		expect(authStorage.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toMatchObject({
+			type: "oauth",
+			clientId: "pathful-dcr-client",
+		});
+	});
+
+	test("uses tool challenge resource metadata and scopes during reauth", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.reload();
+		vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(new Error("HTTP 401: Unauthorized"));
+
+		const resourceMetadataUrl = "https://gateway.example.com/.well-known/oauth-protected-resource";
+		const fetchMock = Object.assign(
+			async (input: string | URL | Request): Promise<Response> => {
+				const url = String(input);
+				if (url === resourceMetadataUrl) {
+					return new Response(
+						JSON.stringify({
+							resource: "https://gateway.example.com/mcp",
+							authorization_servers: ["https://auth.example.com"],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url === "https://auth.example.com/.well-known/oauth-authorization-server") {
+					return new Response(
+						JSON.stringify({
+							authorization_endpoint: "https://auth.example.com/authorize",
+							token_endpoint: "https://auth.example.com/token",
+							client_id: "challenge-client",
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				return new Response("not found", { status: 404 });
+			},
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+		let authorizationUrl = "";
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockImplementation(async function (
+			this: oauthFlow.MCPOAuthFlow,
+		) {
+			authorizationUrl = (await this.generateAuthUrl("state", "http://127.0.0.1:53192/callback")).url;
+			return {
+				access: "fresh-access",
+				refresh: "fresh-refresh",
+				expires: Date.now() + 3_600_000,
+			};
+		});
+
+		const { controller, showError } = createController(authStorage);
+		const updated = await controller.handleMCPAuthChallenge("envserver", {
+			wwwAuthenticate: [`Bearer resource_metadata="${resourceMetadataUrl}" scope="orders.read"`],
+		});
+		expect(updated).toEqual(expect.objectContaining({ type: "http", url: RAW_SERVER_URL }));
+		expect(showError).not.toHaveBeenCalled();
+		expect(new URL(authorizationUrl).searchParams.get("scope")).toBe("orders.read");
+		expect(new URL(authorizationUrl).searchParams.get("resource")).toBe("https://gateway.example.com/mcp");
+	});
+
+	test("reauthorizes on a tool challenge even when the anonymous handshake succeeds", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.reload();
+		// Server allows the unauthenticated handshake; only tool calls are protected.
+		vi.spyOn(mcpClient, "connectToServer").mockResolvedValue({} as never);
+		vi.spyOn(mcpClient, "disconnectServer").mockResolvedValue(undefined as never);
+
+		const resourceMetadataUrl = "https://gateway.example.com/.well-known/oauth-protected-resource";
+		const fetchMock = Object.assign(
+			async (input: string | URL | Request): Promise<Response> => {
+				const url = String(input);
+				if (url === resourceMetadataUrl) {
+					return new Response(
+						JSON.stringify({
+							resource: "https://gateway.example.com/mcp",
+							authorization_servers: ["https://auth.example.com"],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url === "https://auth.example.com/.well-known/oauth-authorization-server") {
+					return new Response(
+						JSON.stringify({
+							authorization_endpoint: "https://auth.example.com/authorize",
+							token_endpoint: "https://auth.example.com/token",
+							client_id: "challenge-client",
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				return new Response("not found", { status: 404 });
+			},
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockResolvedValue({
+			access: "fresh-access",
+			refresh: "fresh-refresh",
+			expires: Date.now() + 3_600_000,
+		});
+
+		const { controller, showError } = createController(authStorage);
+		const updated = await controller.handleMCPAuthChallenge("envserver", {
+			wwwAuthenticate: [`Bearer resource_metadata="${resourceMetadataUrl}" scope="orders.read"`],
+		});
+		expect(updated).toEqual(expect.objectContaining({ type: "http", url: RAW_SERVER_URL }));
+		expect(showError).not.toHaveBeenCalled();
+	});
+
 	test("reuses embedded DCR client secret during reauth token exchange", async () => {
 		const authStorage = freshAuthStorage();
 		await authStorage.reload();
@@ -217,6 +393,109 @@ describe("/mcp auth commands", () => {
 			clientId: "dcr-client",
 			clientSecret: "dcr-secret",
 		});
+	});
+
+	test("Esc aborts the OAuth flow during /mcp reauth", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.reload();
+		vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(AUTH_ERROR);
+
+		// Simulate the real flow: login hangs waiting for the OAuth callback and
+		// only resolves when the controller's signal aborts. Mirrors what
+		// OAuthCallbackFlow.#waitForCallback does in production.
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockImplementation(function (this: oauthFlow.MCPOAuthFlow) {
+			const pending = Promise.withResolvers<never>();
+			this.ctrl.signal?.addEventListener("abort", () => {
+				pending.reject(new Error(`OAuth callback cancelled: ${String(this.ctrl.signal?.reason ?? "aborted")}`));
+			});
+			return pending.promise;
+		});
+
+		const { controller, showError, showStatus, editor } = createController(authStorage);
+
+		const reauthPromise = controller.handle("/mcp reauth envserver");
+
+		// Wait for #handleOAuthFlow to install its editor.onEscape hook.
+		const deadline = Date.now() + 1_000;
+		while (typeof editor.onEscape !== "function" && Date.now() < deadline) {
+			await Bun.sleep(10);
+		}
+		expect(typeof editor.onEscape).toBe("function");
+
+		const installedEscape = editor.onEscape;
+		editor.onEscape?.();
+
+		// Cancellation must resolve the reauth promise promptly (well under the
+		// 5-minute production timeout); a 2s race exposes a hung flow as a test
+		// failure rather than a suite hang.
+		await Promise.race([
+			reauthPromise,
+			Bun.sleep(2_000).then(() => {
+				throw new Error("reauth did not resolve within 2s of Esc");
+			}),
+		]);
+
+		expect(showError).not.toHaveBeenCalled();
+		expect(showStatus).toHaveBeenCalledWith(expect.stringMatching(/cancel/i));
+		// onEscape must be restored to its previous value so subsequent user
+		// input does not keep aborting the (now-finished) flow.
+		expect(editor.onEscape).not.toBe(installedEscape);
+	});
+
+	test("Esc cancels even when OAuth login has not registered its signal listener yet", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.reload();
+		vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(AUTH_ERROR);
+
+		// Simulates the review race: Esc aborts oauthTimeout before
+		// OAuthCallbackFlow.#waitForCallback has registered its abort listener
+		// (e.g. during dynamic client registration or metadata discovery).
+		// The login promise itself never observes ctrl.signal; #handleOAuthFlow
+		// must race it against oauthTimeout.signal.
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockReturnValue(Promise.withResolvers<never>().promise);
+		const { controller, showError, showStatus, editor } = createController(authStorage);
+
+		const reauthPromise = controller.handle("/mcp reauth envserver");
+		const deadline = Date.now() + 1_000;
+		while (typeof editor.onEscape !== "function" && Date.now() < deadline) {
+			await Bun.sleep(10);
+		}
+		expect(typeof editor.onEscape).toBe("function");
+		editor.onEscape?.();
+
+		await Promise.race([
+			reauthPromise,
+			Bun.sleep(2_000).then(() => {
+				throw new Error("reauth did not resolve within 2s of pre-wait Esc");
+			}),
+		]);
+
+		expect(showError).not.toHaveBeenCalled();
+		expect(showStatus).toHaveBeenCalledWith(expect.stringMatching(/cancel/i));
+	});
+
+	test("OAuth deadline still surfaces as a reauthorization error, not a cancellation", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.reload();
+		vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(AUTH_ERROR);
+
+		// Deadline path bypasses both the editor's Esc hook and any external
+		// signal: withTimeout aborts the controller with reason "MCP OAuth flow
+		// timed out" and the login promise rejects with a "timed out" message.
+		// Mirror that here. Keeping the surface distinct from the user-cancel
+		// flag in #handleOAuthFlow is the whole point of this regression test.
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockRejectedValue(
+			new Error("OAuth flow timed out after 5 minutes"),
+		);
+		const { controller, showError, showStatus } = createController(authStorage);
+
+		await controller.handle("/mcp reauth envserver");
+
+		// Deadline must read as "failed", not "cancelled" — they have different
+		// surfaces (error banner vs status line) and the user expects a clear
+		// timeout message rather than thinking they pressed Esc.
+		expect(showStatus).not.toHaveBeenCalledWith(expect.stringMatching(/cancel/i));
+		expect(showError).toHaveBeenCalledWith(expect.stringMatching(/timed out/i));
 	});
 
 	test("clears both expanded and stale raw URL-keyed credentials on unauth", async () => {

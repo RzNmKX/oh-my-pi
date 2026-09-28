@@ -16,6 +16,9 @@ import { subprocessToolRegistry } from "../task/subprocess-tool-registry";
 import type { ToolSession } from ".";
 import { buildOutputValidator, formatAllValidationIssues } from "./output-schema-validator";
 
+const YIELD_RESULT_FORMAT_HINT =
+	'Submit success as {"result":{"data":<your output>}} or failure as {"result":{"error":"message"}}.';
+
 export interface YieldDetails {
 	/** Successful result payload, or omitted when `useLastTurn` requests last-turn extraction. */
 	data?: unknown;
@@ -96,6 +99,16 @@ function parseYieldType(value: unknown): string | string[] | undefined {
 	if (value === undefined || value === null) return undefined;
 	if (isYieldType(value)) return value;
 	throw new Error("type must be a string or non-empty array of strings");
+}
+
+/**
+ * Render an incremental yield's `type: [...]` labels as a quoted, comma-separated list for
+ * model-facing retry messages — keeps the failed section labelled even when the yield carried
+ * multiple labels at once.
+ */
+function formatYieldLabels(labels: readonly string[]): string {
+	if (labels.length === 0) return '""';
+	return labels.map(label => `"${label}"`).join(", ");
 }
 
 /**
@@ -188,6 +201,14 @@ function wrapYieldParameters(dataSchema: Record<string, unknown>): Record<string
  */
 const MAX_SCHEMA_RETRIES = 3;
 
+/**
+ * Max consecutive untyped empty-result submissions before the yield tool fails
+ * the child explicitly. Some weak tool callers can acknowledge the required
+ * wrapper in prose while repeatedly sending `{ result: {} }`; without a hard
+ * stop the parent waits forever.
+ */
+const MAX_EMPTY_RESULT_RETRIES = 3;
+
 export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 	readonly name = "yield";
 	readonly approval = "read" as const;
@@ -202,10 +223,19 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 	lenientArgValidation = true;
 
 	readonly #validate?: (value: unknown) => JsonSchemaValidationResult;
+	readonly #validateSection?: ReadonlyMap<string, (value: unknown) => JsonSchemaValidationResult>;
+	#rejectUnknownSections = false;
+	#knownSectionLabels: readonly string[] = [];
+	#isKnownSection?: (label: string) => boolean;
 	#schemaValidationFailures = 0;
+	#emptyResultFailures = 0;
 
 	constructor(session: ToolSession) {
 		let validate: ((value: unknown) => JsonSchemaValidationResult) | undefined;
+		let validateSection: ReadonlyMap<string, (value: unknown) => JsonSchemaValidationResult> | undefined;
+		let rejectUnknownSections = false;
+		let knownSectionLabels: readonly string[] = [];
+		let isKnownSection: ((label: string) => boolean) | undefined;
 		let parameters: TSchema;
 
 		try {
@@ -217,6 +247,10 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 			} = buildOutputValidator(session.outputSchema);
 			if (validator) {
 				validate = value => validator.validate(value);
+				validateSection = validator.validateSection;
+				rejectUnknownSections = validator.rejectUnknownSections;
+				knownSectionLabels = validator.knownSectionLabels;
+				isKnownSection = label => validator.isKnownSection(label);
 			}
 
 			const schemaHint = formatSchema(normalizedSchema ?? session.outputSchema);
@@ -266,6 +300,10 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 		}
 
 		this.#validate = validate;
+		this.#validateSection = validateSection;
+		this.#rejectUnknownSections = rejectUnknownSections;
+		this.#knownSectionLabels = knownSectionLabels;
+		this.#isKnownSection = isKnownSection;
 		this.parameters = parameters;
 	}
 
@@ -279,7 +317,7 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 		const raw = params as Record<string, unknown>;
 		const rawResult = raw.result;
 		if (!rawResult || typeof rawResult !== "object" || Array.isArray(rawResult)) {
-			throw new Error("result must be an object containing either data or error");
+			throw new Error(`result must be an object containing either data or error. ${YIELD_RESULT_FORMAT_HINT}`);
 		}
 		const resultRecord = rawResult as Record<string, unknown>;
 		const errorMessage = typeof resultRecord.error === "string" ? resultRecord.error : undefined;
@@ -296,36 +334,73 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 			throw new Error("result cannot contain both data and error");
 		}
 		if (errorMessage === undefined && data === undefined && yieldType === undefined) {
+			this.#emptyResultFailures++;
+			if (this.#emptyResultFailures > MAX_EMPTY_RESULT_RETRIES) {
+				const attemptCount = this.#emptyResultFailures;
+				this.#emptyResultFailures = 0;
+				const error =
+					`yield result stayed empty after ${attemptCount} consecutive attempt(s); aborting child instead of retrying forever. ` +
+					'Submit success as `{ "result": { "data": <your output> } }` or failure as `{ "result": { "error": "message" } }`.';
+				return {
+					content: [{ type: "text", text: `Task aborted: ${error}` }],
+					details: {
+						data: undefined,
+						status: "aborted",
+						error,
+						type: yieldType,
+					},
+				};
+			}
+			const remaining = MAX_EMPTY_RESULT_RETRIES - this.#emptyResultFailures;
 			throw new Error(
-				'result must contain either `data` or `error`. Use `{result: {data: <your output>}}` for success or `{result: {error: "message"}}` for failure.',
+				`result must contain either \`data\` or \`error\`. Use \`{result: {data: <your output>}}\` for success or \`{result: {error: "message"}}\` for failure. Empty untyped result retries remaining before abort: ${remaining}.`,
 			);
 		}
 
 		const status = errorMessage !== undefined ? "aborted" : "success";
 		let schemaValidationOverridden = false;
+		// Unknown incremental labels are a hard contract mismatch with the closed caller
+		// schema. Reject before the last-turn short-circuit too: `type: ["findings"], result: {}`
+		// would otherwise be accepted as a typed last-turn incremental yield, then a sibling
+		// section's MAX_SCHEMA_RETRIES override flips schemaOverridden in finalization and the
+		// stale section rides along untouched.
+		if (status === "success" && isIncremental) {
+			const unknownLabels = this.#unknownIncrementalLabels(yieldType as string[]);
+			if (unknownLabels.length > 0) {
+				const validLabels =
+					this.#knownSectionLabels.length > 0 ? formatYieldLabels(this.#knownSectionLabels) : "none";
+				throw new Error(
+					`Section ${formatYieldLabels(yieldType as string[])} uses unknown incremental yield label(s): ${formatYieldLabels(unknownLabels)}. Resubmit with one of the schema's labels: ${validLabels}.`,
+				);
+			}
+		}
 		if (status === "success" && !useLastTurn) {
 			if (data === null) {
 				throw new Error("data is required when yield indicates success");
 			}
-			if (this.#validate && !isIncremental) {
-				const parsed = this.#validate(data);
-				if (!parsed.success) {
-					this.#schemaValidationFailures++;
-					if (this.#schemaValidationFailures <= MAX_SCHEMA_RETRIES) {
-						const remaining = MAX_SCHEMA_RETRIES - this.#schemaValidationFailures;
-						const retryHint =
-							remaining > 0
-								? ` Call yield again with the corrected shape — ${remaining} retry attempt(s) remain before the schema constraint is dropped.`
-								: " Call yield again with the corrected shape — this is the final retry before the schema constraint is dropped.";
-						throw new Error(
-							`Output does not match schema: ${formatAllValidationIssues(parsed.issues)}.${retryHint}`,
-						);
-					}
-					schemaValidationOverridden = true;
+			const sectionFailure = isIncremental
+				? this.#validateIncrementalSection(yieldType as string[], data)
+				: this.#validate
+					? this.#validate(data)
+					: undefined;
+			if (sectionFailure && !sectionFailure.success) {
+				this.#schemaValidationFailures++;
+				if (this.#schemaValidationFailures <= MAX_SCHEMA_RETRIES) {
+					const remaining = MAX_SCHEMA_RETRIES - this.#schemaValidationFailures;
+					const retryHint =
+						remaining > 0
+							? ` Call yield again with the corrected shape — ${remaining} retry attempt(s) remain before the schema constraint is dropped.`
+							: " Call yield again with the corrected shape — this is the final retry before the schema constraint is dropped.";
+					const scope = isIncremental ? `Section ${formatYieldLabels(yieldType as string[])}` : "Output";
+					throw new Error(
+						`${scope} does not match schema: ${formatAllValidationIssues(sectionFailure.issues)}.${retryHint}`,
+					);
 				}
+				schemaValidationOverridden = true;
 			}
 		}
 
+		this.#emptyResultFailures = 0;
 		const responseText =
 			status === "aborted"
 				? `Task aborted: ${errorMessage}`
@@ -343,6 +418,39 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 				schemaOverridden: schemaValidationOverridden || undefined,
 			},
 		};
+	}
+
+	/**
+	 * Return incremental yield labels the closed caller schema does not accept. Closure covers the
+	 * root, `allOf` conjuncts, and `oneOf`/`anyOf` unions whose every variant is closed (e.g. JTD
+	 * discriminators). Open schemas accept any label.
+	 */
+	#unknownIncrementalLabels(labels: string[]): string[] {
+		if (!this.#rejectUnknownSections) return [];
+		const isKnown = this.#isKnownSection;
+		if (!isKnown) return [];
+		return labels.filter(label => !isKnown(label));
+	}
+
+	/**
+	 * Validate the `data` payload of an incremental yield (`type: ["<label>", …]`) against
+	 * the matching property's sub-validator. Returns the first failure across all known labels,
+	 * or `undefined` when no label is recognised (user-defined section labels stay loose) or
+	 * when all known labels accept the value. Lets the model see the same retry feedback that
+	 * the terminal-yield path already produces, instead of leaking the mismatch through to
+	 * the parent's post-mortem `schema_violation`. Unknown labels under a closed schema are
+	 * handled separately by `#unknownIncrementalLabels` and never reach this validator.
+	 */
+	#validateIncrementalSection(labels: string[], data: unknown): JsonSchemaValidationResult | undefined {
+		const subValidators = this.#validateSection;
+		if (!subValidators || subValidators.size === 0) return undefined;
+		for (const label of labels) {
+			const sub = subValidators.get(label);
+			if (!sub) continue;
+			const parsed = sub(data);
+			if (!parsed.success) return parsed;
+		}
+		return undefined;
 	}
 }
 

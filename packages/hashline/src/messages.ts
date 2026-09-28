@@ -1,6 +1,7 @@
 /** Centralized error/warning text for the hashline parser, applier, and patcher. */
 
 import { formatNumberedLine, HL_FILE_HASH_SEP, HL_FILE_PREFIX, HL_FILE_SUFFIX, HL_RANGE_SEP } from "./format";
+import type { BlockSpan } from "./types";
 
 /** Lines of context shown either side of a hash mismatch. */
 export const MISMATCH_CONTEXT = 2;
@@ -29,6 +30,39 @@ export function formatAnchoredContext(anchorLines: readonly number[], fileLines:
 	}
 	return rows;
 }
+/** Concrete range operation rejected because its absolute end precedes its start. */
+export type AbsoluteRangeOp = "replace" | "delete";
+
+/** Explain absolute range endpoints and provide safe, non-applying retry forms. */
+export function invalidAbsoluteRangeMessage(
+	patchLine: number,
+	start: number,
+	end: number,
+	op: AbsoluteRangeOp,
+	block?: BlockSpan,
+): string {
+	const single = op === "replace" ? `SWAP ${start}${HL_RANGE_SEP}${start}:` : `DEL ${start}`;
+	const countedEnd = start + end - 1;
+	const counted =
+		Number.isSafeInteger(countedEnd) && countedEnd >= start
+			? op === "replace"
+				? `SWAP ${start}${HL_RANGE_SEP}${countedEnd}:`
+				: `DEL ${start}${HL_RANGE_SEP}${countedEnd}`
+			: null;
+	const blockForm = op === "replace" ? `SWAP.BLK ${start}:` : `DEL.BLK ${start}`;
+	let message =
+		`line ${patchLine}: Invalid absolute range: start ${start}, end ${end}. ` +
+		`The value after \`${HL_RANGE_SEP}\` is an absolute source line, not a line count or replacement length. ` +
+		`For one line use \`${single}\`.`;
+	if (counted !== null) {
+		message += ` For ${end} lines starting at ${start}, use \`${counted}\`.`;
+	}
+	if (block?.start === start && block.end > start) {
+		message +=
+			` The syntactic block beginning at ${start} ends at ${block.end}, ` + `so \`${blockForm}\` is also valid.`;
+	}
+	return message;
+}
 
 /** Optional patch envelope start marker; silently consumed. */
 export const BEGIN_PATCH_MARKER = "*** Begin Patch";
@@ -52,15 +86,31 @@ export const REPLACE_PAIR_COALESCED_WARNING = `Two hunks targeted the same range
 export const BARE_BODY_AUTO_PIPED_WARNING =
 	"Auto-prefixed bare body row(s) with `+`. Body rows must be `+TEXT` literal lines.";
 
+/**
+ * Bare `-` body rows accepted as literal Markdown bullets. Only emitted when
+ * the hunk is unambiguously a bullet list: every `-` row is bullet-shaped
+ * (`- item`) and the body has no unified-diff `+new` counterpart rows.
+ */
+export const MINUS_BULLET_AUTO_PIPED_WARNING =
+	"Auto-prefixed bare `- ` bullet row(s) as literal content. `-` rows never remove lines — the range does that; always prefix literal body rows with `+`: `+- item`.";
+
 /** Unified-diff-style `-` row in a hunk body. */
 export const MINUS_ROW_REJECTED =
-	"`-` rows are not valid; the range already names the lines being changed. For a literal `-` line, write `+-…`.";
+	"`-` rows are not valid; the range already names the lines being changed. For Markdown bullets or other literal `-` lines, prefix the literal row with `+`: `+- item`.";
 
 /** Replace hunk with no body. */
 export const EMPTY_REPLACE = `\`SWAP N${HL_RANGE_SEP}M:\` needs at least one \`+TEXT\` body row. To delete lines, use \`DEL N${HL_RANGE_SEP}M\`.`;
 
 /** `replace_block N:` hunk with no body. */
 export const EMPTY_BLOCK = "`SWAP.BLK N:` needs at least one `+TEXT` body row. To delete a block, use `DEL.BLK N`.";
+
+/** Optional source-aware suggestions appended to block-anchor diagnostics. */
+export interface BlockDiagnosticSuggestions {
+	/** Closest following multi-line block that begins after the authored anchor. */
+	nextBlock?: BlockSpan;
+	/** Closest preceding multi-line block whose span contains the authored anchor. */
+	enclosingBlock?: BlockSpan;
+}
 
 /**
  * Block-anchored replace/delete could not resolve to a syntactic block
@@ -74,12 +124,31 @@ export function blockUnresolvedMessage(
 	line: number,
 	op: "replace" | "delete" = "replace",
 	fileLines?: readonly string[],
+	suggestions: BlockDiagnosticSuggestions = {},
 ): string {
 	const phrase = op === "delete" ? `DEL.BLK ${line}` : `SWAP.BLK ${line}:`;
 	const fallback = op === "delete" ? `DEL ${line}${HL_RANGE_SEP}M` : `SWAP ${line}${HL_RANGE_SEP}M:`;
-	let message =
-		`\`${phrase}\` could not resolve a syntactic block beginning on line ${line} ` +
-		`(unsupported language, blank/closer line, or parse error). Use \`${fallback}\` with explicit lines.`;
+	const anchorText = fileLines?.[line - 1];
+	const nextBlock = suggestions.nextBlock;
+	let message: string;
+	if (anchorText !== undefined && anchorText.trim().length === 0 && nextBlock) {
+		const retry = op === "delete" ? `DEL.BLK ${nextBlock.start}` : `SWAP.BLK ${nextBlock.start}:`;
+		message =
+			`Line ${line} is blank; no syntactic block can begin there. ` +
+			`The next multi-line block begins at line ${nextBlock.start} and ends at line ${nextBlock.end}. ` +
+			`Retry \`${retry}\`.`;
+	} else {
+		message =
+			`\`${phrase}\` could not resolve a syntactic block beginning on line ${line} ` +
+			`(unsupported language, blank/closer line, or parse error). Use \`${fallback}\` with explicit lines.`;
+	}
+	const enclosingBlock = suggestions.enclosingBlock;
+	if (enclosingBlock) {
+		const retry = op === "delete" ? `DEL.BLK ${enclosingBlock.start}` : `SWAP.BLK ${enclosingBlock.start}:`;
+		message +=
+			` The nearest enclosing multi-line block begins at line ${enclosingBlock.start} ` +
+			`and ends at line ${enclosingBlock.end}; use \`${retry}\` to target it.`;
+	}
 	if (fileLines) {
 		const context = formatAnchoredContext([line], fileLines);
 		if (context.length > 0) message += `\n\n${context.join("\n")}`;
@@ -107,6 +176,55 @@ export function insertAfterBlockCloserLoweredWarning(line: number): string {
  */
 export function insertAfterBlockUnresolvedLoweredWarning(line: number): string {
 	return `\`INS.BLK.POST ${line}:\` could not resolve a syntactic block on line ${line}, so it was applied as plain \`INS.POST ${line}:\`. Verify the landing line; anchor on a line that OPENS a construct.`;
+}
+/**
+ * A one-sided boundary echo whose payload is too short to be the widened
+ * range's full content: dropping the echo deletes range line(s) the payload
+ * never restates (the "widened range" reading), while the "range shifted by
+ * the echo" reading keeps them. The readings produce different files, so the
+ * edit is rejected instead of repaired.
+ */
+export function ambiguousBoundaryEchoMessage(
+	startLine: number,
+	endLine: number,
+	side: "leading" | "trailing",
+	count: number,
+): string {
+	const where =
+		side === "leading"
+			? `opens by restating the ${count} line(s) just above the range`
+			: `ends by restating the ${count} line(s) just below the range`;
+	return (
+		`\`SWAP ${startLine}${HL_RANGE_SEP}${endLine}:\` rejected: the body ${where}, ` +
+		`but is too short to be the full final content of the widened range — applying it as-is or ` +
+		`auto-repairing would delete range line(s) the body never restates. ` +
+		`Re-issue with the range covering exactly the lines that change and the body as their complete ` +
+		`final content: drop the restated keeper from the body, or widen the range to consume it.`
+	);
+}
+
+/**
+ * A replacement range deletes trailing structural closer(s) the payload never
+ * restates, and nothing anchors the payload inside the block those closers
+ * terminate: the payload has no unmatched opener for them and its indentation
+ * is not deeper than the closer. Sparing the closer would have to guess
+ * whether the payload belongs before it (inside the block) or after it (a
+ * sibling), so the edit is rejected instead of repaired.
+ */
+export function ambiguousCloserSpareMessage(
+	startLine: number,
+	endLine: number,
+	closerLine: number,
+	count: number,
+): string {
+	const closers = count === 1 ? `line ${closerLine}` : `lines ${closerLine}-${closerLine + count - 1}`;
+	return (
+		`\`SWAP ${startLine}${HL_RANGE_SEP}${endLine}:\` rejected: the range deletes the closing-delimiter ` +
+		`${closers} but the body never restates it, and the body claims no position inside that block ` +
+		`(no unmatched opener, indentation not deeper than the closer) — whether the new content belongs ` +
+		`before or after the closer is ambiguous. Restate the closer in the body at the intended position, ` +
+		`or use \`INS.PRE ${closerLine}:\` / \`INS.POST ${closerLine}:\` instead.`
+	);
 }
 
 /**
@@ -159,14 +277,9 @@ export const RECOVERY_EXTERNAL_WARNING =
 export const RECOVERY_SESSION_CHAIN_WARNING =
 	"Recovered from a stale file hash using an earlier in-session snapshot (a prior edit in this session advanced the hash).";
 
-/**
- * `Recovery`: session-chain replay fast-path. Less certain than
- * {@link RECOVERY_SESSION_CHAIN_WARNING} — the 3-way merge refused, the
- * anchor-content gate passed, but a coincidental insert+delete earlier in
- * the chain could still misplace an anchor — hence the verify hedge.
- */
-export const RECOVERY_SESSION_REPLAY_WARNING =
-	"Recovered by replaying your edits onto the current file content (a prior in-session edit changed the lines you re-targeted with a stale hash). Verify the diff matches your intent.";
+/** `Recovery`: stale anchors were relocated to unchanged live lines after drift. */
+export const RECOVERY_LINE_REMAP_WARNING =
+	"Recovered by remapping stale line anchors to unchanged current lines (file changed since the tagged read). Verify the diff matches your intent.";
 
 /**
  * `insert head:`/`insert tail:` applied despite a stale snapshot tag.
@@ -219,21 +332,66 @@ function formatLineRanges(lines: readonly number[]): string {
 	return parts.join(", ");
 }
 
+/** One anchored line whose actual content is being surfaced in an error message. */
+export interface RevealedLine {
+	line: number;
+	text: string;
+}
+
+/**
+ * Content preview handed to {@link unseenLinesMessage}. `lines` are the
+ * unseen anchor lines whose actual file content we surface inline (from the
+ * tagged snapshot the caller matched). `truncated` = true means the anchor
+ * range exceeded the inline reveal cap; the caller only revealed a prefix
+ * and the remaining unseen lines still require a range re-read.
+ */
+export interface UnseenLinesReveal {
+	lines: readonly RevealedLine[];
+	truncated: boolean;
+}
+
 /**
  * An anchored edit referenced lines the read that minted the cited tag never
  * displayed (a partial range, or a structural summary that collapsed bodies).
  * Editing lines you have not read is the off-by-memory failure that mangles
- * files; reject and make the model re-read those exact lines first.
+ * files. When `reveal.lines` is non-empty, the caller has already inlined the
+ * actual file content at those lines and merged them into the snapshot's
+ * seen-line set, so the message points the model at a straight retry with the
+ * same `[path#tag]` header; when the reveal is empty or truncated, the
+ * message falls back to instructing a range re-read.
  */
-export function unseenLinesMessage(sectionPath: string, unseenLines: readonly number[], tag: string): string {
+export function unseenLinesMessage(
+	sectionPath: string,
+	unseenLines: readonly number[],
+	tag: string,
+	reveal: UnseenLinesReveal = { lines: [], truncated: false },
+): string {
 	const ranges = formatLineRanges(unseenLines);
 	const selector = ranges.replace(/, /g, ",");
-	return (
+	const header =
 		`This edit anchors to lines ${ranges} of ${sectionPath} that ` +
 		`${HL_FILE_PREFIX}${sectionPath}${HL_FILE_HASH_SEP}${tag}${HL_FILE_SUFFIX} never displayed (it showed a ` +
-		`partial range, a search hit, or a folded summary). Re-read them in full first with a ranged read like ` +
-		`\`${sectionPath}:${selector}\` — it skips summarization and mints a fresh tag (a plain re-read just re-folds ` +
-		`them) — then re-issue the edit.`
+		`partial range, a search hit, or a folded summary).`;
+	if (reveal.lines.length === 0) {
+		return (
+			`${header} Re-read them in full first with a ranged read like ` +
+			`\`${sectionPath}:${selector}\` — it skips summarization and mints a fresh tag (a plain re-read just re-folds ` +
+			`them) — then re-issue the edit.`
+		);
+	}
+	const preview = reveal.lines.map(({ line, text }) => `  ${formatNumberedLine(line, text)}`).join("\n");
+	if (reveal.truncated) {
+		return (
+			`${header} Preview of the actual file content at the first ${reveal.lines.length} unseen line(s):\n${preview}\n` +
+			`The range exceeds the inline preview cap — re-read the remainder with \`${sectionPath}:${selector}\` before ` +
+			`re-issuing the edit.`
+		);
+	}
+	return (
+		`${header} Actual file content at those lines:\n${preview}\n` +
+		`Verify the content matches what you intend to touch, then re-issue the edit with the same ` +
+		`${HL_FILE_PREFIX}path${HL_FILE_HASH_SEP}tag${HL_FILE_SUFFIX} header — a straight retry now succeeds without a re-read. ` +
+		`If the content does NOT match, fix your line numbers.`
 	);
 }
 
@@ -247,7 +405,7 @@ export type BlockOp = "replace" | "delete" | "insert_after";
  * form only earns its keep when it spares counting a closing line you cannot
  * see. Reject and point at both fixes.
  */
-export function blockSingleLineMessage(line: number, op: BlockOp): string {
+export function blockSingleLineMessage(line: number, op: BlockOp, enclosingBlock?: BlockSpan): string {
 	const blockForm = op === "insert_after" ? "INS.BLK.POST" : op === "delete" ? "DEL.BLK" : "SWAP.BLK";
 	const plainForm =
 		op === "insert_after"
@@ -255,9 +413,19 @@ export function blockSingleLineMessage(line: number, op: BlockOp): string {
 			: op === "delete"
 				? `DEL ${line}`
 				: `SWAP ${line}${HL_RANGE_SEP}${line}:`;
-	return (
+	let message =
 		`\`${blockForm} ${line}\` resolved a single-line block — line ${line} is a bare statement, not the opening line ` +
-		`of a multi-line construct. For that one line use \`${plainForm}\`; to act on an enclosing construct, anchor ${blockForm} ` +
-		`on the line that OPENS it (e.g. its \`function\`/\`if\`/\`case\` header), never a statement inside it.`
-	);
+		`of a multi-line construct. For only this statement use \`${plainForm}\`.`;
+	if (enclosingBlock) {
+		const enclosingForm =
+			op === "insert_after"
+				? `INS.BLK.POST ${enclosingBlock.start}:`
+				: op === "delete"
+					? `DEL.BLK ${enclosingBlock.start}`
+					: `SWAP.BLK ${enclosingBlock.start}:`;
+		message +=
+			` The nearest enclosing multi-line block begins at line ${enclosingBlock.start} ` +
+			`and ends at line ${enclosingBlock.end}; use \`${enclosingForm}\` to target it.`;
+	}
+	return message;
 }

@@ -1,40 +1,40 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import * as fs from "node:fs";
-import { $env, isBunTestRuntime, isTerminalHeadless, logger } from "@oh-my-pi/pi-utils";
+import {
+	$env,
+	isBunTestRuntime,
+	isTerminalHeadless,
+	logger,
+	postmortem,
+	restoreTerminalStderr,
+	suppressTerminalStderr,
+} from "@oh-my-pi/pi-utils";
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
 import {
-	isInsideTmux,
+	isInsideTerminalMultiplexer,
 	NotifyProtocol,
 	setCellDimensions,
 	setOsc99Supported,
 	TERMINAL,
-	wrapTmuxPassthrough,
 } from "./terminal-capabilities";
-import { type HangulCompatibilityJamoWidth, setHangulCompatibilityJamoWidth } from "./utils";
+import { isInsideTmux, wrapTmuxPassthrough } from "./tmux";
+import { setHangulCompatibilityJamoWidth } from "./utils";
 
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
-// Hangul Compatibility Jamo (U+3131..=U+318E) render width is terminal-dependent:
-// Ghostty follows UAX#11 (2 cells); Terminal.app and iTerm2 render narrow (1),
-// matching the macOS platform default. Override only for terminals known to
-// disagree — the rest keep the platform default (macOS narrow, otherwise UAX#11),
-// so this is a no-op everywhere except Ghostty. A runtime DSR/CPR probe that
-// auto-detects the width on unknown terminals is tracked separately.
-export function resolveHangulCompatibilityJamoWidthFromTerminalIdentity(
-	env: NodeJS.ProcessEnv = Bun.env,
-): HangulCompatibilityJamoWidth {
-	if (
-		env.GHOSTTY_RESOURCES_DIR ||
-		env.TERM_PROGRAM?.toLowerCase() === "ghostty" ||
-		env.TERM?.toLowerCase().includes("ghostty")
-	) {
-		return 2;
-	}
-	return "platform";
+const WINDOWS_TERMINAL_OSC11_POLL_MS = 30_000;
+function shouldEnableModifyOtherKeysFallback(env: NodeJS.ProcessEnv = Bun.env): boolean {
+	if (!env.SSH_CONNECTION && !env.SSH_TTY && !env.SSH_CLIENT) return true;
+	return TERMINAL.id !== "base" && TERMINAL.id !== "trueColor";
 }
 
+function shouldPollWindowsTerminalAppearance(env: NodeJS.ProcessEnv = Bun.env): boolean {
+	if (process.platform !== "win32") return false;
+	if (!env.WT_SESSION) return false;
+	return !env.TERM_PROGRAM || env.TERM_PROGRAM.toLowerCase() === "windows_terminal";
+}
 /**
  * Maximum encoded UTF-8 bytes per `process.stdout.write` call on Windows.
  *
@@ -156,6 +156,15 @@ let terminalEverStarted = false;
 // jumps to the viewport home, dropping the parent shell prompt on top of the
 // dead frame after exit.
 let altScreenActive = false;
+let terminalRestoreRegistered = false;
+
+function registerPostmortemTerminalRestore(): void {
+	if (terminalRestoreRegistered) return;
+	terminalRestoreRegistered = true;
+	postmortem.register("terminal-restore", () => {
+		emergencyTerminalRestore();
+	});
+}
 
 /** Record alternate-screen state (called by the TUI on `?1049h`/`?1049l` writes). */
 export function setAltScreenActive(active: boolean): void {
@@ -261,6 +270,9 @@ function createConsoleCodepageGuard(): (() => void) | null {
  */
 export function emergencyTerminalRestore(): void {
 	try {
+		// Crash paths must surface subsequent stderr (fatal reports) on the
+		// real terminal; no-op when the stderr guard is inactive.
+		restoreTerminalStderr();
 		const terminal = activeTerminal;
 		if (terminal) {
 			terminal.stop();
@@ -281,6 +293,7 @@ export function emergencyTerminalRestore(): void {
 			process.stdout.write(
 				"\x1b[?2026l" + // End synchronized output
 					"\x1b[?7h" + // Restore autowrap
+					"\x1b[?1l\x1b>" + // Restore normal cursor-key + keypad mode (rmkx, #6374)
 					"\x1b[?2004l" + // Disable bracketed paste
 					"\x1b[?2031l" + // Disable Mode 2031 appearance notifications
 					"\x1b[?2048l" + // Disable in-band resize notifications
@@ -307,8 +320,8 @@ export function emergencyTerminalRestore(): void {
 /** Terminal-reported appearance (dark/light mode). */
 export type TerminalAppearance = "dark" | "light";
 export interface Terminal {
-	// Start the terminal with input and resize handlers
-	start(onInput: (data: string) => void, onResize: () => void): void;
+	// Start the terminal with input, resize, and host-disconnect handlers.
+	start(onInput: (data: string) => void, onResize: () => void, onDisconnect?: () => void): void;
 
 	// Stop the terminal and restore state
 	stop(): void;
@@ -368,15 +381,29 @@ export interface Terminal {
 	 * Register a callback for terminal appearance (dark/light) changes.
 	 * Detection uses OSC 11 background color query with Mode 2031 as a change trigger.
 	 * Fires when the detected appearance changes, including the initial detection.
+	 * Subscribers registered after detection are invoked immediately with the
+	 * already-detected appearance so late subscribers never miss it.
 	 */
 	onAppearanceChange(callback: (appearance: TerminalAppearance) => void): void;
+	/**
+	 * Issue a single OSC 11 background-color re-query, driving the appearance
+	 * callbacks through the same parse/dedup pipeline used at startup and on Mode
+	 * 2031 notifications. Bounded: one probe per call, no timers. Invoked on the
+	 * user's explicit display-reset gesture (Ctrl+L) so terminals that cannot
+	 * deliver end-to-end Mode 2031 notifications still pick up a light/dark switch
+	 * without a restart. Optional so custom Terminals built against older pi-tui
+	 * versions keep working.
+	 */
+	refreshAppearance?(): void;
 	/** The last detected terminal appearance, or undefined if not yet known. */
 	get appearance(): TerminalAppearance | undefined;
 	/**
 	 * Register a callback fired once per DEC private mode when its DECRQM support
-	 * status resolves. Optional: only real terminals implement capability probing.
+	 * status resolves. `confirmed` is false when the terminal answered the DA1
+	 * sentinel without answering DECRQM, which proves only that querying support
+	 * is unavailable — not that the private mode itself is unsupported.
 	 */
-	onPrivateModeReport?(callback: (mode: number, supported: boolean) => void): void;
+	onPrivateModeReport?(callback: (mode: number, supported: boolean, confirmed?: boolean) => void): void;
 }
 
 /**
@@ -412,6 +439,7 @@ function parseOsc99KeyValues(section: string): Map<string, string> {
 	return values;
 }
 const XTERM_SCROLL_TO_BOTTOM_MODES = [1010, 1011] as const;
+type Osc11QueryRoute = "direct" | "tmux";
 
 function isXtermScrollToBottomMode(mode: number): boolean {
 	return mode === 1010 || mode === 1011;
@@ -439,6 +467,16 @@ export class ProcessTerminal implements Terminal {
 	#modifyOtherKeysTimeout?: Timer;
 	#stdinBuffer?: StdinBuffer;
 	#stdinDataHandler?: (data: string) => void;
+	#disconnectHandler?: () => void;
+	#stdinEndHandler = () => {
+		this.#markTerminalDisconnected("stdin ended");
+	};
+	#stdinCloseHandler = () => {
+		this.#markTerminalDisconnected("stdin closed");
+	};
+	#stdinErrorHandler = (err: Error) => {
+		this.#markTerminalDisconnected("stdin failed", err);
+	};
 	#dead = false;
 	// Captured at construction and re-read at start(): when true, every real
 	// terminal side effect (writes, probes, raw mode, SIGWINCH, timers) is
@@ -447,7 +485,7 @@ export class ProcessTerminal implements Terminal {
 	#writeLogPath = $env.PI_TUI_WRITE_LOG || "";
 	#stdoutErrorCleanup?: () => void;
 	#stdoutErrorHandler = (err: Error) => {
-		this.#markTerminalWriteFailed(err);
+		this.#markTerminalDisconnected("stdout failed", err);
 	};
 
 	#windowsVTInputRestore?: () => void;
@@ -455,7 +493,7 @@ export class ProcessTerminal implements Terminal {
 	#appearanceCallbacks: Array<(appearance: TerminalAppearance) => void> = [];
 	#appearance: TerminalAppearance | undefined;
 	#osc11Pending = false;
-	#osc11QueryQueued = false;
+	#osc11QueuedRoute?: Osc11QueryRoute;
 	#osc11ResponseBuffer = "";
 	#osc99PendingId: string | undefined;
 	#osc99ResponseBuffer = "";
@@ -464,7 +502,7 @@ export class ProcessTerminal implements Terminal {
 	#da1SentinelOwners: Da1SentinelOwner[] = [];
 	/** Resolved DECRQM support per private mode (mode → supported). */
 	#privateModeSupport = new Map<number, boolean>();
-	#privateModeCallbacks: Array<(mode: number, supported: boolean) => void> = [];
+	#privateModeCallbacks: Array<(mode: number, supported: boolean, confirmed: boolean) => void> = [];
 	/** Whether DEC 2048 in-band resize notifications are currently enabled. */
 	#inBandResizeActive = false;
 	/** Reassembly buffer for a DEC 2048 in-band resize report split across stdin reads. */
@@ -472,6 +510,7 @@ export class ProcessTerminal implements Terminal {
 	#reportedColumns?: number;
 	#reportedRows?: number;
 	#mode2031DebounceTimer?: Timer;
+	#windowsTerminalAppearancePollTimer?: Timer;
 	#progressTimer?: Timer;
 
 	get kittyProtocolActive(): boolean {
@@ -502,15 +541,40 @@ export class ProcessTerminal implements Terminal {
 
 	onAppearanceChange(callback: (appearance: TerminalAppearance) => void): void {
 		this.#appearanceCallbacks.push(callback);
+		// Replay an already-detected appearance: the startup OSC 11 response can
+		// arrive before consumers (e.g. the theme bridge) subscribe, and the
+		// dedup in #handleOsc11Response would otherwise suppress the value for
+		// them forever (#4731).
+		if (this.#appearance) {
+			try {
+				callback(this.#appearance);
+			} catch {
+				/* ignore callback errors */
+			}
+		}
 	}
 
-	onPrivateModeReport(callback: (mode: number, supported: boolean) => void): void {
+	/**
+	 * Re-query the terminal background via a single OSC 11 probe. Reuses the
+	 * startup DA1-sentinel FIFO, pending/queued gating, parsing, dedup, and
+	 * appearance callbacks. Inside tmux, only this explicit path wraps the query
+	 * and sentinel together for passthrough to the outer terminal; startup and
+	 * Mode 2031 probes remain direct. Bounded to one probe per call; no timers are
+	 * armed. Suppressed while headless or after the terminal is torn down.
+	 */
+	refreshAppearance(): void {
+		if (this.#headless || this.#dead) return;
+		this.#queryBackgroundColor(isInsideTmux() ? "tmux" : "direct");
+	}
+
+	onPrivateModeReport(callback: (mode: number, supported: boolean, confirmed?: boolean) => void): void {
 		this.#privateModeCallbacks.push(callback);
 	}
 
-	start(onInput: (data: string) => void, onResize: () => void): void {
+	start(onInput: (data: string) => void, onResize: () => void, onDisconnect?: () => void): void {
 		this.#inputHandler = onInput;
 		this.#resizeHandler = onResize;
+		this.#disconnectHandler = onDisconnect;
 
 		// Headless (tests): suppress every real-terminal side effect. Skip raw
 		// mode, stdin listeners, capability probes, SIGWINCH, and emergency-restore
@@ -518,10 +582,16 @@ export class ProcessTerminal implements Terminal {
 		// escapes never reach the developer's terminal during `bun test`.
 		this.#headless = isTerminalHeadless();
 		if (this.#headless) return;
+		registerPostmortemTerminalRestore();
 
 		// Register for emergency cleanup
 		activeTerminal = this;
 		terminalEverStarted = true;
+
+		// Keep unmanaged fd-2 writes (macOS libmalloc/framework diagnostics) off
+		// the viewport while we own the terminal; released in stop(). See
+		// stderr-guard in pi-utils (mirrors openai/codex#24459).
+		suppressTerminalStderr();
 
 		// Save previous state and enable raw mode
 		this.#wasRaw = process.stdin.isRaw || false;
@@ -529,10 +599,22 @@ export class ProcessTerminal implements Terminal {
 			process.stdin.setRawMode(true);
 		}
 		process.stdin.setEncoding("utf8");
+		process.stdin.on("end", this.#stdinEndHandler);
+		process.stdin.on("close", this.#stdinCloseHandler);
+		process.stdin.on("error", this.#stdinErrorHandler);
 		process.stdin.resume();
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
 		this.#safeWrite("\x1b[?2004h");
+
+		// Force normal cursor-key (DECCKM) and numeric-keypad mode (terminfo
+		// `rmkx` = "\x1b[?1l\x1b>"). omp decodes both CSI ("\x1b[A") and SS3
+		// ("\x1bOA") arrow encodings, so it never enables application mode
+		// itself — but a prior program that left the TTY in application-cursor-
+		// keys mode makes arrows arrive as SS3. Normalizing on entry keeps input
+		// in the predictable default state; stop() restores the same on exit.
+		// See #6374.
+		this.#safeWrite("\x1b[?1l\x1b>");
 
 		// Set up resize handler immediately. The OS refreshes process.stdout
 		// dimensions before firing `resize`, so it is authoritative for geometry:
@@ -558,7 +640,7 @@ export class ProcessTerminal implements Terminal {
 		// The query handler intercepts input temporarily, then installs the user's handler
 		// See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
 		this.#queryAndEnableKittyProtocol();
-		setHangulCompatibilityJamoWidth(resolveHangulCompatibilityJamoWidthFromTerminalIdentity());
+		setHangulCompatibilityJamoWidth(TERMINAL.hangulJamoWidth);
 
 		// Query terminal background color via OSC 11 for dark/light detection.
 		// Uses DA1 (Primary Device Attributes) as a sentinel: terminals process
@@ -583,7 +665,8 @@ export class ProcessTerminal implements Terminal {
 		// WezTerm) detect the appearance once at startup and pick up later OS
 		// theme changes on next launch. Earlier builds polled OSC 11 every 30 s
 		// here for those terminals, but each poll's OSC 11/DA1 write wiped the
-		// user's active text selection on several of them (#3297).
+		// user's active text selection on several of them (#3297). Native Windows
+		// Terminal gets a scoped fallback after DECRQM confirms 2031 is unsupported.
 
 		// Probe DEC private-mode support via DECRQM. 2026 (synchronized output)
 		// gates the renderer's begin/end markers; 2048 (in-band resize) is enabled
@@ -689,10 +772,33 @@ export class ProcessTerminal implements Terminal {
 		const decrpmResponsePattern = /^\x1b\[\?(\d+);(\d+)\$y$/;
 
 		// In-band resize report (DEC mode 2048): \x1b[48;rows;cols;yPixels;xPixels t
-		const inBandResizePattern = /^\x1b\[48;(\d+);(\d+);(\d+);(\d+)t$/;
+		// Any field may carry `:`-separated subparameters, which clients MUST
+		// ignore per spec (#4748): capture the leading digits of each field and
+		// skip the subparameter tail instead of dropping the whole report.
+		const inBandResizePattern = /^\x1b\[48;(\d+)(?::[\d:]*)?;(\d+)(?::[\d:]*)?;(\d+)(?::[\d:]*)?;(\d+)(?::[\d:]*)?t$/;
 
-		// Forward individual sequences to the input handler
 		this.#stdinBuffer.on("data", (sequence: string) => {
+			// Fast path for plain-text bytes: every escape-probe regex below
+			// anchors on `^\x1b…`, so a byte that is not ESC can never match. A
+			// non-bracketed paste of N printable chars arrives as N per-scalar
+			// `data` events; running the full probe suite per event turns a
+			// 100 KB paste into ~600K regex executions and blocks the event
+			// loop. Skip straight to the input handler when no reassembly
+			// buffer is holding state that a non-ESC continuation could feed
+			// (issue #4073 case C).
+			if (
+				(sequence.length === 0 || sequence.charCodeAt(0) !== 0x1b) &&
+				this.#privateCsiResponseBuffer.length === 0 &&
+				this.#inBandResizeBuffer.length === 0 &&
+				this.#osc11ResponseBuffer.length === 0 &&
+				this.#osc99ResponseBuffer.length === 0
+			) {
+				if (this.#inputHandler) {
+					this.#inputHandler(sequence);
+				}
+				return;
+			}
+
 			// Reassemble split private CSI responses (DA1, kitty keyboard, Mode 2031).
 			// When the terminal writes the response slowly enough that the StdinBuffer's
 			// flush timeout elapses mid-sequence, the prefix `\x1b[?<digits>` arrives as
@@ -741,7 +847,7 @@ export class ProcessTerminal implements Terminal {
 			// reassembled sequence that turns out not to be a resize report (e.g. a
 			// split kitty `\x1b[48;…u` for a digit key) is forwarded to the input
 			// handler rather than dropped.
-			const inBandResizePartialPattern = /^\x1b\[4[\d;]*$/;
+			const inBandResizePartialPattern = /^\x1b\[4[\d;:]*$/;
 			const isInBandResizePartial = this.#inBandResizeActive && inBandResizePartialPattern.test(sequence);
 			if (this.#inBandResizeBuffer && sequence.startsWith("\x1b")) {
 				// A new escape interrupted the partial; the stale partial is
@@ -804,29 +910,32 @@ export class ProcessTerminal implements Terminal {
 						}
 						// Start a queued OSC 11 query once the prior cycle is fully drained.
 						if (
-							this.#osc11QueryQueued &&
+							this.#osc11QueuedRoute !== undefined &&
 							!this.#osc11Pending &&
 							!this.#da1SentinelOwners.some(o => o.kind === "osc11") &&
 							!this.#dead
 						) {
-							this.#osc11QueryQueued = false;
-							this.#startOsc11Query();
+							const route = this.#osc11QueuedRoute;
+							this.#osc11QueuedRoute = undefined;
+							this.#startOsc11Query(route);
 						}
 						break;
 					}
 					case "privateMode": {
-						// DA1 beat the DECRPM reply for this mode → treat as unsupported.
-						this.#resolvePrivateMode(owner.mode, false);
+						// DA1 beat the DECRPM reply. The terminal cannot report this
+						// capability, but may still implement it; keep that distinction
+						// so static terminal detection is not incorrectly downgraded.
+						this.#resolvePrivateMode(owner.mode, false, false);
 						break;
 					}
 					case "keyboard": {
-						// Keyboard probe sentinel: kitty reply never arrived → fall back to modifyOtherKeys.
-						if (!this.#kittyProtocolActive && !this.#modifyOtherKeysActive && this.#modifyOtherKeysTimeout) {
+						// Keyboard probe sentinel: kitty reply never arrived → fall back to modifyOtherKeys
+						// only where the resolved terminal is known enough to tolerate it.
+						if (this.#modifyOtherKeysTimeout) {
 							clearTimeout(this.#modifyOtherKeysTimeout);
 							this.#modifyOtherKeysTimeout = undefined;
-							this.#safeWrite("\x1b[>4;2m");
-							this.#modifyOtherKeysActive = true;
 						}
+						this.#enableModifyOtherKeysFallback();
 						break;
 					}
 					case "osc99Probe": {
@@ -943,29 +1052,43 @@ export class ProcessTerminal implements Terminal {
 	 * DA1 avoids indefinite hangs: if DA1 response arrives before OSC 11,
 	 * the terminal does not support OSC 11.
 	 */
-	#queryBackgroundColor(): void {
+	#queryBackgroundColor(route: Osc11QueryRoute = "direct"): void {
 		if (this.#dead) return;
 		// Queue if an OSC 11 query is in flight or its DA1 sentinel hasn't been
 		// consumed yet. Starting a new query while a DA1 is outstanding would
 		// increment the sentinel counter, and the old DA1 arrival would then
-		// prematurely clear the new query's pending state.
+		// prematurely clear the new query's pending state. Preserve a requested
+		// tmux passthrough route when coalescing direct and explicit queries.
 		if (this.#osc11Pending || this.#da1SentinelOwners.some(o => o.kind === "osc11")) {
-			this.#osc11QueryQueued = true;
+			if (this.#osc11QueuedRoute !== "tmux") this.#osc11QueuedRoute = route;
 			return;
 		}
-		this.#startOsc11Query();
+		this.#startOsc11Query(route);
 	}
 
-	#startOsc11Query(): void {
+	#startOsc11Query(route: Osc11QueryRoute): void {
 		this.#osc11Pending = true;
 		this.#osc11ResponseBuffer = "";
 		this.#da1SentinelOwners.push({ kind: "osc11" });
+		if (route === "tmux") {
+			this.#safeWrite(wrapTmuxPassthrough("\x1b]11;?\x07\x1b[c"));
+			return;
+		}
 		this.#safeWrite("\x1b]11;?\x07"); // OSC 11 query (BEL terminated)
 		this.#safeWrite("\x1b[c"); // DA1 sentinel
 	}
 
 	#shouldQueryOsc99Support(): boolean {
 		if (TERMINAL.notifyProtocol !== NotifyProtocol.Osc99) return false;
+		// Never probe inside a terminal multiplexer. tmux/screen forward the
+		// passthrough-wrapped `p=?` query to the outer terminal, but cannot route
+		// the capability reply back to the pane that sent it (tmux/tmux#4386,
+		// tmux/tmux#3964), so the reply leaks into the pane as literal text and
+		// its bytes perturb input (issue #5582 — the notification sibling of the
+		// graphics-probe leak #5381). Rich notifications fall back to the
+		// single-line OSC 99 form until confirmation, and delivery still uses the
+		// passthrough/BEL path (#3395).
+		if (isInsideTerminalMultiplexer($env)) return false;
 		return !isBunTestRuntime() || $env.PI_TUI_OSC99_PROBE === "1";
 	}
 
@@ -979,14 +1102,9 @@ export class ProcessTerminal implements Terminal {
 		const id = `omp-probe-${nextOsc99ProbeId++}`;
 		this.#osc99PendingId = id;
 		this.#da1SentinelOwners.push({ kind: "osc99Probe", id });
-		// Wrap the probe under tmux so terminals behind `allow-passthrough on`
-		// can still respond (mirroring how `TerminalInfo.sendNotification`
-		// wraps notification deliveries). Without it the probe is swallowed
-		// inside tmux even when the outer terminal speaks OSC 99, and rich
-		// notifications stay permanently downgraded to the single-line fallback.
-		const probe = `\x1b]99;i=${id}:p=?;\x1b\\`;
-		const sequence = isInsideTmux() ? wrapTmuxPassthrough(probe) : probe;
-		this.#safeWrite(`${sequence}\x1b[c`);
+		// The probe never runs under a multiplexer (see #shouldQueryOsc99Support),
+		// so it is always sent directly to the terminal.
+		this.#safeWrite(`\x1b]99;i=${id}:p=?;\x1b\\\x1b[c`);
 	}
 
 	#handleOsc99CapabilityResponse(metaRaw: string, payload: string): boolean {
@@ -1034,6 +1152,13 @@ export class ProcessTerminal implements Terminal {
 		}
 	}
 
+	#enableModifyOtherKeysFallback(): void {
+		if (this.#kittyProtocolActive || this.#modifyOtherKeysActive) return;
+		if (!shouldEnableModifyOtherKeysFallback()) return;
+		this.#safeWrite("\x1b[>4;2m");
+		this.#modifyOtherKeysActive = true;
+	}
+
 	/**
 	 * Query terminal for Kitty keyboard protocol support and enable if available.
 	 *
@@ -1053,11 +1178,7 @@ export class ProcessTerminal implements Terminal {
 		this.#safeWrite("\x1b[?u\x1b[c");
 		this.#modifyOtherKeysTimeout = setTimeout(() => {
 			this.#modifyOtherKeysTimeout = undefined;
-			if (this.#kittyProtocolActive || this.#modifyOtherKeysActive) {
-				return;
-			}
-			this.#safeWrite("\x1b[>4;2m");
-			this.#modifyOtherKeysActive = true;
+			this.#enableModifyOtherKeysFallback();
 		}, 150);
 	}
 
@@ -1075,7 +1196,7 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	#handlePrivateModeReport(mode: number, status: string): void {
-		this.#resolvePrivateMode(mode, isPrivateModeSupported(status));
+		this.#resolvePrivateMode(mode, isPrivateModeSupported(status), true);
 		if (isXtermScrollToBottomMode(mode) && isPrivateModeSet(status)) {
 			this.#disableXtermScrollToBottomMode(mode);
 		}
@@ -1083,22 +1204,40 @@ export class ProcessTerminal implements Terminal {
 
 	/**
 	 * Record DECRQM support for a private mode (idempotent — first result wins)
-	 * and notify subscribers. Enables DEC 2048 in-band resize when 2048 resolves
-	 * supported.
+	 * and notify subscribers. `confirmed` distinguishes an explicit DECRPM
+	 * unsupported response from an absent response followed by the DA1 sentinel.
+	 * Enables DEC 2048 in-band resize only after positive confirmation.
 	 */
-	#resolvePrivateMode(mode: number, supported: boolean): void {
+	#resolvePrivateMode(mode: number, supported: boolean, confirmed: boolean): void {
 		if (this.#privateModeSupport.has(mode)) return;
 		this.#privateModeSupport.set(mode, supported);
 		for (const cb of this.#privateModeCallbacks) {
 			try {
-				cb(mode, supported);
+				cb(mode, supported, confirmed);
 			} catch {
 				// Ignore subscriber errors — capability reporting must not crash input.
 			}
 		}
 		if (mode === 2048 && supported) this.#enableInBandResize();
+		if (mode === 2031) this.#syncWindowsTerminalAppearancePolling(supported);
 	}
 
+	#syncWindowsTerminalAppearancePolling(mode2031Supported: boolean): void {
+		if (mode2031Supported || !shouldPollWindowsTerminalAppearance() || this.#dead) {
+			this.#clearWindowsTerminalAppearancePoll();
+			return;
+		}
+		if (this.#windowsTerminalAppearancePollTimer) return;
+		this.#windowsTerminalAppearancePollTimer = setInterval(() => {
+			this.#queryBackgroundColor();
+		}, WINDOWS_TERMINAL_OSC11_POLL_MS);
+	}
+
+	#clearWindowsTerminalAppearancePoll(): void {
+		if (!this.#windowsTerminalAppearancePollTimer) return;
+		clearInterval(this.#windowsTerminalAppearancePollTimer);
+		this.#windowsTerminalAppearancePollTimer = undefined;
+	}
 	#disableXtermScrollToBottomMode(mode: number): void {
 		if (this.#xtermScrollToBottomRestoreModes.has(mode) || this.#dead) return;
 		this.#xtermScrollToBottomRestoreModes.add(mode);
@@ -1147,9 +1286,9 @@ export class ProcessTerminal implements Terminal {
 	 * `rows` before the `resize` event fires, so they are authoritative for the
 	 * new cell geometry. A cached DEC 2048 report can be stale: the matching
 	 * post-resize report may be dropped (split across stdin reads past the flush
-	 * window) or carry `:`-subparameters the parser skips, leaving the getters
-	 * pinned to the old size — which freezes the rendered width because the
-	 * renderer reflows against {@link columns}/{@link rows}, not the live OS
+	 * window, or interrupted by another escape mid-reassembly), leaving the
+	 * getters pinned to the old size — which freezes the rendered width because
+	 * the renderer reflows against {@link columns}/{@link rows}, not the live OS
 	 * value. Drop a cached dimension that disagrees with the live OS value; the
 	 * terminal's next valid in-band report re-seeds pixel sizing.
 	 */
@@ -1215,6 +1354,11 @@ export class ProcessTerminal implements Terminal {
 			activeTerminal = null;
 		}
 
+		// Release terminal ownership of fd 2 first so external programs,
+		// suspend, and shutdown see the real stderr even if a later teardown
+		// step throws.
+		restoreTerminalStderr();
+
 		if (this.#clearProgressTimer()) {
 			this.#safeWrite(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		}
@@ -1222,6 +1366,13 @@ export class ProcessTerminal implements Terminal {
 		// Leave paint-time terminal modes even if the process exits between the
 		// begin/end halves of a frame. Safe no-ops on terminals that ignored them.
 		this.#safeWrite("\x1b[?2026l\x1b[?7h");
+
+		// Restore normal cursor-key (DECCKM) and numeric-keypad mode (terminfo
+		// `rmkx`). Symmetric with the normalize in start(): a TTY-sharing child
+		// can leave the terminal in application-cursor-keys mode, and without
+		// this reset the parent shell inherits SS3 arrows so Up/Down history
+		// navigation stays broken after omp exits (#6374).
+		this.#safeWrite("\x1b[?1l\x1b>");
 
 		// Disable bracketed paste mode
 		this.#safeWrite("\x1b[?2004l");
@@ -1251,7 +1402,8 @@ export class ProcessTerminal implements Terminal {
 		}
 		this.#appearanceCallbacks = [];
 		this.#osc11Pending = false;
-		this.#osc11QueryQueued = false;
+		this.#clearWindowsTerminalAppearancePoll();
+		this.#osc11QueuedRoute = undefined;
 		this.#osc11ResponseBuffer = "";
 		this.#osc99PendingId = undefined;
 		this.#osc99ResponseBuffer = "";
@@ -1293,6 +1445,10 @@ export class ProcessTerminal implements Terminal {
 			process.stdin.removeListener("data", this.#stdinDataHandler);
 			this.#stdinDataHandler = undefined;
 		}
+		process.stdin.removeListener("end", this.#stdinEndHandler);
+		process.stdin.removeListener("close", this.#stdinCloseHandler);
+		process.stdin.removeListener("error", this.#stdinErrorHandler);
+		this.#disconnectHandler = undefined;
 		this.#inputHandler = undefined;
 		this.#appearance = undefined;
 		if (this.#stdoutResizeListener) {
@@ -1306,9 +1462,15 @@ export class ProcessTerminal implements Terminal {
 		// where Ctrl+D could close the parent shell over SSH.
 		process.stdin.pause();
 
-		// Restore raw mode state
-		if (process.stdin.setRawMode) {
-			process.stdin.setRawMode(this.#wasRaw);
+		// Restore raw mode state. On a disconnected terminal (pane recycled, ssh
+		// dropped) the fd is no longer a tty and Bun's node:tty shim throws; there
+		// is nothing left to restore, and throwing would abort the caller. On a
+		// live terminal the failure still surfaces - swallowing it would silently
+		// leave stdin in raw mode.
+		try {
+			process.stdin.setRawMode?.(this.#wasRaw);
+		} catch (err) {
+			if (!this.#dead) throw err;
 		}
 		this.#stdoutErrorCleanup?.();
 		this.#stdoutErrorCleanup = undefined;
@@ -1318,10 +1480,33 @@ export class ProcessTerminal implements Terminal {
 		this.#stdoutErrorCleanup ??= registerStdoutErrorHandler(this.#stdoutErrorHandler);
 	}
 
-	#markTerminalWriteFailed(err: unknown): void {
+	#markTerminalDisconnected(reason: string, err?: unknown): void {
 		if (this.#dead) return;
 		this.#dead = true;
-		logger.warn("terminal write failed; disabling terminal rendering", { err });
+		logger.warn("terminal disconnected; stopping interactive rendering", { reason, err });
+
+		const disconnectHandler = this.#disconnectHandler;
+		this.#disconnectHandler = undefined;
+		if (!disconnectHandler) return;
+		// The handler tears the TUI down against a terminal that is already gone,
+		// so any step in it can fail. Swallow that: the exit below is the whole
+		// point of this method and must not be preempted by teardown noise.
+		try {
+			disconnectHandler();
+		} catch (handlerErr) {
+			logger.error("Terminal disconnect handler failed; exiting anyway", { err: handlerErr });
+		}
+
+		if (process.platform === "win32") {
+			void postmortem.quit(129);
+			return;
+		}
+		try {
+			process.kill(process.pid, "SIGHUP");
+		} catch (signalErr) {
+			logger.error("Failed to deliver terminal disconnect signal; exiting directly", { err: signalErr });
+			void postmortem.quit(129);
+		}
 	}
 
 	write(data: string): void {
@@ -1368,7 +1553,7 @@ export class ProcessTerminal implements Terminal {
 				process.stdout.write(data);
 			}
 		} catch (err) {
-			this.#markTerminalWriteFailed(err);
+			this.#markTerminalDisconnected("stdout failed", err);
 		}
 	}
 

@@ -7,6 +7,8 @@
 //! thread-local context isolated across concurrent pipeline stages and avoids
 //! blocking the async runtime on synchronous utility I/O.
 
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::{
 	collections::HashMap,
 	ffi::OsString,
@@ -18,6 +20,8 @@ use std::{
 	},
 };
 
+#[cfg(unix)]
+use brush_core::ShellFd;
 use brush_core::{
 	Error,
 	builtins::{BoxFuture, ContentOptions, ContentType, Registration},
@@ -30,6 +34,34 @@ use brush_core::{
 /// Signature of a patched uutils `run` entry point: consumes `argv` (with the
 /// command name at index 0) and returns a process-style exit code.
 type UutilRun = fn(Vec<OsString>) -> i32;
+
+#[cfg(unix)]
+fn process_substitution_fd(arg: &OsStr) -> Option<ShellFd> {
+	let fd = arg.to_str()?.strip_prefix("/dev/fd/")?.parse().ok()?;
+	(fd > OpenFiles::STDERR_FD).then_some(fd)
+}
+
+#[cfg(unix)]
+fn materialize_process_substitution_fds<SE: ShellExtensions>(
+	context: &ExecutionContext<'_, SE>,
+	argv: &mut [OsString],
+) -> Result<Vec<std::os::fd::OwnedFd>, Error> {
+	use std::os::fd::AsRawFd as _;
+
+	let mut fds = Vec::new();
+	for arg in argv {
+		let Some(shell_fd) = process_substitution_fd(arg) else {
+			continue;
+		};
+		let Some(file) = context.try_fd(shell_fd) else {
+			continue;
+		};
+		let fd = file.try_borrow_as_fd()?.try_clone_to_owned()?;
+		*arg = OsString::from(format!("/dev/fd/{}", fd.as_raw_fd()));
+		fds.push(fd);
+	}
+	Ok(fds)
+}
 
 /// Drives a patched uutils utility to completion under a [`pi_uutils_ctx`]
 /// scope derived from the command execution context.
@@ -76,14 +108,19 @@ async fn run_uutil<SE: ShellExtensions>(
 
 	// brush passes the command name as the first `CommandArg`, which is exactly
 	// the argv[0] uutils' argument parsing expects.
-	let argv: Vec<OsString> = args
+	#[cfg_attr(not(unix), allow(unused_mut))]
+	let mut argv: Vec<OsString> = args
 		.iter()
 		.map(|arg| OsString::from(arg.to_string()))
 		.collect();
+	#[cfg(unix)]
+	let process_substitution_fds = materialize_process_substitution_fds(&context, &mut argv)?;
 
 	drop(context);
 
 	let mut handle = tokio::task::spawn_blocking(move || {
+		#[cfg(unix)]
+		let _process_substitution_fds = process_substitution_fds;
 		let stdin: Box<dyn Read + Send> = match stdin {
 			Some(file) => Box::new(file),
 			None => Box::new(io::empty()),
@@ -209,6 +246,49 @@ uutil_builtin!(pub fn rm_builtin => uu_rm::run);
 uutil_builtin!(pub fn mv_builtin => uu_mv::run);
 uutil_builtin!(pub fn cat_builtin => uu_cat::run);
 uutil_builtin!(pub fn uniq_builtin => uu_uniq::run);
+uutil_builtin!(pub fn base64_builtin => uu_base64::run);
+uutil_builtin!(pub fn cmp_builtin => crate::cmp::run);
+uutil_builtin!(pub fn md5sum_builtin => uu_md5sum::run);
+uutil_builtin!(pub fn sha1sum_builtin => uu_sha1sum::run);
+uutil_builtin!(pub fn sha224sum_builtin => uu_sha224sum::run);
+uutil_builtin!(pub fn sha256sum_builtin => uu_sha256sum::run);
+uutil_builtin!(pub fn sha384sum_builtin => uu_sha384sum::run);
+uutil_builtin!(pub fn sha512sum_builtin => uu_sha512sum::run);
+uutil_builtin!(pub fn b2sum_builtin => uu_b2sum::run);
+uutil_builtin!(pub fn basename_builtin => uu_basename::run);
+uutil_builtin!(pub fn dirname_builtin => uu_dirname::run);
+uutil_builtin!(pub fn readlink_builtin => uu_readlink::run);
+uutil_builtin!(pub fn realpath_builtin => uu_realpath::run);
+uutil_builtin!(pub fn touch_builtin => uu_touch::run);
+uutil_builtin!(pub fn stat_builtin => uu_stat::run);
+uutil_builtin!(pub fn date_builtin => uu_date::run);
+uutil_builtin!(pub fn mktemp_builtin => uu_mktemp::run);
+uutil_builtin!(pub fn seq_builtin => uu_seq::run);
+uutil_builtin!(pub fn yes_builtin => uu_yes::run);
+uutil_builtin!(pub fn printenv_builtin => uu_printenv::run);
+uutil_builtin!(pub fn ln_builtin => uu_ln::run);
+uutil_builtin!(pub fn truncate_builtin => uu_truncate::run);
+uutil_builtin!(pub fn tac_builtin => uu_tac::run);
+uutil_builtin!(pub fn nproc_builtin => uu_nproc::run);
+uutil_builtin!(pub fn uname_builtin => uu_uname::run);
+uutil_builtin!(pub fn whoami_builtin => uu_whoami::run);
+uutil_builtin!(pub fn hostname_builtin => uu_hostname::run);
+uutil_builtin!(pub fn diff_builtin => pi_uu_diff::run);
+uutil_builtin!(pub fn cut_builtin => uu_cut::run);
+uutil_builtin!(pub fn tee_builtin => uu_tee::run);
+uutil_builtin!(pub fn tr_builtin => uu_tr::run);
+uutil_builtin!(pub fn paste_builtin => uu_paste::run);
+uutil_builtin!(pub fn comm_builtin => uu_comm::run);
+uutil_builtin!(pub fn sed_builtin => uu_sed::run);
+uutil_builtin!(pub fn xargs_builtin => uu_xargs::run);
+uutil_builtin!(pub fn jq_builtin => jaq::run);
+uutil_builtin!(pub fn ts_builtin => crate::moreutils::ts::run);
+uutil_builtin!(pub fn sponge_builtin => crate::moreutils::sponge::run);
+uutil_builtin!(pub fn ifne_builtin => crate::moreutils::ifne::run);
+uutil_builtin!(pub fn isutf8_builtin => crate::moreutils::isutf8::run);
+uutil_builtin!(pub fn combine_builtin => crate::moreutils::combine::run);
+#[cfg(unix)]
+uutil_builtin!(pub fn errno_builtin => crate::moreutils::errno::run);
 
 #[cfg(test)]
 mod tests {
@@ -217,14 +297,16 @@ mod tests {
 		ffi::OsString,
 		io::{self, Write},
 		path::PathBuf,
-		sync::{Arc, atomic::AtomicBool, mpsc},
+		sync::{Arc, atomic::AtomicBool},
 	};
+
+	use flume::Sender;
 
 	use super::{UutilRun, run_caught};
 
 	/// `Send` writer that forwards every write onto a channel so a test can
 	/// inspect what the utility wrote to the scope's stderr.
-	struct ChanWriter(mpsc::Sender<Vec<u8>>);
+	struct ChanWriter(Sender<Vec<u8>>);
 	impl Write for ChanWriter {
 		fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
 			let _ = self.0.send(buf.to_vec());
@@ -250,7 +332,7 @@ mod tests {
 	}
 
 	fn run_in_scope(run: UutilRun, argv: Vec<OsString>) -> (i32, String) {
-		let (tx, rx) = mpsc::channel();
+		let (tx, rx) = flume::unbounded();
 		let code = pi_uutils_ctx::scope(scope_io(Box::new(ChanWriter(tx))), || run_caught(run, argv));
 		let mut err = Vec::new();
 		while let Ok(chunk) = rx.try_recv() {

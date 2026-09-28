@@ -8,10 +8,11 @@
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
@@ -40,7 +41,7 @@ type PromptCustomMessage = Mock<
 	(
 		message: {
 			customType?: string;
-			content?: string | unknown[];
+			content?: string | (TextContent | ImageContent)[];
 			display?: boolean;
 			attribution?: string;
 			details: SkillPromptDetails;
@@ -49,14 +50,14 @@ type PromptCustomMessage = Mock<
 	) => Promise<void>
 >;
 
-async function writeSkillFile(dir: string, skillName: string, body: string): Promise<string> {
+async function writeSkillFile(dir: string, skillName: string, body: string): Promise<Skill> {
 	const skillPath = path.join(dir, `${skillName}.md`);
 	await Bun.write(skillPath, `---\nname: ${skillName}\n---\n${body}\n`);
-	return skillPath;
+	return { name: skillName, description: "", filePath: skillPath, baseDir: dir, source: "test" };
 }
 
 function createStubInputControllerContext(opts: {
-	skillCommands: Map<string, string>;
+	skillCommands: Map<string, Skill>;
 	isStreaming: boolean;
 	isCompacting?: boolean;
 }) {
@@ -132,12 +133,12 @@ function createStubInputControllerContext(opts: {
 
 describe("InputController skill queue chip metadata", () => {
 	let tempDir: TempDir;
-	let skillCommands: Map<string, string>;
+	let skillCommands: Map<string, Skill>;
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-skill-queue-stub-");
-		const skillPath = await writeSkillFile(tempDir.path(), "test-skill", "Do the thing.");
-		skillCommands = new Map<string, string>([["skill:test-skill", skillPath]]);
+		const skill = await writeSkillFile(tempDir.path(), "test-skill", "Do the thing.");
+		skillCommands = new Map<string, Skill>([["skill:test-skill", skill]]);
 	});
 
 	afterEach(() => {
@@ -260,7 +261,7 @@ describe("InputController skill queue chip metadata", () => {
 
 describe("compaction skill re-invocation", () => {
 	let tempDir: TempDir;
-	let skillCommands: Map<string, string>;
+	let skillCommands: Map<string, Skill>;
 
 	function firstPromptCustomCall(promptCustomMessage: PromptCustomMessage) {
 		const call = promptCustomMessage.mock.calls[0];
@@ -299,8 +300,8 @@ describe("compaction skill re-invocation", () => {
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-skill-compaction-stub-");
-		const skillPath = await writeSkillFile(tempDir.path(), "test-skill", "Do the thing.");
-		skillCommands = new Map<string, string>([["skill:test-skill", skillPath]]);
+		const skill = await writeSkillFile(tempDir.path(), "test-skill", "Do the thing.");
+		skillCommands = new Map<string, Skill>([["skill:test-skill", skill]]);
 	});
 
 	afterEach(() => {
@@ -323,7 +324,17 @@ describe("compaction skill re-invocation", () => {
 		if (!Array.isArray(message.content)) {
 			throw new Error("expected queued skill prompt to preserve image content blocks");
 		}
-		expect(message.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("Do the thing.") });
+		const renderedText = message.content[0];
+		if (renderedText?.type !== "text") {
+			throw new Error("expected first content block to be rendered skill text");
+		}
+		// Bug fix contract: a re-invoked user skill identifies itself and exposes its
+		// skill directory so relative skill paths resolve after compaction.
+		expect(renderedText.text).toContain("Do the thing.");
+		expect(renderedText.text).toContain('The user has invoked the "test-skill" skill');
+		expect(renderedText.text).toContain(`[Skill directory: ${tempDir.path()}]`);
+		expect(renderedText.text).toMatch(/[Rr]esolve any relative paths/);
+		expect(renderedText.text).toContain("User: arg1 arg2");
 		expect(message.content[1]).toEqual(image);
 		expect(message.details).toMatchObject({ name: "test-skill", args: "arg1 arg2", lineCount: 1 });
 		expect(options).toEqual({
@@ -640,11 +651,12 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 	};
 	const pendingMessagesContainer = new Container();
 	const requestRender = vi.fn();
+	const requestComponentRender = vi.fn();
 	const updatePendingMessagesDisplay = vi.fn();
 
 	const ctx = {
 		editor,
-		ui: { requestRender },
+		ui: { requestRender, requestComponentRender },
 		pendingMessagesContainer,
 		session,
 		viewSession: session,
@@ -656,7 +668,7 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 		locallySubmittedUserSignatures: new Set<string>(),
 	} as unknown as InteractiveModeContext;
 
-	return { ctx, editor, pendingMessagesContainer };
+	return { ctx, editor, pendingMessagesContainer, requestComponentRender };
 }
 
 describe("UiHelpers / InputController against derived queued custom display", () => {
@@ -687,8 +699,53 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		const uiHelpers = new UiHelpers(ctx);
 		uiHelpers.updatePendingMessagesDisplay();
 
-		const rendered = pendingMessagesContainer.render(120).join("\n");
-		expect(rendered).toMatch(/Steer: \/skill:test-skill arg1 arg2/);
+		const rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
+		expect(rendered).toContain("Steering · 1");
+		expect(rendered).toContain("1. /skill:test-skill arg1 arg2");
+		expect(rendered).not.toContain("Steer:");
+	});
+
+	it("requests the pending-container repaint after rebuilding and clearing it", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		queueCustomSteer(session, "/skill:test-skill arg1 arg2");
+
+		const { ctx, pendingMessagesContainer, requestComponentRender } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.updatePendingMessagesDisplay();
+
+		expect(pendingMessagesContainer.children.length).toBeGreaterThan(0);
+		expect(requestComponentRender).toHaveBeenNthCalledWith(1, pendingMessagesContainer);
+
+		session.clearQueue();
+		uiHelpers.updatePendingMessagesDisplay();
+
+		expect(pendingMessagesContainer.children).toHaveLength(0);
+		expect(requestComponentRender).toHaveBeenNthCalledWith(2, pendingMessagesContainer);
+	});
+
+	it("groups yield follow-ups under one heading", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		for (const text of ["inspect types", "run tests", "summarize"]) {
+			session.agent.followUp({
+				role: "user",
+				content: text,
+				attribution: "user",
+				timestamp: Date.now(),
+			});
+		}
+
+		const { ctx, pendingMessagesContainer } = createStubInteractiveModeContextForUiHelpers(session);
+		new UiHelpers(ctx).updatePendingMessagesDisplay();
+
+		const rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
+		expect(rendered).toContain("After yield · 3");
+		expect(rendered).toContain("1. inspect types");
+		expect(rendered).toContain("2. run tests");
+		expect(rendered).toContain("3. summarize");
+		expect(rendered).not.toContain("Follow-up:");
 	});
 
 	it("restores the compact slash form into the editor and clears the queue", async () => {
@@ -718,6 +775,7 @@ function createEventControllerFixture() {
 		updateEditorTopBorder: vi.fn(),
 		addMessageToChat,
 		updatePendingMessagesDisplay,
+		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
 		session: {},
 		get viewSession() {

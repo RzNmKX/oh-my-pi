@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import mimetypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Literal, NotRequired, TypedDict, TypeAlias, cast
 
@@ -11,15 +11,19 @@ JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"
 JsonObject: TypeAlias = dict[str, JsonValue]
 
 Attribution: TypeAlias = Literal["user", "agent"]
-Effort: TypeAlias = Literal["minimal", "low", "medium", "high", "xhigh"]
-ThinkingLevel: TypeAlias = Literal["off", "minimal", "low", "medium", "high", "xhigh"]
+Effort: TypeAlias = Literal["minimal", "low", "medium", "high", "xhigh", "max"]
+ThinkingLevel: TypeAlias = Literal[
+    "off", "minimal", "low", "medium", "high", "xhigh", "max"
+]
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
 WidgetPlacement: TypeAlias = Literal["aboveEditor", "belowEditor"]
-TodoStatus: TypeAlias = Literal["pending", "in_progress", "completed", "abandoned"]
+TodoStatus: TypeAlias = Literal[
+    "pending", "in_progress", "completed", "abandoned", "blocked"
+]
 ExtensionUiMethod: TypeAlias = Literal[
     "select",
     "confirm",
@@ -50,7 +54,7 @@ VALUE_EXTENSION_UI_METHODS: Final[frozenset[ValueExtensionUiMethod]] = frozenset
     {"select", "input", "editor"}
 )
 _EFFORT_VALUES: Final[frozenset[str]] = frozenset(
-    {"minimal", "low", "medium", "high", "xhigh"}
+    {"minimal", "low", "medium", "high", "xhigh", "max"}
 )
 _THINKING_LEVEL_VALUES: Final[frozenset[str]] = _EFFORT_VALUES | frozenset({"off"})
 _STEERING_MODE_VALUES: Final[frozenset[str]] = frozenset({"all", "one-at-a-time"})
@@ -63,7 +67,7 @@ _WIDGET_PLACEMENT_VALUES: Final[frozenset[str]] = frozenset(
     {"aboveEditor", "belowEditor"}
 )
 _TODO_STATUS_VALUES: Final[frozenset[str]] = frozenset(
-    {"pending", "in_progress", "completed", "abandoned"}
+    {"pending", "in_progress", "completed", "abandoned", "blocked"}
 )
 _EXTENSION_UI_METHOD_VALUES: Final[frozenset[str]] = frozenset(
     {
@@ -743,6 +747,8 @@ class TodoItem:
     status: TodoStatus
     notes: str | None = None
     details: str | None = None
+    # What a `blocked` task is waiting on; None for all other statuses.
+    blocker: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -849,7 +855,18 @@ class SessionStats:
 
 @dataclass(slots=True, frozen=True)
 class ReadyEvent:
+    protocol_version: int | None = None
+    supported_protocol_versions: tuple[int, ...] | None = None
+    max_frame_bytes: int | None = None
+    max_reassembled_frame_bytes: int | None = None
     type: Literal["ready"] = "ready"
+
+
+@dataclass(slots=True, frozen=True)
+class MessagesPage:
+    messages: tuple[AgentMessage, ...]
+    total_messages: int
+    next_cursor: str | None
 
 
 @dataclass(slots=True, frozen=True)
@@ -903,6 +920,7 @@ class AgentStartEvent:
 class AgentEndEvent:
     messages: tuple[AgentMessage, ...]
     type: Literal["agent_end"] = "agent_end"
+    message_count: int | None = field(default=None, kw_only=True)
 
 
 @dataclass(slots=True, frozen=True)
@@ -1142,7 +1160,10 @@ def _parse_thinking_config(payload: object) -> ThinkingConfig | None:
     if not isinstance(raw_efforts, list):
         raise ValueError("model.thinking.efforts must be a list")
     efforts: tuple[Effort, ...] = tuple(
-        cast(Effort, _require_literal(item, _EFFORT_VALUES, field="model.thinking.efforts[]"))
+        cast(
+            Effort,
+            _require_literal(item, _EFFORT_VALUES, field="model.thinking.efforts[]"),
+        )
         for item in raw_efforts
     )
     return ThinkingConfig(
@@ -1243,6 +1264,7 @@ def parse_todo_item(payload: JsonObject) -> TodoItem:
         ),
         notes=_optional_str(payload, "notes"),
         details=_optional_str(payload, "details"),
+        blocker=_optional_str(payload, "blocker"),
     )
 
 
@@ -1484,7 +1506,23 @@ def parse_extension_error(payload: JsonObject) -> ExtensionError:
 def parse_notification(payload: JsonObject) -> RpcNotification:
     event_type = payload.get("type")
     if event_type == "ready":
-        return ReadyEvent()
+        raw_versions = payload.get("supportedProtocolVersions")
+        supported_versions: tuple[int, ...] | None = None
+        if raw_versions is not None:
+            if not isinstance(raw_versions, list) or any(
+                not isinstance(version, int) or isinstance(version, bool)
+                for version in raw_versions
+            ):
+                raise ValueError("ready.supportedProtocolVersions must be integers")
+            supported_versions = tuple(raw_versions)
+        return ReadyEvent(
+            protocol_version=_optional_int(payload, "protocolVersion"),
+            supported_protocol_versions=supported_versions,
+            max_frame_bytes=_optional_int(payload, "maxFrameBytes"),
+            max_reassembled_frame_bytes=_optional_int(
+                payload, "maxReassembledFrameBytes"
+            ),
+        )
     if event_type == "extension_ui_request":
         return parse_extension_ui_request(payload)
     if event_type == "extension_error":
@@ -1495,7 +1533,8 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         return AgentEndEvent(
             messages=parse_agent_messages(
                 cast(JsonValue | None, payload.get("messages"))
-            )
+            ),
+            message_count=_optional_int(payload, "messageCount"),
         )
     if event_type == "turn_start":
         return TurnStartEvent()

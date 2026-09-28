@@ -11,11 +11,19 @@ import {
 	validateAnthropicCompatibleApiKey,
 	validateApiKeyAgainstModelsEndpoint,
 	validateOpenAICompatibleApiKey,
+	validateOpenAIResponsesApiKey,
 } from "./api-key-validation";
 import type { OAuthController } from "./oauth/types";
 
 type ChatCompletionsValidation = {
 	kind: "chat-completions";
+	provider: string;
+	baseUrl: string;
+	model: string;
+};
+
+type ResponsesValidation = {
+	kind: "responses";
 	provider: string;
 	baseUrl: string;
 	model: string;
@@ -31,7 +39,7 @@ type AnthropicMessagesValidation = {
 type ModelsEndpointValidation = {
 	kind: "models-endpoint";
 	provider: string;
-	modelsUrl: string;
+	modelsUrl: string | (() => string);
 	headers?: Record<string, string> | (() => Record<string, string> | undefined);
 };
 
@@ -47,7 +55,12 @@ export type ApiKeyLoginConfig = {
 	/** Placeholder string for the prompt (e.g. "sk-...", "csk-..."). */
 	placeholder: string;
 	/** Validation strategy, or `null` to skip validation. */
-	validation: ChatCompletionsValidation | AnthropicMessagesValidation | ModelsEndpointValidation | null;
+	validation:
+		| ChatCompletionsValidation
+		| ResponsesValidation
+		| AnthropicMessagesValidation
+		| ModelsEndpointValidation
+		| null;
 };
 
 export function createApiKeyLogin(config: ApiKeyLoginConfig): (options: OAuthController) => Promise<string> {
@@ -86,6 +99,15 @@ export function createApiKeyLogin(config: ApiKeyLoginConfig): (options: OAuthCon
 					signal: options.signal,
 					fetch: options.fetch,
 				});
+			} else if (config.validation.kind === "responses") {
+				await validateOpenAIResponsesApiKey({
+					provider: config.validation.provider,
+					apiKey: trimmed,
+					baseUrl: config.validation.baseUrl,
+					model: config.validation.model,
+					signal: options.signal,
+					fetch: options.fetch,
+				});
 			} else if (config.validation.kind === "anthropic-messages") {
 				await validateAnthropicCompatibleApiKey({
 					provider: config.validation.provider,
@@ -99,7 +121,10 @@ export function createApiKeyLogin(config: ApiKeyLoginConfig): (options: OAuthCon
 				await validateApiKeyAgainstModelsEndpoint({
 					provider: config.validation.provider,
 					apiKey: trimmed,
-					modelsUrl: config.validation.modelsUrl,
+					modelsUrl:
+						typeof config.validation.modelsUrl === "function"
+							? config.validation.modelsUrl()
+							: config.validation.modelsUrl,
 					headers: config.validation.headers,
 					signal: options.signal,
 					fetch: options.fetch,

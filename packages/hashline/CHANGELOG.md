@@ -2,6 +2,82 @@
 
 ## [Unreleased]
 
+## [17.1.5] - 2026-07-27
+
+### Changed
+
+- Improved reversed-range and invalid block-anchor diagnostics with absolute endpoint corrections plus nearby syntactic opener suggestions, without auto-applying the suggested edit ([#6671](https://github.com/can1357/oh-my-pi/issues/6671)).
+- Accepted a single dot between integer range endpoints, such as `DEL 235.258`, as an unambiguous range separator ([#6671](https://github.com/can1357/oh-my-pi/issues/6671)).
+
+## [17.1.2] - 2026-07-24
+
+### Changed
+
+- Bare `- ` bullet body rows are now auto-accepted as literal content with a warning when the hunk is unambiguously a Markdown bullet list (every `-` row bullet-shaped and no plain `+new` diff counterpart); ambiguous `-` rows still fail with the teaching error.
+
+## [17.0.8] - 2026-07-22
+
+### Changed
+
+- Improved snapshot recovery line remapping by utilizing native line diffing.
+- Switched line anchor recovery diffs to native `diffLineRuns`, processing UTF-16 code units directly and removing JS diff fallback.
+
+### Removed
+
+- Removed npm `diff` dependency.
+
+## [17.0.4] - 2026-07-18
+
+### Fixed
+
+- Rejected `DEL N:` headers with a trailing colon instead of silently tolerating the colon, so delete-with-body mistakes surface the corrective "has no colon" guidance.
+
+## [17.0.0] - 2026-07-15
+
+### Added
+
+- Added `enforceSeenLines` option to `PatcherOptions` (defaulting to `true`) to control whether seen-line validation is enforced on anchored edits, allowing tags to validate on content hash alone when disabled.
+
+## [16.5.0] - 2026-07-13
+
+### Fixed
+
+- Fixed a critical issue where ambiguous swaps could silently delete range boundaries.
+- Prevented incorrect auto-repairing of structural closing lines when payload placement is ambiguous.
+- Fixed a bug in stale-hash recovery that could incorrectly relocate edits onto duplicated context after the original target changed.
+
+## [16.3.3] - 2026-07-02
+
+### Breaking Changes
+
+- Removed SnapshotStore.byHashExact. Consumers should now use byHash, which resolves collisions by returning the most recently recorded version.
+
+### Changed
+
+- Improved patch application robustness by resolving 16-bit snapshot tag collisions to the most recent version instead of rejecting them.
+
+### Fixed
+
+- Fixed frequent edit rejections after a structural-summary read (affecting parseable code over 100 lines) by automatically inlining unseen anchor lines and merging them into the snapshot's seen lines, allowing immediate retries to succeed without requiring a separate range re-read.
+
+## [16.3.0] - 2026-07-02
+
+### Changed
+
+- Significantly improved performance on large files by optimizing stale-anchor remap validation.
+
+### Fixed
+
+- Fixed an issue where snapshot tag collisions could cause line-anchored edits to be incorrectly applied to unrelated content, improving recovery and edit-preview safety.
+- Fixed tracking of edit anchors when earlier in-session insertions or deletions shift unchanged target lines.
+- Fixed hashline edit guidance and parsing errors for Markdown list rows.
+
+## [16.2.8] - 2026-06-30
+
+### Fixed
+
+- Fixed hashline writes preserving UTF-8 BOM bytes when the host text decoder hides the leading `U+FEFF`. ([#3867](https://github.com/can1357/oh-my-pi/issues/3867))
+
 ## [16.2.6] - 2026-06-29
 
 ### Fixed

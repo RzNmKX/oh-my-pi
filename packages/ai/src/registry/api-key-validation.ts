@@ -65,6 +65,10 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 		signal,
 	});
 
+	await assertValidationResponseOk(options.provider, response);
+}
+
+async function assertValidationResponseOk(provider: string, response: Response): Promise<void> {
 	if (response.ok) {
 		return;
 	}
@@ -77,9 +81,40 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 	}
 
 	const message = details
-		? `${options.provider} API key validation failed (${response.status}): ${details}`
-		: `${options.provider} API key validation failed (${response.status})`;
+		? `${provider} API key validation failed (${response.status}): ${details}`
+		: `${provider} API key validation failed (${response.status})`;
 	throw new AIError.ApiKeyRequiredError(message);
+}
+
+/**
+ * Validate an API key against an OpenAI-compatible **Responses** endpoint.
+ *
+ * Needed for gateways that only speak `/responses`: reasoning-only proxies
+ * reject the chat-completions probe above outright (legacy `max_tokens` and
+ * `temperature` are both 400s on Palantir Foundry's XOS proxy, and it serves no
+ * `/models` endpoint to fall back on).
+ */
+export async function validateOpenAIResponsesApiKey(options: OpenAICompatibleValidationOptions): Promise<void> {
+	const timeoutSignal = AbortSignal.timeout(VALIDATION_TIMEOUT_MS);
+	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+	const fetchImpl = options.fetch ?? fetch;
+
+	const response = await fetchImpl(`${options.baseUrl}/responses`, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${options.apiKey}`,
+		},
+		body: JSON.stringify({
+			model: options.model,
+			input: "ping",
+			max_output_tokens: 16,
+			store: false,
+		}),
+		signal,
+	});
+
+	await assertValidationResponseOk(options.provider, response);
 }
 
 /**

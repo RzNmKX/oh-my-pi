@@ -11,10 +11,12 @@
  * scrollback-clearing repaint (`clearTerminalHistory`).
  */
 
-import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, Usage } from "@oh-my-pi/pi-ai";
+import { kStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
@@ -25,6 +27,13 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 
 beforeAll(() => {
 	initTheme();
+});
+
+beforeEach(async () => {
+	// afterEach resets Settings, but renderInitialMessages reads the global
+	// Settings (display.collapseCompacted) — re-init before every test.
+	resetSettingsForTest();
+	await Settings.init({ inMemory: true });
 });
 
 const originalImageProtocol = TERMINAL.imageProtocol;
@@ -42,8 +51,6 @@ function makeEmptyContext(): SessionContext {
 		serviceTier: undefined,
 		models: {},
 		injectedTtsrRules: [],
-		selectedMCPToolNames: [],
-		hasPersistedMCPToolSelection: false,
 		mode: "none",
 	};
 }
@@ -61,7 +68,7 @@ function makeCtx(): {
 
 	const ctx = {
 		chatContainer: { clear: vi.fn(), addChild: vi.fn() },
-		pendingMessagesContainer: { clear: vi.fn() },
+		pendingMessagesContainer: { clear: vi.fn(), disposeChildren: vi.fn() },
 		pendingBashComponents: [],
 		pendingPythonComponents: [],
 		session: { buildTranscriptSessionContext: transcriptSpy },
@@ -121,16 +128,18 @@ function transcriptWith(messages: AgentMessage[]): SessionContext {
 
 function countImageComponents(component: Component): number {
 	const own = component instanceof Image ? 1 : 0;
-	const children = (component as { children?: unknown }).children;
-	if (!Array.isArray(children)) return own;
-	return own + children.reduce((count, child) => count + countImageComponents(child as Component), 0);
+	if (!("children" in component) || !Array.isArray(component.children)) return own;
+	return own + component.children.reduce((count, child) => count + countImageComponents(child), 0);
 }
 
 function hasImageComponent(component: Component): boolean {
 	return countImageComponents(component) > 0;
 }
 
-function makeRenderCtx(transcript: SessionContext): { ctx: InteractiveModeContext; chatContainer: Container } {
+function makeRenderCtx(
+	transcript: SessionContext,
+	showImages = true,
+): { ctx: InteractiveModeContext; chatContainer: Container } {
 	const chatContainer = new Container();
 	let helpers: UiHelpers;
 	const ctx = {
@@ -138,13 +147,16 @@ function makeRenderCtx(transcript: SessionContext): { ctx: InteractiveModeContex
 		pendingMessagesContainer: new Container(),
 		pendingBashComponents: [],
 		pendingPythonComponents: [],
+		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
 		statusLine: { invalidate: vi.fn() },
 		updateEditorBorderColor: vi.fn(),
 		updateEditorTopBorder: vi.fn(),
 		ui: { requestRender: vi.fn(), imageBudget: undefined },
 		resetTranscript: () => chatContainer.clear(),
-		settings: { get: () => false },
+		// Rebuild paths honor terminal.showImages since the native-image work;
+		// keep it on so the image-replay contracts below stay meaningful.
+		settings: { get: (key: string) => key === "terminal.showImages" && showImages },
 		toolOutputExpanded: false,
 		hideThinkingBlock: false,
 		focusedAgentId: undefined,
@@ -181,7 +193,8 @@ function makeRenderCtx(transcript: SessionContext): { ctx: InteractiveModeContex
 }
 
 describe("UiHelpers.renderInitialMessages — transcript source", () => {
-	it("renders the collapsed live display transcript, never the LLM context", () => {
+	it("renders the collapsed live display transcript, never the LLM context", async () => {
+		await Settings.init({ inMemory: true });
 		const { ctx, transcriptSpy, llmContextSpy, renderSessionContextSpy } = makeCtx();
 		const transcript = makeEmptyContext();
 		transcriptSpy.mockReturnValue(transcript);
@@ -198,13 +211,15 @@ describe("UiHelpers.renderInitialMessages — transcript source", () => {
 });
 
 describe("UiHelpers.renderInitialMessages — clearTerminalHistory", () => {
-	it("requests a scrollback-clearing repaint when clearTerminalHistory is set", () => {
+	it("requests a scrollback-clearing repaint when clearTerminalHistory is set", async () => {
+		await Settings.init({ inMemory: true });
 		const { ctx } = makeCtx();
 		new UiHelpers(ctx).renderInitialMessages({ clearTerminalHistory: true });
 		expect(ctx.ui.requestRender).toHaveBeenCalledWith(true, { clearScrollback: true });
 	});
 
-	it("never clears scrollback when clearTerminalHistory is unset", () => {
+	it("never clears scrollback when clearTerminalHistory is unset", async () => {
+		await Settings.init({ inMemory: true });
 		const { ctx } = makeCtx();
 		new UiHelpers(ctx).renderInitialMessages();
 		const clearedCall = (ctx.ui.requestRender as Mock<(...a: unknown[]) => void>).mock.calls.find(
@@ -264,6 +279,33 @@ describe("UiHelpers.renderInitialMessages — image replay", () => {
 		expect(Bun.stripANSI(chatContainer.render(100).join("\n"))).toContain("display image 1: 1x1");
 	});
 
+	it("preserves hidden read images so enabling them later can replay the image", async () => {
+		await Settings.init({ inMemory: true, overrides: { "terminal.showImages": false } });
+		setTerminalImageProtocol(ImageProtocol.Sixel);
+		const transcript = transcriptWith([
+			assistantToolCall("read-hidden", "read", { path: "hidden.png" }),
+			{
+				role: "toolResult",
+				toolCallId: "read-hidden",
+				toolName: "read",
+				content: [{ type: "text", text: "Read image: hidden.png" }, pngImage],
+				isError: false,
+				timestamp: 2,
+			},
+		]);
+		const { ctx, chatContainer } = makeRenderCtx(transcript, false);
+
+		new UiHelpers(ctx).renderInitialMessages();
+
+		expect(hasImageComponent(chatContainer)).toBe(false);
+		const assistant = chatContainer.children.find(
+			(child): child is AssistantMessageComponent => child instanceof AssistantMessageComponent,
+		);
+		expect(assistant).toBeDefined();
+		assistant?.setImagesVisible(true);
+		expect(hasImageComponent(chatContainer)).toBe(true);
+	});
+
 	it("replays reopened session image blocks through the cold-start rebuild path", async () => {
 		await Settings.init({ inMemory: true, overrides: { "terminal.showImages": true } });
 		setTerminalImageProtocol(ImageProtocol.Sixel);
@@ -303,5 +345,87 @@ describe("UiHelpers.renderInitialMessages — image replay", () => {
 		expect(countImageComponents(chatContainer)).toBe(2);
 		expect(Bun.stripANSI(chatContainer.render(100).join("\n"))).toContain("Read reopened.png");
 		expect(ctx.ui.requestRender).toHaveBeenCalledWith(true, { clearScrollback: true });
+	});
+});
+
+describe("UiHelpers.renderSessionContext — error-stop tool calls", () => {
+	it("keeps the synthetic assistant error result instead of replaying a later tool result", async () => {
+		await Settings.init({ inMemory: true });
+		const transcript = transcriptWith([
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "error-tool",
+						name: "eval",
+						arguments: { language: "py", code: "raise RuntimeError('boom')" },
+					},
+				],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet",
+				usage: emptyUsage,
+				stopReason: "error",
+				errorMessage: "synthetic assistant stop error",
+				timestamp: 1,
+			},
+			{
+				role: "toolResult",
+				toolCallId: "error-tool",
+				toolName: "eval",
+				content: [{ type: "text", text: "late tool result must not replace the assistant stop error" }],
+				isError: false,
+				timestamp: 2,
+			},
+		]);
+		const { ctx, chatContainer } = makeRenderCtx(transcript);
+
+		new UiHelpers(ctx).renderInitialMessages();
+
+		const rendered = Bun.stripANSI(chatContainer.render(120).join("\n"));
+		expect(rendered).toContain("synthetic assistant stop error");
+		expect(rendered).not.toContain("late tool result must not replace the assistant stop error");
+	});
+});
+
+describe("UiHelpers.renderSessionContext — mid-stream tool call rebuild", () => {
+	it("decodes streamed write content from partialJson, not the provider's stale parsed arguments", async () => {
+		// A transcript rebuild (theme change, settings edit, focus replay) can land
+		// while a write's args still stream. The provider re-parses `arguments`
+		// only every STREAMING_JSON_PARSE_MIN_GROWTH bytes, so the parsed snapshot
+		// lags the raw buffer. The rebuilt preview must decode from the buffer —
+		// exactly like the live reveal path — or the write body freezes at the
+		// last throttled parse until more bytes arrive.
+		await Settings.init({ inMemory: true });
+		const staleContent = "line one of the streamed write";
+		const grownBuffer = `{"path":"/tmp/mid.ts","content":"${staleContent}\\nGROWN_TAIL_SENTINEL`;
+		const transcript = transcriptWith([
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "write-mid",
+						name: "write",
+						// Provider-parsed snapshot from BEFORE the buffer grew.
+						arguments: { path: "/tmp/mid.ts", content: staleContent },
+						[kStreamingPartialJson]: grownBuffer,
+					},
+				],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet",
+				usage: emptyUsage,
+				stopReason: "toolUse",
+				timestamp: 1,
+			},
+		]);
+		const { ctx, chatContainer } = makeRenderCtx(transcript);
+
+		new UiHelpers(ctx).renderInitialMessages();
+
+		const rendered = Bun.stripANSI(chatContainer.render(120).join("\n"));
+		expect(rendered).toContain("GROWN_TAIL_SENTINEL");
 	});
 });

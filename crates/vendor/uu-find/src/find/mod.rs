@@ -7,9 +7,9 @@
 pub mod matchers;
 
 use std::{
-	cell::RefCell,
+	cell::{Cell, RefCell},
 	error::Error,
-	io::Write,
+	io::{self, Write},
 	path::{Path, PathBuf},
 	rc::Rc,
 	time::SystemTime,
@@ -17,7 +17,6 @@ use std::{
 
 use matchers::{Follow, WalkEntry};
 use pi_uutils_ctx::{stderr, stdout};
-use walkdir::WalkDir;
 
 pub struct Config {
 	same_file_system:  bool,
@@ -45,9 +44,9 @@ impl Default for Config {
 			help_requested:    false,
 			version_requested: false,
 			today_start:       false,
-			// Directory information and traversal are done by walkdir,
-			// and this configuration field will exist as
-			// a compatibility item for GNU findutils.
+			// Directory information and traversal are handled by pi_walker,
+			// and this configuration field exists as a compatibility item for
+			// GNU findutils.
 			no_leaf_dirs:      false,
 			follow:            Follow::Never,
 			new_paths:         None, // This option exclusively for -files0-from argument.
@@ -151,6 +150,153 @@ fn parse_args(args: &[&str]) -> Result<ParsedInfo, Box<dyn Error>> {
 	Ok(ParsedInfo { matcher, paths, config })
 }
 
+fn apply_find_entry(
+	mut entry: WalkEntry,
+	operand: &Path,
+	resolved_root: &Path,
+	deps: &dyn Dependencies,
+	matcher: &dyn matchers::Matcher,
+	current_dir: &mut Option<PathBuf>,
+	ret: &mut i32,
+) -> (bool, bool) {
+	entry.set_display_root(operand, resolved_root);
+	let mut matcher_io = matchers::MatcherIO::new(deps);
+
+	let new_dir = entry.path().parent().map(|x| x.to_path_buf());
+	if new_dir != *current_dir {
+		if let Some(dir) = current_dir.take() {
+			matcher.finished_dir(dir.as_path(), &mut matcher_io);
+		}
+		*current_dir = new_dir;
+	}
+
+	matcher.matches(&entry, &mut matcher_io);
+	match matcher_io.exit_code() {
+		0 => {},
+		code => *ret = code,
+	}
+	(matcher_io.should_quit(), matcher_io.should_skip_current_dir())
+}
+
+fn finish_find_walk(
+	deps: &dyn Dependencies,
+	matcher: &dyn matchers::Matcher,
+	current_dir: &mut Option<PathBuf>,
+	ret: &mut i32,
+) {
+	let mut matcher_io = matchers::MatcherIO::new(deps);
+	if let Some(dir) = current_dir.take() {
+		matcher.finished_dir(dir.as_path(), &mut matcher_io);
+	}
+	matcher.finished(&mut matcher_io);
+	// This is implemented for exec +.
+	match matcher_io.exit_code() {
+		0 => {},
+		code => *ret = code,
+	}
+}
+
+fn walker_follow_links(follow: Follow) -> pi_walker::FollowLinks {
+	match follow {
+		Follow::Never => pi_walker::FollowLinks::Never,
+		Follow::Roots => pi_walker::FollowLinks::Roots,
+		Follow::Always => pi_walker::FollowLinks::Always,
+	}
+}
+
+fn build_find_walk_request(config: &Config, root: &Path) -> pi_walker::WalkRequest {
+	pi_walker::WalkRequest::new(root)
+		.hidden(true)
+		.gitignore(false)
+		.skip_git(false)
+		.skip_node_modules(false)
+		.follow_links(walker_follow_links(config.follow))
+		.detail(pi_walker::WalkDetail::Minimal)
+		.order(if config.sorted_output {
+			pi_walker::WalkOrder::Path
+		} else {
+			pi_walker::WalkOrder::Unordered
+		})
+		.emit_root(true)
+		.depth(config.min_depth, config.max_depth)
+		.visit_order(if config.depth_first {
+			pi_walker::VisitOrder::ContentsFirst
+		} else {
+			pi_walker::VisitOrder::PreOrder
+		})
+		.directory_errors(pi_walker::DirectoryErrorMode::Visit)
+		.same_file_system(config.same_file_system)
+		.cache(false)
+}
+fn process_dir_walk_request(
+	config: &Config,
+	deps: &dyn Dependencies,
+	matcher: &dyn matchers::Matcher,
+	quit: &mut bool,
+	resolved_root: &Path,
+	operand: &Path,
+) -> i32 {
+	let request = build_find_walk_request(config, resolved_root);
+	let current_dir = RefCell::new(None);
+	let ret = Cell::new(0);
+	let local_quit = Cell::new(false);
+	let status = request.for_each_entry_with_heartbeat(
+		|| Ok::<(), io::Error>(()),
+		|entry: pi_walker::EntryMeta<'_>| {
+			let walk_entry =
+				WalkEntry::new(entry.absolute_path.as_ref().to_path_buf(), entry.depth, config.follow);
+			let mut current_dir = current_dir.borrow_mut();
+			let mut ret_value = ret.get();
+			let (should_quit, should_skip_current_dir) = apply_find_entry(
+				walk_entry,
+				operand,
+				resolved_root,
+				deps,
+				matcher,
+				&mut current_dir,
+				&mut ret_value,
+			);
+			ret.set(ret_value);
+			if should_quit {
+				local_quit.set(true);
+				Ok(pi_walker::WalkDecision::Stop)
+			} else if should_skip_current_dir {
+				Ok(pi_walker::WalkDecision::SkipDescend)
+			} else {
+				Ok(pi_walker::WalkDecision::Include)
+			}
+		},
+		|error| {
+			ret.set(1);
+			writeln!(&mut stderr(), "Error: {}: {}", error.path.display(), error.error).unwrap();
+			Ok(pi_walker::WalkDecision::Include)
+		},
+	);
+	let mut current_dir = current_dir.into_inner();
+	let mut ret_value = ret.get();
+	match status {
+		Ok(pi_walker::WalkStatus::Complete | pi_walker::WalkStatus::Stopped) => {
+			finish_find_walk(deps, matcher, &mut current_dir, &mut ret_value);
+			if local_quit.get() {
+				*quit = true;
+			}
+			ret_value
+		},
+		Err(pi_walker::WalkError::Interrupted(err)) => {
+			ret_value = 1;
+			writeln!(&mut stderr(), "Error: {err}").unwrap();
+			finish_find_walk(deps, matcher, &mut current_dir, &mut ret_value);
+			ret_value
+		},
+		Err(pi_walker::WalkError::InvalidData { path, message }) => {
+			ret_value = 1;
+			writeln!(&mut stderr(), "Error: {}: {message}", path.display()).unwrap();
+			finish_find_walk(deps, matcher, &mut current_dir, &mut ret_value);
+			ret_value
+		},
+	}
+}
+
 fn process_dir(
 	dir: &str,
 	config: &Config,
@@ -160,71 +306,13 @@ fn process_dir(
 ) -> i32 {
 	let resolved_root = pi_uutils_ctx::resolve(dir);
 	let operand = Path::new(dir);
-	let mut walkdir = WalkDir::new(&resolved_root)
-		.contents_first(config.depth_first)
-		.max_depth(config.max_depth)
-		.min_depth(config.min_depth)
-		.same_file_system(config.same_file_system)
-		.follow_links(config.follow == Follow::Always)
-		.follow_root_links(config.follow != Follow::Never);
-	if config.sorted_output {
-		walkdir = walkdir.sort_by(|a, b| a.file_name().cmp(b.file_name()));
+	if config.min_depth > config.max_depth {
+		let mut current_dir = None;
+		let mut ret = 0;
+		finish_find_walk(deps, matcher, &mut current_dir, &mut ret);
+		return ret;
 	}
-
-	let mut ret = 0;
-
-	// Slightly yucky loop handling here :-(. See docs for
-	// WalkDirIterator::skip_current_dir for explanation.
-	let mut it = walkdir.into_iter();
-	// As WalkDir seems not providing a function to check its stack,
-	// using current_dir is a workaround to check leaving directory.
-	let mut current_dir: Option<PathBuf> = None;
-	while let Some(result) = it.next() {
-		match WalkEntry::from_walkdir(result, config.follow) {
-			Err(err) => {
-				ret = 1;
-				writeln!(&mut stderr(), "Error: {err}").unwrap();
-			},
-			Ok(mut entry) => {
-				entry.set_display_root(operand, &resolved_root);
-				let mut matcher_io = matchers::MatcherIO::new(deps);
-
-				let new_dir = entry.path().parent().map(|x| x.to_path_buf());
-				if new_dir != current_dir {
-					if let Some(dir) = current_dir.take() {
-						matcher.finished_dir(dir.as_path(), &mut matcher_io);
-					}
-					current_dir = new_dir;
-				}
-
-				matcher.matches(&entry, &mut matcher_io);
-				match matcher_io.exit_code() {
-					0 => {},
-					code => ret = code,
-				}
-				if matcher_io.should_quit() {
-					*quit = true;
-					break;
-				}
-				if matcher_io.should_skip_current_dir() {
-					it.skip_current_dir();
-				}
-			},
-		}
-	}
-
-	let mut matcher_io = matchers::MatcherIO::new(deps);
-	if let Some(dir) = current_dir.take() {
-		matcher.finished_dir(dir.as_path(), &mut matcher_io);
-	}
-	matcher.finished(&mut matcher_io);
-	// This is implemented for exec +.
-	match matcher_io.exit_code() {
-		0 => {},
-		code => ret = code,
-	}
-
-	ret
+	process_dir_walk_request(config, deps, matcher, quit, &resolved_root, operand)
 }
 
 fn do_find(args: &[&str], deps: &dyn Dependencies) -> Result<i32, Box<dyn Error>> {
@@ -311,13 +399,66 @@ fn print_version() {
 	let _ = writeln!(stdout(), "find (Rust) {}", env!("CARGO_PKG_VERSION"));
 }
 
+/// pi-uutils: BSD `find -E` compatibility (macOS muscle memory).
+///
+/// BSD `-E` selects POSIX extended regular expressions before the path list;
+/// GNU find rejects it, but supports the equivalent `-regextype
+/// posix-extended`. Rewriting is limited to otherwise-unparseable invocations:
+/// a valid GNU expression may use `-E` as an operand, so it must retain its
+/// existing meaning. The inserted setting starts the expression, before every
+/// `-regex`/`-iregex`, because matcher construction applies the current regex
+/// type as it encounters those predicates.
+fn rewrite_bsd_invocation(args: &[&str]) -> Option<Vec<String>> {
+	if !args.contains(&"-E") {
+		return None;
+	}
+	let Err(error) = parse_args(args) else {
+		return None;
+	};
+	if !error.to_string().contains("Unrecognized flag: '-E'") {
+		return None;
+	}
+
+	let mut rewritten: Vec<String> = args
+		.iter()
+		.filter(|arg| **arg != "-E")
+		.map(|arg| (*arg).to_string())
+		.collect();
+
+	let mut i = 0;
+	while i < rewritten.len() {
+		match rewritten[i].as_str() {
+			"-O0" | "-O1" | "-O2" | "-O3" | "-H" | "-L" | "-P" => i += 1,
+			"--" => {
+				i += 1;
+				break;
+			},
+			_ => break,
+		}
+	}
+	while i < rewritten.len()
+		&& (rewritten[i] == "-" || !rewritten[i].starts_with('-'))
+		&& rewritten[i] != "!"
+		&& rewritten[i] != "("
+	{
+		i += 1;
+	}
+	rewritten.splice(i..i, ["-regextype".to_string(), "posix-extended".to_string()]);
+	Some(rewritten)
+}
+
 /// Does all the work for find.
 ///
 /// All main has to do is pass in the command-line args and exit the process
 /// with the exit code. Note that the first string in args is expected to be
 /// the name of the executable.
 pub fn find_main(args: &[&str], deps: &dyn Dependencies) -> i32 {
-	match do_find(&args[1..], deps) {
+	let rewritten = rewrite_bsd_invocation(&args[1..]);
+	let args: Vec<&str> = match &rewritten {
+		Some(args) => args.iter().map(String::as_str).collect(),
+		None => args[1..].to_vec(),
+	};
+	match do_find(&args, deps) {
 		Ok(ret) => ret,
 		Err(e) => {
 			writeln!(&mut stderr(), "Error: {e}").unwrap();

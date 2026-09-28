@@ -1,6 +1,6 @@
 /**
  * Coding-agent runner that drives the hashline {@link Patcher} on behalf of
- * the `edit` tool. Converts a `{input}` tool-call payload into a
+ * the `edit` tool. Converts an `{input}` tool-call payload into a
  * fully-applied patch, wraps the result in the agent's
  * {@link AgentToolResult} shape, and attaches LSP diagnostics + `outputMeta`
  * for the renderer.
@@ -210,7 +210,8 @@ export async function executeHashlineSingle(
 		batchRequest: options.batchRequest,
 	});
 	const snapshots = getFileSnapshotStore(options.session);
-	const patcher = new Patcher({ fs, snapshots, blockResolver: nativeBlockResolver });
+	const enforceSeenLines = options.session.settings.get("edit.enforceSeenLines");
+	const patcher = new Patcher({ fs, snapshots, blockResolver: nativeBlockResolver, enforceSeenLines });
 
 	// Single-section fast path: prepare, commit, render.
 	const inputHash = hashPatchInput(options.input);

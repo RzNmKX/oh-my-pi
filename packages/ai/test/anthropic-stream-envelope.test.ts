@@ -6,8 +6,11 @@ import {
 	type AnthropicMessagesClientLike,
 	type AnthropicRequestOptions,
 } from "@oh-my-pi/pi-ai/providers/anthropic-client";
+import type { WebSearchToolResultBlockParam } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
 import type { AssistantMessageEvent, Context, Model, ModelSpec, ProviderSessionState } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { structuredCloneJSON } from "@oh-my-pi/pi-utils";
+import { withEnv } from "./helpers";
 
 const model: Model<"anthropic-messages"> = buildModel({
 	id: "claude-sonnet-4-5",
@@ -135,6 +138,14 @@ function createStrictGrammarTooLargeError(): Error {
 	const error = new Error(
 		'400 {"type":"error","error":{"type":"invalid_request_error","message":"The compiled grammar is too large, which would cause performance issues. Simplify your tool schemas or reduce the number of strict tools."},"request_id":"req_test"}',
 	);
+	(error as Error & { status: number }).status = 400;
+	return error;
+}
+
+// Azure Foundry-style rejection: no invalid_request_error wrapper, the gateway
+// just names the missing feature for the hosted model deployment.
+function createStructuredOutputsUnsupportedError(): Error {
+	const error = new Error('400 {"error":{"code":"BadRequest","message":"structured_outputs not supported"}}');
 	(error as Error & { status: number }).status = 400;
 	return error;
 }
@@ -535,6 +546,205 @@ describe("anthropic stream envelope handling", () => {
 		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "59" }]);
 	});
 
+	it("replays native server-tool blocks in their original assistant order", async () => {
+		const searchResult: WebSearchToolResultBlockParam = {
+			type: "web_search_tool_result",
+			tool_use_id: "srvtoolu_1",
+			content: [
+				{
+					type: "web_search_result",
+					url: "https://example.com/result",
+					title: "Search result",
+					encrypted_content: "encrypted-result",
+					page_age: "July 24, 2026",
+				},
+			],
+		};
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(
+			() =>
+				createMockRequest([
+					{
+						type: "message_start",
+						message: {
+							id: "msg_native_search",
+							usage: {
+								input_tokens: 12,
+								output_tokens: 0,
+								cache_read_input_tokens: 0,
+								cache_creation_input_tokens: 0,
+							},
+						},
+					},
+					{ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } },
+					{ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Search first." } },
+					{ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig-1" } },
+					{ type: "content_block_stop", index: 0 },
+					{
+						type: "content_block_start",
+						index: 1,
+						content_block: { type: "server_tool_use", id: "srvtoolu_1", name: "web_search" },
+					},
+					{
+						type: "content_block_delta",
+						index: 1,
+						delta: { type: "input_json_delta", partial_json: '{"query":"current weather"}' },
+					},
+					{ type: "content_block_stop", index: 1 },
+					{ type: "content_block_start", index: 2, content_block: searchResult },
+					{ type: "content_block_stop", index: 2 },
+					{ type: "content_block_start", index: 3, content_block: { type: "thinking", thinking: "" } },
+					{ type: "content_block_delta", index: 3, delta: { type: "thinking_delta", thinking: "Read the file." } },
+					{ type: "content_block_delta", index: 3, delta: { type: "signature_delta", signature: "sig-2" } },
+					{ type: "content_block_stop", index: 3 },
+					{ type: "content_block_start", index: 4, content_block: { type: "text", text: "" } },
+					{ type: "content_block_delta", index: 4, delta: { type: "text_delta", text: "I found the forecast." } },
+					{ type: "content_block_stop", index: 4 },
+					{
+						type: "content_block_start",
+						index: 5,
+						content_block: { type: "tool_use", id: "tool_1", name: "read", input: {} },
+					},
+					{
+						type: "content_block_delta",
+						index: 5,
+						delta: { type: "input_json_delta", partial_json: '{"path":"forecast.txt"}' },
+					},
+					{ type: "content_block_stop", index: 5 },
+					{
+						type: "message_delta",
+						delta: { stop_reason: "tool_use" },
+						usage: {
+							input_tokens: 12,
+							output_tokens: 20,
+							cache_read_input_tokens: 0,
+							cache_creation_input_tokens: 0,
+							server_tool_use: { web_search_requests: 1 },
+						},
+					},
+					{ type: "message_stop" },
+				]) as never,
+		);
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		for await (const _ of stream) {
+			// drain stream
+		}
+		const result = await stream.result();
+		const persistedResult = structuredCloneJSON(result);
+		const replay = convertAnthropicMessages(
+			[
+				context.messages[0],
+				persistedResult,
+				{
+					role: "toolResult",
+					toolCallId: "tool_1",
+					toolName: "read",
+					content: [{ type: "text", text: "forecast contents" }],
+					isError: false,
+					timestamp: 2,
+				},
+			],
+			model,
+			false,
+		);
+		const assistant = replay.find(message => message.role === "assistant");
+
+		expect(assistant?.content).toEqual([
+			{ type: "thinking", thinking: "Search first.", signature: "sig-1" },
+			{
+				type: "server_tool_use",
+				id: "srvtoolu_1",
+				name: "web_search",
+				input: { query: "current weather" },
+			},
+			searchResult,
+			{ type: "thinking", thinking: "Read the file.", signature: "sig-2" },
+			{ type: "text", text: "I found the forecast." },
+			{ type: "tool_use", id: "tool_1", name: "read", input: { path: "forecast.txt" } },
+		]);
+		expect(replay.at(-1)?.content).toEqual([
+			{
+				type: "tool_result",
+				tool_use_id: "tool_1",
+				content: "forecast contents",
+				is_error: false,
+			},
+		]);
+	});
+
+	it("does not persist a code-execution call without its unsupported result block", async () => {
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(
+			() =>
+				createMockRequest([
+					{
+						type: "message_start",
+						message: {
+							id: "msg_code_execution",
+							usage: {
+								input_tokens: 12,
+								output_tokens: 0,
+								cache_read_input_tokens: 0,
+								cache_creation_input_tokens: 0,
+							},
+						},
+					},
+					{
+						type: "content_block_start",
+						index: 0,
+						content_block: {
+							type: "server_tool_use",
+							id: "srvtoolu_code",
+							name: "bash_code_execution",
+						},
+					},
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "input_json_delta", partial_json: '{"command":"printf ok"}' },
+					},
+					{ type: "content_block_stop", index: 0 },
+					{
+						type: "content_block_start",
+						index: 1,
+						content_block: {
+							type: "bash_code_execution_tool_result",
+							tool_use_id: "srvtoolu_code",
+							content: {
+								type: "bash_code_execution_result",
+								stdout: "ok",
+								stderr: "",
+								return_code: 0,
+								content: [],
+							},
+						},
+					},
+					{ type: "content_block_stop", index: 1 },
+					{ type: "content_block_start", index: 2, content_block: { type: "text", text: "" } },
+					{ type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "done" } },
+					{ type: "content_block_stop", index: 2 },
+					{
+						type: "message_delta",
+						delta: { stop_reason: "end_turn" },
+						usage: {
+							input_tokens: 12,
+							output_tokens: 8,
+							cache_read_input_tokens: 0,
+							cache_creation_input_tokens: 0,
+						},
+					},
+					{ type: "message_stop" },
+				]) as never,
+		);
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		for await (const _ of stream) {
+			// drain stream
+		}
+		const result = await stream.result();
+
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "done" }]);
+	});
+
 	it("passes Umans gateway web search headers to custom clients", async () => {
 		type CapturedPayload = { tools?: Array<{ name?: string }> };
 		let capturedParams: CapturedPayload | undefined;
@@ -641,10 +851,15 @@ describe("anthropic stream envelope handling", () => {
 			model,
 			false,
 		);
+		// The unwrapped thinking block carries no signature. On same-model replay to
+		// signature-enforcing Anthropic an unsigned thinking block is dropped entirely — it cannot
+		// replay natively (a "" signature 400s) and must not be demoted to text (demotion trips the
+		// reasoning_extraction classifier). It was this turn's only content, so the whole assistant
+		// message falls away, leaving just the two surrounding user turns with no leaked reasoning.
 		const replayAssistant = replayParams.find(param => param.role === "assistant");
-		expect(replayAssistant?.content).toEqual([
-			{ type: "text", text: "<thinking>\nCheck logs before accepting container health.\n</thinking>\n" },
-		]);
+		expect(replayAssistant).toBeUndefined();
+		expect(replayParams.map(param => param.role)).toEqual(["user", "user"]);
+		expect(replayParams.every(param => !JSON.stringify(param.content).includes("Check logs"))).toBe(true);
 	});
 	it("preserves signed thinking bytes when no literal thinking envelope is present", async () => {
 		const signedThinking = "\nCheck logs before accepting container health.\n";
@@ -892,7 +1107,7 @@ describe("anthropic stream envelope handling", () => {
 			{
 				type: "content_block_start",
 				index: 0,
-				content_block: { type: "server_tool_use", id: "srv_1", name: "web_search" },
+				content_block: { type: "future_server_block", id: "srv_1", name: "web_search" },
 			},
 			{
 				type: "content_block_delta",
@@ -1008,6 +1223,45 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(nextEvents, "done")).toBe(1);
 		expect(countEvents(nextEvents, "error")).toBe(0);
 		expect(strictFlags).toEqual([[true], [false], [false]]);
+	});
+
+	it("retries without strict tools when the endpoint rejects structured outputs for the model", async () => {
+		const toolContext: Context = {
+			...context,
+			tools: [
+				{
+					name: "edit",
+					description: "Edit a value",
+					strict: true,
+					parameters: queryObjectSchema,
+				},
+			],
+		};
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const strictFlags: boolean[][] = [];
+		let attempt = 0;
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation((params: unknown) => {
+			attempt += 1;
+			strictFlags.push(getStrictFlags(params));
+			if (attempt === 1) {
+				return createRejectedMockRequest(createStructuredOutputsUnsupportedError()) as never;
+			}
+			return createMockRequest(createTextSuccessEvents("recovered")) as never;
+		});
+
+		const stream = streamAnthropic(model, toolContext, { apiKey: "sk-ant-test", providerSessionState });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorMessage).toBeUndefined();
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "recovered" }]);
+		expect(countEvents(events, "error")).toBe(0);
+		expect(strictFlags).toEqual([[true], [false]]);
+		expect(anthropicStrictToolsDisabled(providerSessionState)).toBe(true);
 	});
 
 	it("does not disable strict tools for unrelated Anthropic invalid request errors", async () => {
@@ -1326,6 +1580,47 @@ describe("anthropic stream envelope handling", () => {
 		});
 		expect(cacheControls[0]).toEqual({ type: "ephemeral", ttl: "1h" });
 		expect(cacheControls[1]).toEqual({ type: "ephemeral" });
+		expect(cacheControls[2]).toEqual({ type: "ephemeral" });
+	});
+
+	it("defaults API-key requests to 1h cache TTL where long retention is supported", async () => {
+		type CapturedParams = { messages: Array<{ content: unknown }> };
+		const payloads: CapturedParams[] = [];
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation((params: unknown) => {
+			// Params captured verbatim at the mocked SDK boundary.
+			const captured = params as CapturedParams;
+			payloads.push(captured);
+			return createMockRequest(createTextSuccessEvents("ok")) as never;
+		});
+		const proxyModel = buildModel({
+			...model,
+			compat: { ...model.compatConfig, supportsLongCacheRetention: false },
+		} as ModelSpec<"anthropic-messages">);
+		const drain = async (testModel: Model<"anthropic-messages">): Promise<void> => {
+			const stream = streamAnthropic(testModel, context, { apiKey: "sk-ant-test" });
+			for await (const _ of stream) {
+				// drain stream
+			}
+			await stream.result();
+		};
+
+		await drain(model);
+		await drain(proxyModel);
+		await withEnv({ PI_CACHE_RETENTION: "short" }, () => drain(model));
+
+		const cacheControls = payloads.map(payload => {
+			const content = payload.messages.at(-1)?.content;
+			if (!Array.isArray(content)) return undefined;
+			const lastBlock: { cache_control?: { ttl?: string; type: string } } | undefined = content.at(-1);
+			return lastBlock?.cache_control;
+		});
+		// Agent sessions idle past 5 minutes on background jobs; the canonical
+		// Anthropic API defaults to the 1h breakpoint so resume doesn't cold-miss
+		// the whole prefix.
+		expect(cacheControls[0]).toEqual({ type: "ephemeral", ttl: "1h" });
+		// Endpoints without long-cache support keep the plain 5m breakpoint.
+		expect(cacheControls[1]).toEqual({ type: "ephemeral" });
+		// PI_CACHE_RETENTION=short opts back out of the 1h default.
 		expect(cacheControls[2]).toEqual({ type: "ephemeral" });
 	});
 });

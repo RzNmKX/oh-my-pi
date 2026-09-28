@@ -5,9 +5,12 @@
  * in response to process exit, signals, or fatal exceptions. It is intended to
  * allow reliably releasing resources or shutting down subprocesses, files, sockets, etc.
  */
+
+import * as fs from "node:fs";
 import inspector from "node:inspector";
 import { isMainThread } from "node:worker_threads";
-import { logger } from ".";
+import * as logger from "./logger";
+import { restoreTerminalStderr } from "./stderr-guard";
 
 // Cleanup reasons, in order of priority/meaning.
 export enum Reason {
@@ -25,6 +28,11 @@ export enum Reason {
 const callbackList: ((reason: Reason) => Promise<void> | void)[] = [];
 // Tracks cleanup run state (to prevent recursion/reentry issues)
 let cleanupStage: "idle" | "running" | "complete" = "idle";
+const CLEANUP_DEADLINE_MS = 10_000;
+const exitProcess =
+	typeof process.reallyExit === "function" ? process.reallyExit.bind(process) : process.exit.bind(process);
+let cleanupPromise: Promise<void> | undefined;
+let stdioDisconnectRegistrations = 0;
 
 /**
  * Internal: runs all registered cleanup callbacks for the given reason.
@@ -38,7 +46,7 @@ function runCleanup(reason: Reason): Promise<void> {
 			cleanupStage = "running";
 			break;
 		case "running":
-			return Promise.resolve();
+			return cleanupPromise ?? Promise.resolve();
 		case "complete":
 			return Promise.resolve();
 	}
@@ -49,7 +57,7 @@ function runCleanup(reason: Reason): Promise<void> {
 		return Promise.try(() => callback(reason));
 	});
 
-	return Promise.allSettled(promises).then(results => {
+	const cleanupSettled = Promise.allSettled(promises).then(results => {
 		for (const result of results) {
 			if (result.status === "rejected") {
 				const err = result.reason instanceof Error ? result.reason : new Error(String(result.reason));
@@ -58,6 +66,16 @@ function runCleanup(reason: Reason): Promise<void> {
 		}
 		cleanupStage = "complete";
 	});
+	const deadline = Promise.withResolvers<void>();
+	const deadlineTimer = setTimeout(() => {
+		logger.error("Cleanup deadline exceeded; proceeding with exit", { reason });
+		cleanupStage = "complete";
+		deadline.resolve();
+	}, CLEANUP_DEADLINE_MS);
+	cleanupPromise = Promise.race([cleanupSettled, deadline.promise]).finally(() => {
+		clearTimeout(deadlineTimer);
+	});
+	return cleanupPromise;
 }
 
 // Register signal and error event handlers to trigger cleanup before exit.
@@ -65,17 +83,84 @@ function runCleanup(reason: Reason): Promise<void> {
 // Worker thread: exit only (workers use self.addEventListener for exceptions)
 let inspectorOpened = false;
 
+/** Origin of an EPIPE raised by a process communication channel. */
+export type BrokenPipeSource = "ipc-send" | "stdio-write";
+
 /**
- * Detect an EPIPE rejection that originated from an IPC `send()` to a worker
- * subprocess (`syscall: "send"`), as opposed to a stdin/stdout pipe write
- * (`syscall: "write"`). Only the IPC-send path can break an optional worker
- * subsystem without affecting the main process, so only this shape is safe to
- * swallow at the global `unhandledRejection` level. See issue #2997.
+ * Classify EPIPE errors from worker IPC and stdio without treating unrelated
+ * broken pipes as globally recoverable.
  */
+export function classifyBrokenPipe(err: Error): BrokenPipeSource | undefined {
+	if (!("code" in err) || err.code !== "EPIPE" || !("syscall" in err)) return undefined;
+	if (err.syscall === "send") return "ipc-send";
+	if (err.syscall === "write") return "stdio-write";
+	return undefined;
+}
+
+/** Whether an EPIPE came from an IPC `send()` to an optional worker. */
 export function isIpcSendEpipe(err: Error): boolean {
-	const code = (err as { code?: unknown }).code;
-	const syscall = (err as { syscall?: unknown }).syscall;
-	return code === "EPIPE" && syscall === "send";
+	return classifyBrokenPipe(err) === "ipc-send";
+}
+
+/**
+ * Treat unhandled stdout EPIPE rejections as a graceful peer disconnect.
+ *
+ * Stdio protocol servers call this for their process lifetime so a closed
+ * client pipe runs registered cleanup callbacks instead of the fatal path.
+ * The returned callback removes the registration.
+ */
+export function registerStdioDisconnectHandling(): () => void {
+	let registered = true;
+	stdioDisconnectRegistrations++;
+	return () => {
+		if (!registered) return;
+		registered = false;
+		stdioDisconnectRegistrations--;
+	};
+}
+
+// Well-known key marking an error as an *expected* teardown artifact (e.g. a
+// browser run-scope abort at normal run end). `Symbol.for` so the marker
+// survives duplicate module instances across bundles/realms.
+const EXPECTED_CLEANUP = Symbol.for("omp.expectedCleanupError");
+
+/**
+ * Mark an error as expected cleanup fallout so the global fatal handlers
+ * downgrade it to a log line instead of tearing down the process. Use for
+ * abort reasons fired by routine resource teardown (browser run end, tab
+ * close) whose rejections may surface on fire-and-forget promises with no
+ * consumer. Returns the same error for inline use at the `abort()` callsite.
+ */
+export function markExpectedCleanupError<T extends object>(reason: T): T {
+	(reason as Record<PropertyKey, unknown>)[EXPECTED_CLEANUP] = true;
+	return reason;
+}
+
+/**
+ * Whether `reason` (or any error in its `cause` chain) was marked via
+ * {@link markExpectedCleanupError}. Walks the chain because the unhandled
+ * reason is often a wrapper (`AbortError`) with the marked abort reason as
+ * its `cause`.
+ */
+export function isExpectedCleanupError(reason: unknown): boolean {
+	let current: unknown = reason;
+	for (let depth = 0; depth < 8 && current !== null && typeof current === "object"; depth++) {
+		if ((current as Record<PropertyKey, unknown>)[EXPECTED_CLEANUP] === true) return true;
+		current = (current as { cause?: unknown }).cause;
+	}
+	return false;
+}
+
+/** Interceptors consulted by the global `unhandledRejection` handler before the fatal path. */
+const rejectionInterceptors = new Set<(reason: unknown) => boolean>();
+
+/**
+ * Register an interceptor consulted before an unhandled rejection tears the
+ * process down. A consuming interceptor owns reporting and keeps the process alive.
+ */
+export function interceptUnhandledRejections(interceptor: (reason: unknown) => boolean): () => void {
+	rejectionInterceptors.add(interceptor);
+	return () => rejectionInterceptors.delete(interceptor);
 }
 
 function formatFatalError(label: string, err: Error): string {
@@ -87,11 +172,28 @@ function formatFatalError(label: string, err: Error): string {
 	return `\n[${label}] ${name}: ${message}${formattedStack}\n`;
 }
 
+async function exitAfterFatal(label: string, logMessage: string, err: Error, reason: Reason): Promise<void> {
+	const forcedExit = setTimeout(() => exitProcess(1), CLEANUP_DEADLINE_MS);
+	try {
+		restoreTerminalStderr();
+		// A revoked terminal can make stream writes raise another fatal error. Use
+		// the descriptor directly so failure stays synchronous and contained.
+		try {
+			fs.writeSync(2, formatFatalError(label, err));
+		} catch {}
+		logger.error(logMessage, { err });
+		await runCleanup(reason);
+	} finally {
+		clearTimeout(forcedExit);
+		exitProcess(1);
+	}
+}
+
 if (isMainThread) {
 	process
 		.on("SIGINT", async () => {
 			await runCleanup(Reason.SIGINT);
-			process.exit(130); // 128 + SIGINT (2)
+			exitProcess(130); // 128 + SIGINT (2)
 		})
 		.on("SIGUSR1", () => {
 			if (inspectorOpened) return;
@@ -101,13 +203,15 @@ if (isMainThread) {
 			process.stderr.write(`Inspector opened: ${url}\n`);
 		})
 		.on("uncaughtException", async err => {
-			process.stderr.write(formatFatalError("Uncaught Exception", err));
-			logger.error("Uncaught exception", { err });
-			await runCleanup(Reason.UNCAUGHT_EXCEPTION);
-			process.exit(1);
+			if (isExpectedCleanupError(err)) {
+				logger.warn("Ignoring expected cleanup exception", { err });
+				return;
+			}
+			await exitAfterFatal("Uncaught Exception", "Uncaught exception", err, Reason.UNCAUGHT_EXCEPTION);
 		})
 		.on("unhandledRejection", async reason => {
 			const err = reason instanceof Error ? reason : new Error(String(reason));
+			const brokenPipeSource = classifyBrokenPipe(err);
 			// EPIPE from an IPC `send()` (`syscall: "send"`) originates from a
 			// worker subprocess whose pipe broke between the exit being observed
 			// and the next `proc.send()` — a race window that Bun surfaces as an
@@ -117,25 +221,40 @@ if (isMainThread) {
 			// send pipe must never take down the whole session. Log and continue
 			// instead of exiting; the owning client detects the dead worker via
 			// its own `onExit`/error path and respawns or disables it. See #2997.
-			if (isIpcSendEpipe(err)) {
+			if (brokenPipeSource === "ipc-send") {
 				logger.warn("Ignoring EPIPE from worker IPC send; optional subsystem will self-recover", { err });
 				return;
 			}
-			process.stderr.write(formatFatalError("Unhandled Rejection", err));
-			logger.error("Unhandled rejection", { err });
-			await runCleanup(Reason.UNHANDLED_REJECTION);
-			process.exit(1);
+			if (brokenPipeSource === "stdio-write" && stdioDisconnectRegistrations > 0) {
+				logger.warn("Stdio peer disconnected; shutting down gracefully", { err });
+				await runQuit(0, "native");
+				return;
+			}
+			if (isExpectedCleanupError(reason)) {
+				logger.warn("Ignoring expected cleanup rejection", { err });
+				return;
+			}
+			for (const interceptor of rejectionInterceptors) {
+				try {
+					if (interceptor(reason)) return;
+				} catch (interceptorErr) {
+					logger.warn("Unhandled-rejection interceptor threw; continuing with fatal path", {
+						err: interceptorErr,
+					});
+				}
+			}
+			await exitAfterFatal("Unhandled Rejection", "Unhandled rejection", err, Reason.UNHANDLED_REJECTION);
 		})
 		.on("exit", async () => {
 			void runCleanup(Reason.EXIT); // fire and forget (exit imminent)
 		})
 		.on("SIGTERM", async () => {
 			await runCleanup(Reason.SIGTERM);
-			process.exit(143); // 128 + SIGTERM (15)
+			exitProcess(143); // 128 + SIGTERM (15)
 		})
 		.on("SIGHUP", async () => {
 			await runCleanup(Reason.SIGHUP);
-			process.exit(129); // 128 + SIGHUP (1)
+			exitProcess(129); // 128 + SIGHUP (1)
 		});
 } else {
 	// Worker thread: only register exit handler for cleanup.
@@ -200,13 +319,7 @@ export function cleanup(): Promise<void> {
 	return runCleanup(Reason.MANUAL);
 }
 
-/**
- * Runs all cleanup callbacks and exits.
- *
- * In main thread: waits for stdout drain, then calls process.exit().
- * In workers: runs cleanup only (process.exit would kill entire process).
- */
-export async function quit(code: number = 0): Promise<void> {
+async function runQuit(code: number, exitMode: "guarded" | "native"): Promise<void> {
 	await runCleanup(Reason.MANUAL);
 
 	if (!isMainThread) {
@@ -218,5 +331,21 @@ export async function quit(code: number = 0): Promise<void> {
 		process.stdout.once("drain", resolve);
 		await Promise.race([promise, Bun.sleep(5000)]);
 	}
-	process.exit(code);
+
+	switch (exitMode) {
+		case "guarded":
+			return process.exit(code);
+		case "native":
+			return exitProcess(code);
+	}
+}
+
+/**
+ * Runs all cleanup callbacks and exits through the current `process.exit`.
+ *
+ * In main thread: waits for stdout drain, then calls `process.exit()`.
+ * In workers: runs cleanup only (process.exit would kill entire process).
+ */
+export function quit(code: number = 0): Promise<void> {
+	return runQuit(code, "guarded");
 }

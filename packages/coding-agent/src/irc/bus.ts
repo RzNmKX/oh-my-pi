@@ -8,10 +8,11 @@
  * agents receive the message as a non-interrupting aside at the next step
  * boundary (see AgentSession.deliverIrcMessage). Replies are real turns by
  * the recipient, observed via `wait` — with one exception: when the sender
- * awaits a reply and the recipient is mid-turn with async execution
- * disabled, the recipient session generates an ephemeral side-channel
- * auto-reply (it may be blocked in a synchronous task spawn whose batch
- * includes the sender, so a real turn could never happen in time).
+ * awaits a reply and the recipient cannot run a real reply turn in time
+ * (mid-turn with async execution disabled — possibly blocked in a
+ * synchronous task spawn whose batch includes the sender — or idle in plan
+ * mode, where autonomous wake turns are suppressed), the recipient session
+ * generates an ephemeral side-channel auto-reply.
  */
 
 import { logger, Snowflake } from "@oh-my-pi/pi-utils";
@@ -103,8 +104,19 @@ export class IrcBus {
 	): Promise<IrcDeliveryReceipt> {
 		const message: IrcMessage = { ...msg, id: Snowflake.next(), ts: Date.now() };
 		const ref = this.#registry.get(message.to);
-		if (!ref || ref.status === "aborted") {
-			return { to: message.to, outcome: "failed", error: `Unknown or terminated agent "${message.to}".` };
+		if (!ref) {
+			return {
+				to: message.to,
+				outcome: "failed",
+				error: `Unknown agent "${message.to}" — check \`irc list\` for live peers.`,
+			};
+		}
+		if (ref.status === "aborted") {
+			return {
+				to: message.to,
+				outcome: "failed",
+				error: `Agent "${message.to}" was hard-aborted and cannot be messaged or revived. Its transcript remains readable at history://${message.to}.`,
+			};
 		}
 		// Advisor refs are observability-only transcripts, never messageable peers.
 		if (ref.kind === "advisor") {
@@ -115,12 +127,31 @@ export class IrcBus {
 			};
 		}
 
+		// A `parked` recipient always needs the lifecycle to revive it — this is
+		// read from *this* bus's registry, so it holds for any registry. The
+		// mid-park / adopted checks below query the lifecycle's own state, which
+		// only describes the registry it manages: consult them only when the
+		// lifecycle owns this bus's registry, otherwise a custom-registry bus
+		// (fallen back to the global manager) would gate a live recipient on
+		// unrelated global park state. Main/non-adopted live peers skip the gate,
+		// and pending waiters still win without a session.
+		const lifecycle = this.#lifecycle();
+		const lifecycleOwnsRegistry = lifecycle.manages(this.#registry);
+		const needsLifecycleGate =
+			ref.status === "parked" ||
+			(lifecycleOwnsRegistry && (lifecycle.isParking(message.to) || lifecycle.has(message.to)));
+
+		const priorSession = ref.session;
 		let revived = false;
-		if (ref.status === "parked") {
+		if (needsLifecycleGate) {
 			try {
-				await this.#lifecycle().ensureLive(message.to);
-				revived = true;
+				const liveSession = await lifecycle.ensureLive(message.to);
+				// Revival = we did not keep the same live instance (parked start, or
+				// park completed and a fresh session was rebuilt).
+				revived = !priorSession || liveSession !== priorSession;
 			} catch (error) {
+				// Not revivable / released / revive failed. Do not buffer: a permanent
+				// failure must not inflate unread counts or pretend delivery is pending.
 				return {
 					to: message.to,
 					outcome: "failed",
@@ -174,7 +205,7 @@ export class IrcBus {
 		filter: { from?: string },
 		timeoutMs: number,
 		signal?: AbortSignal,
-		options?: { drainPending?: boolean },
+		options?: { drainPending?: boolean; liveness?: { registry: AgentRegistry; senderId: string } },
 	): Promise<IrcMessage | null> {
 		if (signal?.aborted) {
 			throw signal.reason instanceof Error ? signal.reason : new Error("IRC wait aborted");
@@ -189,35 +220,49 @@ export class IrcBus {
 		const { promise, resolve, reject } = Promise.withResolvers<IrcMessage | null>();
 		let timer: NodeJS.Timeout | undefined;
 		let onAbort: (() => void) | undefined;
+		let unsubscribeLiveness: (() => void) | undefined;
 
-		const waiter: IrcWaiter = {
-			from: filter.from,
-			resolve: msg => {
-				cleanup();
-				resolve(msg);
-			},
-			cancel: () => {
-				cleanup();
-			},
+		const liveness = options?.liveness;
+		const livenessReason = filter.from
+			? `IRC wait aborted: agent "${filter.from}" is not running`
+			: "IRC wait aborted: no running peers remain";
+
+		const settle = (
+			outcome: { kind: "message"; msg: IrcMessage } | { kind: "timeout" } | { kind: "abort"; error: Error },
+		): void => {
+			cleanup();
+			if (outcome.kind === "message") {
+				resolve(outcome.msg);
+			} else if (outcome.kind === "timeout") {
+				resolve(null);
+			} else {
+				reject(outcome.error);
+			}
 		};
+
 		const cleanup = (): void => {
 			this.#removeWaiter(agentId, waiter);
 			clearTimeout(timer);
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+			unsubscribeLiveness?.();
+		};
+
+		const waiter: IrcWaiter = {
+			from: filter.from,
+			resolve: msg => settle({ kind: "message", msg }),
+			cancel: () => cleanup(),
 		};
 
 		if (signal) {
-			onAbort = () => {
-				cleanup();
-				reject(signal.reason instanceof Error ? signal.reason : new Error("IRC wait aborted"));
-			};
+			onAbort = () =>
+				settle({
+					kind: "abort",
+					error: signal.reason instanceof Error ? signal.reason : new Error("IRC wait aborted"),
+				});
 			signal.addEventListener("abort", onAbort, { once: true });
 		}
 		if (timeoutMs > 0) {
-			timer = setTimeout(() => {
-				cleanup();
-				resolve(null);
-			}, timeoutMs);
+			timer = setTimeout(() => settle({ kind: "timeout" }), timeoutMs);
 			timer.unref?.();
 		}
 
@@ -227,6 +272,22 @@ export class IrcBus {
 			this.#waiters.set(agentId, waiters);
 		}
 		waiters.push(waiter);
+
+		if (liveness) {
+			const { registry, senderId } = liveness;
+			const hasRunningSender = (from?: string): boolean =>
+				registry.listVisibleTo(senderId).some(ref => ref.status === "running" && (!from || ref.id === from));
+			const check = filter.from ? () => hasRunningSender(filter.from) : () => hasRunningSender();
+			unsubscribeLiveness = registry.onChange(() => {
+				if (!check()) {
+					settle({ kind: "abort", error: new Error(livenessReason) });
+				}
+			});
+			if (!check()) {
+				settle({ kind: "abort", error: new Error(livenessReason) });
+			}
+		}
+
 		return promise;
 	}
 

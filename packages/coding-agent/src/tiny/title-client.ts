@@ -29,7 +29,12 @@ import type { TinyTitleProgressEvent, TinyTitleWorkerInbound, TinyTitleWorkerOut
 type PendingRequest =
 	| { kind: "generate"; modelKey: TinyTitleLocalModelKey; resolve: (title: string | null) => void }
 	| { kind: "complete"; modelKey: TinyMemoryLocalModelKey; resolve: (text: string | null) => void }
-	| { kind: "download"; modelKey: TinyLocalModelKey; resolve: (ok: boolean) => void };
+	| { kind: "download"; modelKey: TinyLocalModelKey; resolve: (result: TinyTitleDownloadResult) => void };
+
+export interface TinyTitleDownloadResult {
+	ok: boolean;
+	error?: string;
+}
 
 export interface TinyTitleDownloadOptions {
 	signal?: AbortSignal;
@@ -191,6 +196,28 @@ export class TinyTitleClient {
 		return () => this.#progressListeners.delete(listener);
 	}
 
+	/**
+	 * Spawn the tiny-model worker ahead of first use without loading any model.
+	 * Called from idle TUI startup so the first {@link generate} reuses a live,
+	 * unref'd subprocess instead of paying subprocess-spawn latency on the submit
+	 * hot path (issue #6462). No-ops for online / non-local keys and for models
+	 * already marked failed. A no-op `ping` round-trips the transport to fault in
+	 * the worker's module graph; no pending request is registered, so
+	 * {@link #syncWorkerRef} leaves the worker unref'd and idle sessions still exit.
+	 */
+	prewarm(modelKey: string): void {
+		if (!isTinyTitleLocalModelKey(modelKey) || this.#failedModels.has(modelKey)) return;
+		try {
+			const worker = this.#ensureWorker();
+			worker.send({ type: "ping", id: String(++this.#nextRequestId) });
+		} catch (error) {
+			logger.debug("tiny-title: prewarm failed", {
+				modelKey,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
 	async generate(modelKey: string, message: string, signal?: AbortSignal): Promise<string | null>;
 	async generate(modelKey: string, message: string, options?: TinyTitleGenerateOptions): Promise<string | null>;
 	async generate(
@@ -269,21 +296,21 @@ export class TinyTitleClient {
 		}
 	}
 
-	async downloadModel(modelKey: string, options: TinyTitleDownloadOptions = {}): Promise<boolean> {
-		if (!isTinyLocalModelKey(modelKey)) return false;
-		if (options.signal?.aborted) return false;
+	async downloadModel(modelKey: string, options: TinyTitleDownloadOptions = {}): Promise<TinyTitleDownloadResult> {
+		if (!isTinyLocalModelKey(modelKey)) return { ok: false };
+		if (options.signal?.aborted) return { ok: false };
 
 		const unsubscribe = options.onProgress ? this.onProgress(options.onProgress) : undefined;
 		try {
 			const worker = this.#ensureWorker();
 			const id = String(++this.#nextRequestId);
-			const { promise, resolve } = Promise.withResolvers<boolean>();
+			const { promise, resolve } = Promise.withResolvers<TinyTitleDownloadResult>();
 			this.#addPending(id, { kind: "download", modelKey, resolve });
 			const abort = (): void => {
 				const pending = this.#pending.get(id);
 				if (pending?.kind !== "download") return;
 				this.#deletePending(id);
-				pending.resolve(false);
+				pending.resolve({ ok: false });
 			};
 			options.signal?.addEventListener("abort", abort, { once: true });
 			try {
@@ -294,11 +321,12 @@ export class TinyTitleClient {
 				this.#deletePending(id);
 			}
 		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
 			logger.debug("tiny-title: local model download failed", {
 				modelKey,
-				error: error instanceof Error ? error.message : String(error),
+				error: message,
 			});
-			return false;
+			return { ok: false, error: message };
 		} finally {
 			unsubscribe?.();
 		}
@@ -314,7 +342,7 @@ export class TinyTitleClient {
 		for (const pending of this.#pending.values()) {
 			this.#emitProgress({ modelKey: pending.modelKey, status: "error" });
 			if (pending.kind === "generate" || pending.kind === "complete") pending.resolve(null);
-			else pending.resolve(false);
+			else pending.resolve({ ok: false });
 		}
 		this.#pending.clear();
 		this.#refed = false;
@@ -379,7 +407,7 @@ export class TinyTitleClient {
 			return;
 		}
 		if (message.type === "downloaded") {
-			if (pending.kind === "download") pending.resolve(true);
+			if (pending.kind === "download") pending.resolve({ ok: true });
 			return;
 		}
 		if (message.type === "completion") {
@@ -389,8 +417,8 @@ export class TinyTitleClient {
 		logger.debug("tiny-title: worker returned error", { error: message.error });
 		this.#markFailedModel(pending);
 		this.#emitProgress({ modelKey: pending.modelKey, status: "error" });
-		if (pending.kind === "generate" || pending.kind === "complete") pending.resolve(null);
-		else pending.resolve(false);
+		if (pending.kind === "download") pending.resolve({ ok: false, error: message.error });
+		else pending.resolve(null);
 		void this.terminate();
 	}
 
@@ -407,7 +435,7 @@ export class TinyTitleClient {
 		for (const pending of this.#pending.values()) {
 			this.#emitProgress({ modelKey: pending.modelKey, status: "error" });
 			if (pending.kind === "generate" || pending.kind === "complete") pending.resolve(null);
-			else pending.resolve(false);
+			else pending.resolve({ ok: false, error: error.message });
 		}
 		this.#pending.clear();
 		void this.terminate();

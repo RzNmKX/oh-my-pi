@@ -33,13 +33,35 @@ import {
 	HEADTAIL_DRIFT_WARNING,
 	missingSnapshotTagMessage,
 	pathRecoveredFromTagMessage,
+	type RevealedLine,
 	unseenLinesMessage,
 } from "./messages";
 import { MismatchError } from "./mismatch";
 import { detectLineEnding, type LineEnding, normalizeToLF, restoreLineEndings, stripBom } from "./normalize";
+import { InvalidAbsoluteRangeError } from "./parser";
 import { Recovery, type RecoveryResult } from "./recovery";
-import type { SnapshotStore } from "./snapshots";
-import type { ApplyResult, BlockResolution, BlockResolver, Edit, FileOp } from "./types";
+import type { Snapshot, SnapshotStore } from "./snapshots";
+import type { ApplyResult, BlockResolution, BlockResolver, BlockSpan, Edit, FileOp } from "./types";
+
+/**
+ * Upper bound on the number of unseen anchor lines whose actual file content
+ * we inline into a rejection error (see {@link Patcher.assertSeenLines}). Big
+ * enough to fit the common "edit a whole function body" retry path in one
+ * message, small enough to keep the error human-readable when the model
+ * over-anchors and to preserve the "re-read first" fallback for genuinely
+ * blind wide edits (only the revealed prefix gets merged into `seenLines`).
+ */
+const SEEN_LINE_REVEAL_CAP = 40;
+
+/**
+ * Per-revealed-line character cap. Matches the read/search column cap so a
+ * revealed anchor line can never dump a minified megabyte-wide bundle line
+ * into the tool error, TUI, and model context. Lines longer than the cap
+ * are trimmed to `cap` characters plus an `…` marker AND flag the entire
+ * reveal as truncated so no line joins `seenLines` — the model must re-read
+ * the range to prove it saw the full width.
+ */
+const SEEN_LINE_REVEAL_MAX_COLUMNS = 512;
 
 export interface PatcherOptions {
 	/** Storage backend used for all reads and writes. */
@@ -52,6 +74,12 @@ export interface PatcherOptions {
 	 * host did not wire a resolver). Plain line-range ops never need it.
 	 */
 	blockResolver?: BlockResolver;
+	/**
+	 * Enforce the seen-line guard: reject anchored edits on lines the read/search
+	 * that minted the tag never displayed. Defaults to `true`. When `false`, tags
+	 * validate on content hash alone and any anchor into the tagged content applies.
+	 */
+	enforceSeenLines?: boolean;
 }
 
 /** Per-section result returned by {@link Patcher.apply} / {@link Patcher.commit}. */
@@ -148,6 +176,10 @@ function mergeWarnings(...sources: ReadonlyArray<readonly string[] | undefined>)
 	return out;
 }
 
+function hasUtf8Bom(bytes: Uint8Array | undefined): boolean {
+	return bytes !== undefined && bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
+}
+
 function assertUniqueCanonicalPaths(prepared: readonly PreparedSection[]): void {
 	const seen = new Map<string, string>();
 	for (const entry of prepared) {
@@ -172,6 +204,7 @@ export class Patcher {
 	readonly snapshots: SnapshotStore;
 	readonly recovery: Recovery;
 	readonly blockResolver: BlockResolver | undefined;
+	readonly #enforceSeenLines: boolean;
 
 	constructor(options: PatcherOptions) {
 		if (!options.snapshots) {
@@ -181,6 +214,7 @@ export class Patcher {
 		this.snapshots = options.snapshots;
 		this.recovery = new Recovery(options.snapshots);
 		this.blockResolver = options.blockResolver;
+		this.#enforceSeenLines = options.enforceSeenLines ?? true;
 	}
 
 	/**
@@ -244,6 +278,25 @@ export class Patcher {
 		}
 	}
 
+	async #parseWithRangeDiagnostics(section: PatchSection) {
+		try {
+			return section.parse();
+		} catch (error) {
+			if (!(error instanceof InvalidAbsoluteRangeError) || !this.blockResolver) throw error;
+			let span: BlockSpan | null = null;
+			try {
+				const read = await this.#tryRead(section.path);
+				if (read.exists) {
+					const normalized = normalizeToLF(stripBom(read.rawContent).text);
+					span = this.blockResolver({ path: section.path, text: normalized, line: error.startLine });
+				}
+			} catch {
+				// Source-aware enrichment is best-effort; preserve the actionable parser error.
+			}
+			throw span?.start === error.startLine && span.end > span.start ? error.withBlock(span) : error;
+		}
+	}
+
 	/**
 	 * Read a section's target file, parse the section, validate the snapshot
 	 * tag (with recovery), and apply the edits in memory. Returns a
@@ -254,7 +307,7 @@ export class Patcher {
 	 * tag mismatch ({@link MismatchError}).
 	 */
 	async prepare(section: PatchSection): Promise<PreparedSection> {
-		const parsed = section.parse();
+		const parsed = await this.#parseWithRangeDiagnostics(section);
 		const parseWarnings = [...parsed.warnings];
 		const fileOp = parsed.fileOp;
 		assertSectionHashPresent(section.path, section.fileHash);
@@ -295,7 +348,8 @@ export class Patcher {
 			throw new Error(`MV destination is the same as ${target.path}.`);
 		}
 
-		const { bom, text } = stripBom(read.rawContent);
+		const { bom: bomFromText, text } = stripBom(read.rawContent);
+		const bom = bomFromText || (await this.#readBinaryBom(target.path));
 		const lineEnding = detectLineEnding(text);
 		const normalized = normalizeToLF(text);
 
@@ -453,6 +507,12 @@ export class Patcher {
 		};
 	}
 
+	async #readBinaryBom(path: string): Promise<string> {
+		if (!this.fs.readBinary) return "";
+		const bytes = await this.fs.readBinary(path);
+		return hasUtf8Bom(bytes) ? "\uFEFF" : "";
+	}
+
 	async #tryRead(path: string): Promise<{ exists: boolean; rawContent: string }> {
 		try {
 			const content = await this.fs.readText(path);
@@ -469,18 +529,61 @@ export class Patcher {
 
 	/**
 	 * Reject an anchored edit that references a line the read which minted
-	 * `expected` never displayed. The snapshot's `seenLines` is the set of
-	 * 1-indexed lines a producer (read/search) actually showed under that tag;
-	 * absent or empty means no provenance was recorded, so the edit applies as
-	 * before. Only runs on the no-drift path, where anchor line numbers index
-	 * the tagged content 1:1.
+	 * `expected` never displayed. `matchedSnapshot` is the store version whose
+	 * text equals the live normalized content — the exact snapshot the model
+	 * anchored against. Absent means no provenance was recorded (the tag was
+	 * externally minted or aged out), so the edit applies as before. Only runs
+	 * on the no-drift path, where anchor line numbers index the tagged content
+	 * 1:1.
+	 *
+	 * The rejection inlines the actual file content at the unseen anchor lines
+	 * (from `matchedSnapshot.text`, which by definition equals the live
+	 * normalized content) so the model can verify what it was about to touch.
+	 * When the reveal covers EVERY unseen anchor line in full width
+	 * (`truncated === false`) those lines also merge into the snapshot's
+	 * seen-line set, so a straight retry with the same `[path#tag]` header
+	 * succeeds without a follow-up range read — the content the model
+	 * received in the error IS proof it has now seen those lines. When the
+	 * anchor range exceeds {@link SEEN_LINE_REVEAL_CAP} lines OR any
+	 * revealed line exceeds {@link SEEN_LINE_REVEAL_MAX_COLUMNS} characters
+	 * (`truncated === true`), NO lines merge: the message keeps the
+	 * range-re-read guidance intact and the model cannot piecewise-reveal
+	 * its way past the guard across multiple retries
+	 * (over-cap retry → tail reveal → next retry applies), nor coax the tool
+	 * into dumping a minified megabyte-wide line into the error preview.
 	 */
-	#assertSeenLines(section: PatchSection, canonicalPath: string, expected: string): void {
-		const seen = this.snapshots.byHash(canonicalPath, expected)?.seenLines;
+	#assertSeenLines(section: PatchSection, expected: string, matchedSnapshot: Snapshot | null): void {
+		const seen = matchedSnapshot?.seenLines;
 		if (!seen || seen.size === 0) return;
 		const unseen = section.collectAnchorLines().filter(line => !seen.has(line));
 		if (unseen.length === 0) return;
-		throw new Error(unseenLinesMessage(section.path, unseen, expected));
+		const sourceLines = matchedSnapshot?.text.split("\n") ?? [];
+		const revealed: RevealedLine[] = [];
+		const revealCount = Math.min(unseen.length, SEEN_LINE_REVEAL_CAP);
+		let columnTruncated = false;
+		for (let i = 0; i < revealCount; i++) {
+			const line = unseen[i];
+			// Out-of-range anchors are caught by parse/apply with a better
+			// message; skip them here so they never join the revealed set.
+			if (line < 1 || line > sourceLines.length) continue;
+			const source = sourceLines[line - 1] ?? "";
+			if (source.length > SEEN_LINE_REVEAL_MAX_COLUMNS) {
+				revealed.push({ line, text: `${source.slice(0, SEEN_LINE_REVEAL_MAX_COLUMNS)}…` });
+				columnTruncated = true;
+			} else {
+				revealed.push({ line, text: source });
+			}
+		}
+		const truncated = unseen.length > revealed.length || columnTruncated;
+		// Only merge when the reveal covered every unseen anchor line in full
+		// width. A prefix-truncated reveal would let the model split a blind
+		// edit into <=cap-line retries and land it without ever running the
+		// required range re-read; a column-clipped reveal would leave part of
+		// each line unseen while the model receives an "ok to retry" signal.
+		if (!truncated) {
+			for (const { line } of revealed) seen.add(line);
+		}
+		throw new Error(unseenLinesMessage(section.path, unseen, expected, { lines: revealed, truncated }));
 	}
 	#mismatchError(
 		section: PatchSection,
@@ -509,7 +612,13 @@ export class Patcher {
 	}): ApplyResult {
 		const { section, canonicalPath, exists, normalized, edits } = args;
 		const expected = exists ? section.fileHash : undefined;
+		// The 4-hex tag is content-derived: when the live text hashes to it,
+		// trust the match and apply directly. `storedSnapshotForTag` feeds the
+		// drift paths below (block resolution, anchor remapping); on a 16-bit
+		// tag collision it resolves to the most-recently recorded text.
+		const storedSnapshotForTag = expected === undefined ? null : this.snapshots.byHash(canonicalPath, expected);
 		const liveMatches = expected !== undefined && computeFileHash(normalized) === expected;
+		const matchedSnapshot = liveMatches ? this.snapshots.byContent(canonicalPath, normalized) : null;
 
 		// Resolve `replace_block N:` edits to concrete ranges before recovery
 		// runs. Block anchors are expressed against the snapshot the section tag
@@ -517,15 +626,14 @@ export class Patcher {
 		//   - live content matches the tag (or there is no tag) → resolve against
 		//     the live, normalized content;
 		//   - the file drifted → resolve against the tagged snapshot's text so the
-		//     resulting ranges flow through the 3-way-merge recovery below.
+		//     resulting ranges can be mapped to unchanged live lines below.
 		// When a block edit needs the tagged snapshot but it is unavailable, the
 		// range cannot be placed safely — reject with a MismatchError (re-read).
 		const blockResolutions: BlockResolution[] = [];
 		const resolveWarnings: string[] = [];
 		let resolved: readonly Edit[] = edits;
 		if (hasBlockEdit(edits)) {
-			const baseText =
-				expected === undefined || liveMatches ? normalized : this.snapshots.byHash(canonicalPath, expected)?.text;
+			const baseText = expected === undefined || liveMatches ? normalized : storedSnapshotForTag?.text;
 			if (baseText === undefined) {
 				throw this.#mismatchError(section, canonicalPath, normalized, expected ?? "", false);
 			}
@@ -548,7 +656,9 @@ export class Patcher {
 			// The line numbers in `edits` index the exact content the tag names.
 			// Reject any anchor the read never displayed: editing lines the model
 			// has not seen is the off-by-memory mistake that mangles files.
-			if (expected !== undefined) this.#assertSeenLines(section, canonicalPath, expected);
+			if (expected !== undefined && this.#enforceSeenLines) {
+				this.#assertSeenLines(section, expected, matchedSnapshot);
+			}
 			const result = applyEdits(normalized, resolved);
 			return withResolveWarnings(blockResolutions.length > 0 ? { ...result, blockResolutions } : result);
 		}
@@ -560,8 +670,8 @@ export class Patcher {
 			const result = applyEdits(normalized, resolved);
 			return withResolveWarnings({ ...result, warnings: [HEADTAIL_DRIFT_WARNING, ...(result.warnings ?? [])] });
 		}
-		// File drifted: try to replay the edit against the version the tag
-		// names and 3-way-merge it onto the live content.
+		// File drifted: map every anchor from the tagged snapshot to unchanged
+		// live lines. Recovery refuses changed or ambiguous targets.
 		const recovered = this.recovery.tryRecover({
 			path: canonicalPath,
 			currentText: normalized,

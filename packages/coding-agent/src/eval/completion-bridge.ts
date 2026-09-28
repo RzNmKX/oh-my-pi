@@ -37,9 +37,9 @@ const STRUCTURED_TOOL_NAME = "respond";
 type CompletionTier = "smol" | "default" | "slow";
 
 const TIER_TO_PATTERN: Record<CompletionTier, string> = {
-	smol: "pi/smol",
-	default: "pi/default",
-	slow: "pi/slow",
+	smol: "@smol",
+	default: "@default",
+	slow: "@slow",
 };
 
 const completionArgsSchema = type({
@@ -62,7 +62,7 @@ export interface EvalCompletionResult {
 
 /**
  * Resolve a tier to a concrete {@link Model}. `default` prefers the session's
- * active model and falls back to the `pi/default` role; `smol`/`slow` resolve
+ * active model and falls back to the `@default` role; `smol`/`slow` resolve
  * their respective role patterns. Returns `undefined` when nothing matches.
  */
 function resolveTierModel(tier: CompletionTier, session: ToolSession): Model<Api> | undefined {
@@ -75,7 +75,7 @@ function resolveTierModel(tier: CompletionTier, session: ToolSession): Model<Api
 	const resolve = (pattern: string | undefined): Model<Api> | undefined => {
 		if (!pattern) return undefined;
 		const expanded = expandRoleAlias(pattern, session.settings);
-		return resolveModelFromString(expanded, available, matchPreferences, modelRegistry);
+		return resolveModelFromString(expanded, available, matchPreferences);
 	};
 
 	if (tier === "default") {

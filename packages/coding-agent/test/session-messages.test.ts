@@ -54,7 +54,8 @@ describe("convertToLlm compaction summary", () => {
 			{ role: "compactionSummary", summary: "plain summary", tokensBefore: 1000, timestamp: Date.now() },
 		];
 		const converted = convertToLlm(messages);
-		expect((converted[0]?.content as unknown[]).length).toBe(1);
+		expect(converted[0]).toBeDefined();
+		expect((converted[0]!.content as unknown[]).length).toBe(1);
 	});
 });
 
@@ -374,8 +375,9 @@ describe("wrapSteeringForModel", () => {
 		expect(wrapped[0]).not.toBe(message);
 		expect(message.content).toEqual([{ type: "text", text: rawText }]);
 		const wrappedText = getUserText(wrapped[0]);
-		expect(wrappedText).toContain("<user_interjection>");
-		expect(wrappedText).toContain("<message>\nUse <tag> & keep it literal\n</message>");
+		expect(wrappedText).toContain("<system-notice>");
+		expect(wrappedText).not.toContain("<message>");
+		expect(wrappedText).toContain("Use <tag> & keep it literal");
 		expect(wrappedText).not.toContain("&lt;tag&gt;");
 		expect(wrappedText).not.toContain("&amp;");
 	});
@@ -397,8 +399,8 @@ describe("wrapSteeringForModel", () => {
 		// the cached prefix stays valid instead of busting on the turn after a steer.
 		expect(wrapped).not.toBe(messages);
 		expect(wrapped[0]).not.toBe(buried);
-		expect(getUserText(wrapped[0])).toContain("<user_interjection>");
-		expect(getUserText(wrapped[0])).toContain("<message>\nold steer\n</message>");
+		expect(getUserText(wrapped[0])).toContain("<system-notice>");
+		expect(getUserText(wrapped[0])).toContain("old steer");
 		// Non-steering trailing message is untouched, and the persisted steer is not mutated.
 		expect(wrapped[1]).toBe(later);
 		expect(buried.content).toBe("old steer");
@@ -443,7 +445,7 @@ describe("wrapSteeringForModel", () => {
 		expect(wrapped).not.toBe(messages);
 		expect(wrapped[0]).not.toBe(first);
 		expect(wrapped[1]).not.toBe(second);
-		expect(getUserText(wrapped[0])).toContain("<message>\nfirst steer\n</message>");
-		expect(getUserText(wrapped[1])).toContain("<message>\nsecond steer\n</message>");
+		expect(getUserText(wrapped[0])).toContain("first steer");
+		expect(getUserText(wrapped[1])).toContain("second steer");
 	});
 });

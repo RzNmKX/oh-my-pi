@@ -195,7 +195,7 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 		const bigLines = bigNew.split("\n");
 		const bigPartials = bigLines.map((_v, i) => bigLines.slice(0, i + 1).join("\n"));
 
-		const uiStub = { requestRender() {} } as unknown as TUI;
+		const uiStub = { requestRender() {}, requestComponentRender() {} } as unknown as TUI;
 		const tool = { mode: "replace" } as unknown as AgentTool;
 		const component = new ToolExecutionComponent(
 			"edit",
@@ -382,7 +382,7 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 describe("streaming tool call preview height (bounded across renderers)", () => {
 	beforeAll(async () => {
 		// `evalToolRenderer.renderCall` walks the theme during highlighting; the
-		// bash/ssh/eval pending previews exercised below DO NOT read
+		// bash/eval pending previews exercised below DO NOT read
 		// `settings.*`, so the global Settings singleton is intentionally left
 		// untouched here. Resetting/initialising it in `beforeEach` raced with
 		// parallel test files that do the same dance (issue #2582), flipping the
@@ -401,6 +401,14 @@ describe("streaming tool call preview height (bounded across renderers)", () => 
 		}
 	}
 
+	function getRenderedLines(lines: readonly string[]): string[] {
+		return lines
+			.map(line => Bun.stripANSI(line).trim())
+			.filter(line => line.startsWith("│") && line.endsWith("│"))
+			.map(line => line.slice(1, -1).trim())
+			.filter(line => line !== "" && !line.includes("earlier lines"));
+	}
+
 	test("framed inline tool previews span the full tool width", () => {
 		const width = 80;
 		const { lines } = renderPending("bash", { command: "echo hi" });
@@ -413,8 +421,8 @@ describe("streaming tool call preview height (bounded across renderers)", () => 
 		expect(visibleWidth(topBorder ?? "")).toBe(width);
 	});
 
-	test("bash/ssh pending previews stay short even with very long multiline args", () => {
-		// bash/ssh window the collapsed command to a viewport-sized TAIL: the end
+	test("bash pending previews stay short even with very long multiline args", () => {
+		// bash windows the collapsed command to a viewport-sized TAIL: the end
 		// (the live edge while args stream) stays visible behind an "… N earlier
 		// lines" marker on top; the head is elided.
 		const window = previewWindowRows();
@@ -425,19 +433,16 @@ describe("streaming tool call preview height (bounded across renderers)", () => 
 		const lastHidden = `line-${hidden - 1}`;
 		const firstVisible = `line-${hidden}`;
 		const lastVisible = `line-${total - 1}`;
-		const cases: Array<{ name: string; args: unknown }> = [
-			{ name: "bash", args: { command: longLines.join("\n") } },
-			{ name: "ssh", args: { host: "example", command: longLines.join("\n") } },
-		];
+		const cases: Array<{ name: string; args: unknown }> = [{ name: "bash", args: { command: longLines.join("\n") } }];
 
 		for (const testCase of cases) {
 			const { lines, text } = renderPending(testCase.name, testCase.args);
 			expect(lines.length, `${testCase.name} preview should stay bounded`).toBeLessThan(window + 10);
-			for (const needle of [firstVisible, lastVisible]) {
-				expect(text, `${testCase.name} preview should keep ${needle}`).toContain(needle);
-			}
-			expect(text, `${testCase.name} preview should elide line-0`).not.toContain("line-0");
-			expect(text, `${testCase.name} preview should elide ${lastHidden}`).not.toContain(lastHidden);
+			const renderedLines = getRenderedLines(lines);
+			expect(renderedLines, `${testCase.name} preview should keep ${firstVisible}`).toContain(firstVisible);
+			expect(renderedLines, `${testCase.name} preview should keep ${lastVisible}`).toContain(lastVisible);
+			expect(renderedLines, `${testCase.name} preview should elide line-0`).not.toContain("line-0");
+			expect(renderedLines, `${testCase.name} preview should elide ${lastHidden}`).not.toContain(lastHidden);
 			expect(text, `${testCase.name} preview should advertise the elided head`).toContain(
 				`… ${hidden} earlier lines`,
 			);
@@ -446,13 +451,15 @@ describe("streaming tool call preview height (bounded across renderers)", () => 
 
 	test("eval pending preview windows the code to the viewport tail", () => {
 		// Eval cell code is capped to the same viewport-sized TAIL window as
-		// bash/ssh: the live edge stays visible behind an "… N earlier lines"
+		// bash: the live edge stays visible behind an "… N earlier lines"
 		// marker on top; ctrl+o uncaps. Unlike bash, the marker row sits above
 		// the window, so previewWindowRows() code lines stay visible.
 		const window = previewWindowRows();
 		const total = window + 5;
 		const hidden = total - window;
-		const longLines = Array.from({ length: total }, (_, i) => `line-${i}`);
+		// Underscore identifiers: the display formatter would space `line-1` as a
+		// subtraction, and this test asserts windowing, not operator layout.
+		const longLines = Array.from({ length: total }, (_, i) => `line_${i}`);
 		const { lines, text } = renderPending("eval", {
 			language: "js",
 			title: "big",
@@ -460,10 +467,11 @@ describe("streaming tool call preview height (bounded across renderers)", () => 
 		});
 
 		expect(lines.length, "eval code preview should stay bounded").toBeLessThan(window + 10);
-		expect(text).toContain(`const line-${total - 1} = 1;`);
-		expect(text).toContain(`const line-${hidden} = 1;`);
-		expect(text).not.toContain("const line-0 = 1;");
-		expect(text).not.toContain(`const line-${hidden - 1} = 1;`);
+		const renderedLines = getRenderedLines(lines);
+		expect(renderedLines).toContain(`const line_${total - 1} = 1;`);
+		expect(renderedLines).toContain(`const line_${hidden} = 1;`);
+		expect(renderedLines).not.toContain("const line_0 = 1;");
+		expect(renderedLines).not.toContain(`const line_${hidden - 1} = 1;`);
 		expect(text).toContain(`… ${hidden} earlier lines`);
 	}, 30_000);
 });

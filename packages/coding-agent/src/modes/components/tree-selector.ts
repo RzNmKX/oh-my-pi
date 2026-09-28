@@ -15,9 +15,10 @@ import type { TreeFilterMode } from "../../config/settings-schema";
 import { theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt, matchesSelectDown, matchesSelectUp } from "../../modes/utils/keybinding-matchers";
 import type { SessionTreeNode } from "../../session/session-entries";
-import { toPathList } from "../../tools/grep";
+import { toPathList } from "../../tools/path-utils";
 import { shortenPath } from "../../tools/render-utils";
 import { canonicalizeMessage } from "../../utils/thinking-display";
+import { resolveAssistantErrorPresentation } from "../utils/transcript-render-helpers";
 import { DynamicBorder } from "./dynamic-border";
 import { centeredWindow, contentRowWidth, renderScrollableList } from "./selector-helpers";
 
@@ -65,7 +66,7 @@ class TreeList implements Component {
 	#activePathIds: Set<string> = new Set();
 	#lastSelectedId: string | null = null;
 
-	onSelect?: (entryId: string) => void;
+	onSelect?: (entryId: string, options: { summarize: boolean }) => void;
 	onCancel?: () => void;
 	onLabelEdit?: (entryId: string, currentLabel: string | undefined) => void;
 
@@ -615,15 +616,20 @@ class TreeList implements Component {
 					const content = normalize(this.#extractContent(msgWithContent.content));
 					result = theme.fg("dim", "developer: ") + theme.fg("muted", content);
 				} else if (role === "assistant") {
+					const presentation = resolveAssistantErrorPresentation(msg);
+					if (presentation.kind === "compact-recovered") {
+						result = theme.fg("success", "assistant: ") + theme.fg("dim", presentation.text);
+						break;
+					}
 					const msgWithContent = msg as { content?: unknown; stopReason?: string; errorMessage?: string };
 					const textContent = normalize(this.#extractContent(msgWithContent.content));
 					if (textContent) {
 						result = theme.fg("success", "assistant: ") + textContent;
+					} else if (presentation.kind === "full") {
+						result =
+							theme.fg("success", "assistant: ") + theme.fg("error", normalize(presentation.text).slice(0, 80));
 					} else if (msgWithContent.stopReason === "aborted") {
 						result = theme.fg("success", "assistant: ") + theme.fg("muted", "(aborted)");
-					} else if (msgWithContent.errorMessage) {
-						const errMsg = normalize(msgWithContent.errorMessage).slice(0, 80);
-						result = theme.fg("success", "assistant: ") + theme.fg("error", errMsg);
 					} else {
 						result = theme.fg("success", "assistant: ") + theme.fg("muted", "(no content)");
 					}
@@ -753,8 +759,15 @@ class TreeList implements Component {
 				return `[grep: /${pattern}/ in ${shortenPath(scope)}]`;
 			}
 			case "glob": {
-				const paths = Array.isArray(args.paths) ? args.paths.join(", ") : String(args.pattern || ".");
-				return `[glob: ${shortenPath(paths)}]`;
+				const globInput =
+					typeof args.path === "string"
+						? args.path
+						: typeof args.paths === "string" || Array.isArray(args.paths)
+							? args.paths
+							: undefined;
+				const paths = toPathList(globInput);
+				const scope = paths.length > 0 ? paths.join(", ") : ".";
+				return `[glob: ${shortenPath(scope)}]`;
 			}
 			case "ls": {
 				const path = shortenPath(String(args.path || "."));
@@ -779,10 +792,16 @@ class TreeList implements Component {
 		} else if (matchesKey(keyData, "right")) {
 			// Page down
 			this.#selectedIndex = Math.min(this.#filteredNodes.length - 1, this.#selectedIndex + this.maxVisibleLines);
+		} else if (matchesKey(keyData, "shift+enter") || matchesKey(keyData, "shift+return")) {
+			// Summarize-and-switch: fork with a branch summary without the extra prompt.
+			const selected = this.#filteredNodes[this.#selectedIndex];
+			if (selected && this.onSelect) {
+				this.onSelect(selected.node.entry.id, { summarize: true });
+			}
 		} else if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
 			const selected = this.#filteredNodes[this.#selectedIndex];
 			if (selected && this.onSelect) {
-				this.onSelect(selected.node.entry.id);
+				this.onSelect(selected.node.entry.id, { summarize: false });
 			}
 		} else if (matchesAppInterrupt(keyData)) {
 			if (this.#searchQuery) {
@@ -910,7 +929,7 @@ export class TreeSelectorComponent extends Container {
 		tree: SessionTreeNode[],
 		currentLeafId: string | null,
 		terminalHeight: number,
-		onSelect: (entryId: string) => void,
+		onSelect: (entryId: string, options: { summarize: boolean }) => void,
 		onCancel: () => void,
 		private readonly onLabelChangeCallback?: (entryId: string, label: string | undefined) => void,
 		initialFilterMode: FilterMode = "default",
@@ -935,7 +954,7 @@ export class TreeSelectorComponent extends Container {
 			new TruncatedText(
 				theme.fg(
 					"muted",
-					"Up/Down: move. Left/Right: page. Shift+L: label. Ctrl+O/Shift+Ctrl+O: filter. Alt+D/T/U/L/A: filter. Type to search",
+					"Enter: switch. Shift+Enter: summarize & switch. Shift+L: label. Ctrl+O: filter. Alt+D/T/U/L/A: filter. Type to search",
 				),
 				0,
 				0,

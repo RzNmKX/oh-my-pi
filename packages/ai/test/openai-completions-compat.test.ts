@@ -3,6 +3,7 @@ import { renderDemotedThinking } from "@oh-my-pi/pi-ai/dialect";
 import {
 	applyOpenRouterRoutingVariant,
 	convertMessages,
+	parseChunkUsage,
 	streamOpenAICompletions,
 } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import type {
@@ -114,7 +115,7 @@ function kimiZaiModel(): Model<"openai-completions"> {
 async function captureOpenAICompletionsPayload(
 	model: Model<"openai-completions">,
 	context: Context = baseContext(),
-	options?: { reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" },
+	options?: { reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; temperature?: number },
 ): Promise<unknown> {
 	const { promise, resolve } = Promise.withResolvers<unknown>();
 	const fetchMock = createMockFetch(["[DONE]"]);
@@ -155,6 +156,19 @@ function getLastTextPart(content: unknown): Record<string, unknown> | undefined 
 }
 
 describe("openai-completions compatibility", () => {
+	it("omits sampling params for OpenAI reasoning models", async () => {
+		const model = buildModel({
+			...gpt4oMiniSpec,
+			id: "gpt-5.6-luna",
+			provider: "github-copilot",
+			api: "openai-completions",
+		} as ModelSpec<"openai-completions">);
+		expect(model.compat.supportsSamplingParams).toBe(false);
+
+		const payload = await captureOpenAICompletionsPayload(model, undefined, { temperature: 0 });
+		expect(toObject(payload)?.temperature).toBeUndefined();
+	});
+
 	it("serializes assistant text content as a plain string", () => {
 		const model: Model<"openai-completions"> = buildModel({
 			...gpt4oMiniSpec,
@@ -195,6 +209,7 @@ describe("openai-completions compatibility", () => {
 			supportsStrictMode: true,
 			toolStrictMode: "none",
 			supportsReasoningParams: true,
+			supportsSamplingParams: true,
 			alwaysSendMaxTokens: false,
 			isOpenRouterHost: false,
 			isVercelGatewayHost: false,
@@ -232,6 +247,11 @@ describe("openai-completions compatibility", () => {
 			throw new Error("assistant message missing");
 		}
 		expect(typeof assistant.content).toBe("string");
+		// Ordinary adjacent text blocks (bridge stitching, imported transcripts,
+		// streaming chunk splits) preserve their original byte sequence on
+		// flatten. The demoted-thinking separator is inserted by the flatten
+		// itself, gated on the kDemotedThinking marker, so unmarked blocks like
+		// these are never touched.
 		expect(assistant.content).toBe("hello world");
 	});
 
@@ -274,7 +294,7 @@ describe("openai-completions compatibility", () => {
 		// Regression: thinking+text replay used to call `.unshift` on the string
 		// content set above (TypeError). Both blocks must survive as one string.
 		expect(typeof assistant.content).toBe("string");
-		expect(assistant.content).toBe(`${renderDemotedThinking(model.id, "chain of thought")}final answer`);
+		expect(assistant.content).toBe(`${renderDemotedThinking(model.id, "chain of thought")} final answer`);
 	});
 
 	it("emits thinking-only assistant content as a plain string when requiresThinkingAsText is set", () => {
@@ -614,6 +634,175 @@ describe("openai-completions compatibility", () => {
 		expect(result.usage.totalTokens).toBe(15);
 	});
 
+	it("keeps unindexed batched tool-call arguments isolated", async () => {
+		const model: Model<"openai-completions"> = buildModel({
+			...gpt4oMiniSpec,
+			api: "openai-completions",
+		} as ModelSpec<"openai-completions">);
+		const fetchMock = createMockFetch([
+			{
+				id: "chatcmpl-batched-tools",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: {
+							tool_calls: [
+								{ function: { name: "bash", arguments: '{"command":"echo hello"}' } },
+								{ function: { name: "bash", arguments: '{"command":"echo goodbye"}' } },
+							],
+						},
+					},
+				],
+			},
+			{
+				id: "chatcmpl-batched-tools",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
+
+		const calls = result.content.filter(content => content.type === "toolCall");
+		expect(calls.map(call => call.arguments)).toEqual([{ command: "echo hello" }, { command: "echo goodbye" }]);
+	});
+
+	it("routes unindexed batched tool-call continuation chunks back by array offset", async () => {
+		const model: Model<"openai-completions"> = buildModel({
+			...gpt4oMiniSpec,
+			api: "openai-completions",
+		} as ModelSpec<"openai-completions">);
+		const fetchMock = createMockFetch([
+			{
+				id: "chatcmpl-batched-continuation",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: {
+							tool_calls: [
+								{ function: { name: "bash", arguments: '{"command":"echo hello"' } },
+								{ function: { name: "bash", arguments: '{"command":"echo goodbye"' } },
+							],
+						},
+					},
+				],
+			},
+			{
+				id: "chatcmpl-batched-continuation",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: {
+							tool_calls: [{ function: { arguments: "}" } }, { function: { arguments: "}" } }],
+						},
+					},
+				],
+			},
+			{
+				id: "chatcmpl-batched-continuation",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
+
+		const calls = result.content.filter(content => content.type === "toolCall");
+		expect(calls.map(call => call.arguments)).toEqual([{ command: "echo hello" }, { command: "echo goodbye" }]);
+	});
+
+	it("falls through zero cached-token candidates to later non-zero usage fields", () => {
+		const model: Model<"openai-completions"> = buildModel({
+			...gpt4oMiniSpec,
+			api: "openai-completions",
+		} as ModelSpec<"openai-completions">);
+		const cases: Array<{
+			name: string;
+			usage: object;
+			expectedCacheRead: number;
+		}> = [
+			{
+				name: "root zero falls through to nested prompt token details",
+				usage: {
+					prompt_tokens: 50_000,
+					completion_tokens: 3,
+					cached_tokens: 0,
+					prompt_tokens_details: { cached_tokens: 49_216 },
+				},
+				expectedCacheRead: 49_216,
+			},
+			{
+				name: "missing root uses prompt cache hit tokens",
+				usage: {
+					prompt_tokens: 100,
+					completion_tokens: 3,
+					prompt_cache_hit_tokens: 41,
+				},
+				expectedCacheRead: 41,
+			},
+			{
+				name: "standard nested prompt token details",
+				usage: {
+					prompt_tokens: 100,
+					completion_tokens: 3,
+					prompt_tokens_details: { cached_tokens: 37 },
+				},
+				expectedCacheRead: 37,
+			},
+			{
+				name: "all candidates missing or zero",
+				usage: {
+					prompt_tokens: 100,
+					completion_tokens: 3,
+					cached_tokens: 0,
+					prompt_cache_hit_tokens: 0,
+					prompt_tokens_details: { cached_tokens: 0 },
+				},
+				expectedCacheRead: 0,
+			},
+			{
+				name: "multiple non-zero fields preserve priority order",
+				usage: {
+					prompt_tokens: 100,
+					completion_tokens: 3,
+					cached_tokens: 11,
+					prompt_cache_hit_tokens: 13,
+					prompt_tokens_details: { cached_tokens: 17 },
+				},
+				expectedCacheRead: 11,
+			},
+		];
+
+		for (const testCase of cases) {
+			const usage = parseChunkUsage(testCase.usage, model, undefined);
+			expect(usage.cacheRead).toBe(testCase.expectedCacheRead);
+			expect(usage.input).toBe(
+				(testCase.usage as { prompt_tokens: number }).prompt_tokens - testCase.expectedCacheRead,
+			);
+		}
+	});
+
 	it("maps qwen chat template reasoning into chat_template_kwargs", async () => {
 		const model: Model<"openai-completions"> = buildModel({
 			...gpt4oMiniSpec,
@@ -635,7 +824,7 @@ describe("openai-completions compatibility", () => {
 		expect(getNestedBoolean(chatTemplateArgs, "enable_thinking")).toBe(true);
 	});
 
-	it("maps GLM-5.2 xhigh to Z.AI max and enables tool streaming", async () => {
+	it("sends reasoning_effort:max for the real Z.AI max tier and enables tool streaming", async () => {
 		const model = zaiGlm52Model();
 		const readTool: Tool = {
 			name: "read",
@@ -653,7 +842,7 @@ describe("openai-completions compatibility", () => {
 			{ ...baseContext(), tools: [readTool] },
 			{
 				apiKey: "test-key",
-				reasoning: "xhigh",
+				reasoning: "max",
 				signal: createAbortedSignal(),
 				onPayload: payload => resolve(payload),
 				maxTokens: 65_536,
@@ -704,21 +893,10 @@ describe("openai-completions compatibility", () => {
 		expect(payloadObject?.tool_stream).toBeUndefined();
 	});
 
-	it("maps GLM-5.2 minimal reasoning to disabled Z.AI thinking", async () => {
+	it("bakes the honest [high, max] Z.AI GLM-5.2 ladder with no effortMap", () => {
 		const model = zaiGlm52Model();
-
-		const { promise, resolve } = Promise.withResolvers<unknown>();
-		streamOpenAICompletions(model, baseContext(), {
-			apiKey: "test-key",
-			reasoning: "minimal",
-			signal: createAbortedSignal(),
-			onPayload: payload => resolve(payload),
-		});
-		const payload = await promise;
-		const thinking = getNestedObject(payload, "thinking");
-
-		expect(thinking?.type).toBe("disabled");
-		expect(toObject(payload)?.reasoning_effort).toBeUndefined();
+		expect(model.thinking?.efforts).toEqual([Effort.High, Effort.Max]);
+		expect(model.thinking?.effortMap).toBeUndefined();
 	});
 
 	it("treats finish_reason end as stop", async () => {
@@ -1042,7 +1220,7 @@ describe("kimi model detection via detectCompat", () => {
 		expect(openRouterKimi.compat.thinkingFormat).toBe("openrouter");
 	});
 
-	it("maps OpenRouter Anthropic adaptive reasoning efforts to the Anthropic scale", async () => {
+	it("sends OpenRouter Anthropic adaptive reasoning efforts 1:1 on the wire", async () => {
 		const model: Model<"openai-completions"> = buildModel({
 			...gpt4oMiniSpec,
 			api: "openai-completions",
@@ -1054,9 +1232,11 @@ describe("kimi model detection via detectCompat", () => {
 
 		const highPayload = await captureOpenAICompletionsPayload(model, baseContext(), { reasoning: "high" });
 		const xhighPayload = await captureOpenAICompletionsPayload(model, baseContext(), { reasoning: "xhigh" });
+		const maxPayload = await captureOpenAICompletionsPayload(model, baseContext(), { reasoning: "max" });
 
-		expect(getNestedObject(highPayload, "reasoning")).toEqual({ effort: "xhigh" });
-		expect(getNestedObject(xhighPayload, "reasoning")).toEqual({ effort: "max" });
+		expect(getNestedObject(highPayload, "reasoning")).toEqual({ effort: "high" });
+		expect(getNestedObject(xhighPayload, "reasoning")).toEqual({ effort: "xhigh" });
+		expect(getNestedObject(maxPayload, "reasoning")).toEqual({ effort: "max" });
 	});
 
 	// Regression for #1071: OpenCode-Go/Zen handle reasoning content server-side
@@ -2202,6 +2382,22 @@ describe("Moonshot Flavored JSON Schema tool normalization", () => {
 				additionalProperties: false,
 			},
 		},
+		{
+			name: "task",
+			description: "spawn task",
+			parameters: {
+				type: "object",
+				properties: {
+					tasks: {
+						type: "array",
+						items: {
+							type: "object",
+							properties: { outputSchema: true },
+						},
+					},
+				},
+			},
+		},
 	];
 
 	function toolParameters(payload: unknown, toolName: string): Record<string, unknown> {
@@ -2239,8 +2435,8 @@ describe("Moonshot Flavored JSON Schema tool normalization", () => {
 		return buildModel({
 			...gpt4oMiniSpec,
 			api: "openai-completions",
-			provider: "vllm",
-			baseUrl: "http://localhost:8000/v1",
+			provider: "custom",
+			baseUrl: "https://api.example.com/v1",
 			id: "local-model",
 		} as ModelSpec<"openai-completions">);
 	}
@@ -2254,6 +2450,10 @@ describe("Moonshot Flavored JSON Schema tool normalization", () => {
 		const paths = probeProperty(payload, "find", "paths");
 		expect(paths.minItems).toBeUndefined();
 		expect(paths.type).toBe("array");
+		const taskProperties = toObject(
+			toObject(toObject(probeProperty(payload, "task", "tasks").items)?.properties)?.outputSchema,
+		);
+		expect(taskProperties).toEqual({});
 	});
 
 	it("leaves raw JSON Schema untouched on non-Moonshot hosts (flag-gated)", async () => {
@@ -2266,5 +2466,136 @@ describe("Moonshot Flavored JSON Schema tool normalization", () => {
 		expect(op).toEqual({ type: "string", enum: ["pr_checkout", "pr_create"], description: "github operation" });
 		const paths = probeProperty(payload, "find", "paths");
 		expect(paths.minItems).toBe(1);
+		const taskItems = toObject(probeProperty(payload, "task", "tasks").items);
+		const taskProperties = toObject(taskItems?.properties);
+		expect(taskProperties?.outputSchema).toBe(true);
+	});
+});
+
+describe("grammar tool-schema normalization (issue #5914)", () => {
+	const primitiveUnion = {
+		anyOf: [
+			{ type: "string" },
+			{ type: "number" },
+			{ type: "boolean" },
+			{ type: "object" },
+			{ type: "array" },
+			{ type: "null" },
+		],
+	};
+
+	// An open field (`z.unknown()` / ArkType `"unknown"` / raw `{}`) becomes a
+	// bare boolean `true` after `toolWireSchema`'s empty-schema normalization
+	// (issue #1179). The `task` tool ships exactly this via `outputSchema`.
+	const openFieldTool: Tool = {
+		name: "task",
+		description: "spawn subagents",
+		parameters: {
+			type: "object",
+			properties: {
+				task: { type: "string" },
+				outputSchema: {},
+				nested: {
+					type: "object",
+					properties: { value: { type: "string" } },
+					additionalProperties: false,
+				},
+			},
+			required: ["task"],
+			additionalProperties: false,
+		},
+	};
+
+	function toolParameters(payload: unknown, toolName: string): Record<string, unknown> {
+		const tools = toObject(payload)?.tools;
+		if (!Array.isArray(tools)) throw new Error("payload tools missing");
+		for (const entry of tools) {
+			const fn = getNestedObject(entry, "function");
+			if (fn?.name === toolName) {
+				const params = toObject(fn.parameters);
+				if (!params) throw new Error(`tool ${toolName} has no parameters`);
+				return params;
+			}
+		}
+		throw new Error(`tool ${toolName} not in payload`);
+	}
+
+	function localLlamaModel(): Model<"openai-completions"> {
+		return buildModel({
+			...gpt4oMiniSpec,
+			api: "openai-completions",
+			provider: "llama.cpp",
+			baseUrl: "http://127.0.0.1:8080/v1",
+			id: "qwen3-coder",
+		} as ModelSpec<"openai-completions">);
+	}
+
+	function remoteModel(): Model<"openai-completions"> {
+		return buildModel({
+			...gpt4oMiniSpec,
+			api: "openai-completions",
+			provider: "custom",
+			baseUrl: "https://api.example.com/v1",
+			id: "remote-model",
+		} as ModelSpec<"openai-completions">);
+	}
+
+	it("auto-detects the grammar flavor for local OpenAI-compatible backends", () => {
+		expect(localLlamaModel().compat.toolSchemaFlavor).toBe("grammar");
+	});
+
+	it("widens bare boolean subschemas and keeps additionalProperties:false", async () => {
+		const model = localLlamaModel();
+		const payload = await captureOpenAICompletionsPayload(model, { ...baseContext(), tools: [openFieldTool] });
+		const params = toolParameters(payload, "task");
+		const properties = toObject(params.properties);
+		if (!properties) throw new Error("task tool has no properties");
+
+		// The offending bare `true` (from the `{}` open field) becomes a
+		// value-accepting primitive union the GBNF converter can compile.
+		expect(properties.outputSchema).toEqual(primitiveUnion);
+		// No bare boolean subschema remains anywhere in the wire schema.
+		expect(JSON.stringify(params)).not.toContain('"outputSchema":true');
+		// The closed-object contract survives: dropping `additionalProperties:
+		// false` would silently reopen the object to arbitrary keys.
+		expect(params.additionalProperties).toBe(false);
+		const nested = toObject(properties.nested);
+		expect(nested?.additionalProperties).toBe(false);
+	});
+
+	it("widens booleans nested inside object-valued additionalProperties", async () => {
+		const model = localLlamaModel();
+		const mapTool: Tool = {
+			name: "map_tool",
+			description: "tool with a schema-valued additionalProperties",
+			parameters: {
+				type: "object",
+				properties: {
+					env: {
+						type: "object",
+						additionalProperties: { type: "object", properties: { metadata: {} } },
+					},
+				},
+				additionalProperties: false,
+			},
+		};
+		const payload = await captureOpenAICompletionsPayload(model, { ...baseContext(), tools: [mapTool] });
+		const params = toolParameters(payload, "map_tool");
+		const env = getNestedObject(toObject(params.properties), "env");
+		const ap = toObject(env?.additionalProperties);
+		// The schema-valued form is traversed: the nested open field is widened
+		// so the GBNF converter never reaches a bare boolean subschema.
+		expect(getNestedObject(toObject(ap?.properties), "metadata")).toEqual(primitiveUnion);
+		// The boolean form on the outer object still survives untouched.
+		expect(params.additionalProperties).toBe(false);
+	});
+
+	it("leaves the wire schema untouched on non-grammar hosts", async () => {
+		const model = remoteModel();
+		expect(model.compat.toolSchemaFlavor).toBeUndefined();
+		const payload = await captureOpenAICompletionsPayload(model, { ...baseContext(), tools: [openFieldTool] });
+		const properties = toObject(toolParameters(payload, "task").properties);
+		// Off the grammar path the open field keeps the normalized bare boolean.
+		expect(properties?.outputSchema).toBe(true);
 	});
 });

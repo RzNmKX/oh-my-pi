@@ -14,8 +14,10 @@ import type {
 	streamSimple,
 	TextContent,
 	Tool,
+	ToolCallProviderMetadata,
 	ToolChoice,
 	ToolResultMessage,
+	ToolResultProviderMetadata,
 	TSchema,
 } from "@oh-my-pi/pi-ai";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
@@ -46,6 +48,24 @@ export interface AgentTurnEndContext {
 	willContinue: boolean;
 }
 
+export interface AgentPreModelCallStop {
+	/** Stop the agent loop before sending the next provider request. */
+	stop: true;
+	/** Optional owner-facing reason, logged by the loop when it stops. */
+	reason?: string;
+}
+
+export type AgentPreModelCallResult = AgentPreModelCallStop | undefined;
+
+/**
+ * A pre-model-call gate. Return {@link AgentPreModelCallStop} to refuse the
+ * request, or nothing to proceed; the signal aborts with the run.
+ */
+export type AgentBeforeModelCall = (
+	context: Context,
+	signal?: AbortSignal,
+) => AgentPreModelCallResult | void | Promise<AgentPreModelCallResult | void>;
+
 /**
  * A soft tool requirement: the host wants `toolName` called before the loop
  * runs other tools or yields, but WITHOUT paying the forced-`toolChoice` cost
@@ -68,6 +88,13 @@ export interface SoftToolRequirement {
 	id: string;
 	/** Tool that must be called before the loop runs other tools or yields. */
 	toolName: string;
+	/**
+	 * Per-call compliance check: a turn satisfies the requirement only when every
+	 * tool call passes. Defaults to `name === toolName`. Lets a host demand a
+	 * specific invocation shape (e.g. `write` targeting a virtual device path)
+	 * instead of any call to `toolName`. Escalation still forces `toolName`.
+	 */
+	satisfies?(toolCall: { name: string; arguments?: Record<string, unknown> }): boolean;
 	/** Host-owned reminder messages, injected once per `id` activation. */
 	reminder: AgentMessage[];
 }
@@ -78,9 +105,27 @@ export interface SoftToolRequirement {
  */
 export type ToolChoiceDirective = ToolChoice | SoftToolRequirement;
 
+/** Mutable soft-requirement lifecycle retained across stopped agent runs. */
+export interface SoftToolRequirementState {
+	id?: string;
+	forcedToolChoice?: ToolChoice;
+	escalations: number;
+}
+
 /** True when a {@link ToolChoiceDirective} is a soft requirement, not a hard choice. */
 export function isSoftToolRequirement(directive: ToolChoiceDirective | undefined): directive is SoftToolRequirement {
 	return typeof directive === "object" && directive !== null && (directive as SoftToolRequirement).soft === true;
+}
+
+/** Source category for a queued steering interrupt observed without consuming the queue. */
+export type SteeringInterruptSource = "user" | "system" | "unknown";
+
+/** Non-consuming summary of whether queued steering should interrupt a tool batch. */
+export interface SteeringQueueState {
+	/** True when at least one steering message is queued. */
+	queued: boolean;
+	/** Best-effort origin used only to word synthetic skipped-tool results. */
+	source?: SteeringInterruptSource;
 }
 
 /**
@@ -194,10 +239,31 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * restore queued messages while in-flight tools settle, and an external
 	 * abort in that window leaves the queue intact for a post-abort continue.
 	 *
+	 * Returning `true` is treated as user-originated steering for compatibility.
+	 * Return a {@link SteeringQueueState} when the queue can distinguish system
+	 * advisories from real user messages.
+	 *
 	 * When omitted, steering never interrupts a running tool batch; queued
 	 * messages are still delivered at the next injection boundary.
 	 */
-	hasSteeringMessages?: () => boolean | Promise<boolean>;
+	hasSteeringMessages?: () => boolean | SteeringQueueState | Promise<boolean | SteeringQueueState>;
+
+	/**
+	 * Wakes the in-flight tool interrupt watcher when a steering message is queued.
+	 * The callback must not consume the queue; the loop still calls
+	 * {@link hasSteeringMessages} before aborting and injects through
+	 * {@link getSteeringMessages}.
+	 */
+	waitForSteeringMessages?: (signal?: AbortSignal) => Promise<void>;
+
+	/**
+	 * Peeks whether IRC messages should interrupt an interruptible waiting tool.
+	 *
+	 * Uses the same delivery rules as steering: the poll is non-consuming, only
+	 * runs for interruptible tools, and is ignored when interruptMode is "wait".
+	 * The host owns message injection at the next boundary.
+	 */
+	hasIrcInterrupts?: () => boolean | Promise<boolean>;
 
 	/**
 	 * Returns follow-up messages to process after the agent would otherwise stop.
@@ -235,14 +301,35 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Refreshes prompt/tool context from live session state before each model call.
 	 * Use this when tool availability or the system prompt can change mid-turn.
+	 *
+	 * Runs after pending messages are folded in and before provider conversion.
+	 * Mutate the agent context here; use `beforeModelCall` to inspect the
+	 * provider-bound context.
 	 */
 	syncContextBeforeModelCall?: (context: AgentContext) => void | Promise<void>;
+
+	/**
+	 * Asked after the complete provider context has been built, including
+	 * message conversion, provider transforms, normalized tools, and owned
+	 * dialect prompt injection. Returning {@link AgentPreModelCallStop} ends
+	 * the stream without emitting `turn_start`, so no turn is left open and no
+	 * request is billed. Return nothing to proceed. The signal aborts when
+	 * the run is canceled or its deadline expires.
+	 */
+	beforeModelCall?: AgentBeforeModelCall;
 
 	/**
 	 * Optional transform applied to tool call arguments before execution.
 	 * Use for deobfuscating secrets or rewriting arguments.
 	 */
 	transformToolCallArguments?: (args: Record<string, unknown>, toolName: string) => Record<string, unknown>;
+	/**
+	 * Resolve a tool call whose name matched no advertised tool (including
+	 * `customWireName` aliases). Lets hosts route calls to tools they expose
+	 * through side transports (e.g. `xd://` device mounts) instead of failing
+	 * with "Tool not found". Returning `undefined` keeps the failure.
+	 */
+	resolveFallbackTool?: (name: string) => AgentTool<any> | undefined;
 
 	/**
 	 * Enable intent tracing for tool calls.
@@ -309,12 +396,33 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	getToolChoice?: () => ToolChoiceDirective | undefined;
 
 	/**
+	 * Soft-requirement lifecycle retained by the host when a pre-model-call
+	 * gate stops a run before its pending reminder or escalation is served.
+	 */
+	softToolRequirementState?: SoftToolRequirementState;
+
+	/**
+	 * Notifies the host that the pre-model-call gate stopped the run after a
+	 * hard tool choice was obtained from {@link getToolChoice} but before it
+	 * was served, so the host can retain it for the next admitted request.
+	 */
+	onToolChoiceRejected?: () => void;
+
+	/**
 	 * Dynamic reasoning effort override, resolved per LLM call.
 	 * When set and returns a value, overrides the static `reasoning` captured
 	 * at run-loop start. Use this so mid-run thinking-level changes apply on
 	 * the next model call instead of waiting for the next prompt.
 	 */
 	getReasoning?: () => Effort | undefined;
+	/**
+	 * Dynamic model override, resolved once per LLM call. When set, each
+	 * provider call re-reads the model (like {@link getReasoning}) so mid-run
+	 * model switches — context promotion, retry fallback — apply on the next
+	 * call instead of the run finishing on the stale model captured at
+	 * run-loop start. Falls back to the static {@link model} when unset.
+	 */
+	getModel?: () => Model;
 
 	/**
 	 * Dynamic reasoning-disable override, resolved per LLM call. When set,
@@ -419,6 +527,17 @@ export interface ToolCallContext {
 	index: number;
 	total: number;
 	toolCalls: Array<{ id: string; name: string }>;
+	/** Provider-native metadata for the current call, when present. */
+	providerMetadata?: ToolCallProviderMetadata;
+	/**
+	 * Cooperative steering signal: aborted when a queued user/steering message
+	 * (or an interrupting peer IRC) is detected while this tool batch runs.
+	 * Unlike the hard abort signal it NEVER kills the tool — long-running
+	 * tools MAY observe it (via `ctx.toolCall.steeringSignal`) to finish early
+	 * or background themselves so the message injects promptly; ignoring it is
+	 * always safe (the message injects at the next batch boundary).
+	 */
+	steeringSignal?: AbortSignal;
 }
 
 /** A single tool-call content block emitted by an assistant message. */
@@ -449,6 +568,8 @@ export interface AfterToolCallResult {
 	content?: (TextContent | ImageContent)[];
 	/** If provided, replaces the tool result details payload in full. */
 	details?: unknown;
+	/** If provided, replaces the provider-native result metadata in full. */
+	providerMetadata?: ToolResultProviderMetadata;
 	/** If provided, replaces the error flag carried with the tool result. */
 	isError?: boolean;
 	/** If provided, replaces the contextually-useless flag carried with the tool result. */
@@ -535,6 +656,8 @@ export interface AgentToolResult<T = any, _TInput = unknown> {
 	// Marks a non-throwing failure (e.g. an aggregator catching per-entry errors).
 	// agent-loop honors this and surfaces it as a tool error on the wire.
 	isError?: boolean;
+	/** Provider-native metadata that must survive into history replay unchanged. */
+	providerMetadata?: ToolResultProviderMetadata;
 	/** Marks the result as contextually useless: safe for compaction to elide once consumed (e.g. zero matches, wait timeout). Ignored when isError is set. */
 	useless?: boolean;
 }
@@ -556,15 +679,29 @@ export interface RenderResultOptions {
 export type ToolTier = "read" | "write" | "exec";
 
 /**
+ * How an enabled tool is presented to the model. `"essential"` tools are exposed
+ * as normal top-level tools. `"discoverable"` tools are removed from the top-level
+ * schema and either mounted under `xd://` device URLs (when that transport is
+ * active) or surfaced through BM25 tool search — keeping their schemas off every
+ * request. Selection (settings, `hidden`, `defaultInactive`, explicit `--tools`,
+ * provider availability) decides whether a tool is enabled; `loadMode` only
+ * decides how an enabled tool is presented.
+ */
+export type ToolLoadMode = "essential" | "discoverable";
+
+/**
  * Per-tool approval declaration.
  * - bare tier ("read" / "write" / "exec") — static classification.
  * - object form — adds a `reason` (shown in the prompt) and/or `override: true`
  *   (force-prompt even in modes that would otherwise auto-approve this tier).
+ *   `policy: "deny"` blocks the call at the approval gate.
  * - function — dynamic, given parsed args. Returns either form above.
  *
  * Omitted approvals are treated as "exec" by callers that enforce approvals.
  */
-export type ToolApprovalDecision = ToolTier | { tier: ToolTier; reason?: string; override?: boolean };
+export type ToolApprovalDecision =
+	| ToolTier
+	| { tier: ToolTier; reason?: string; override?: boolean; policy?: "allow" | "deny" | "prompt" };
 export type ToolApproval = ToolApprovalDecision | ((args: unknown) => ToolApprovalDecision);
 
 /**
@@ -593,8 +730,8 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	hidden?: boolean;
 	/** If true, tool can stage a pending action that requires explicit resolution via the resolve tool. */
 	deferrable?: boolean;
-	/** Built-in tool loading behavior. "essential" loads initially; "discoverable" can be activated by tool search. */
-	loadMode?: "essential" | "discoverable";
+	/** How an enabled tool is presented. See {@link ToolLoadMode}. Omitted is treated as `"essential"` for built-ins; custom-tool adapters normalize omission to `"discoverable"`. */
+	loadMode?: ToolLoadMode;
 	/** Short one-line summary used for tool discovery indexes. */
 	summary?: string;
 	/**
@@ -607,14 +744,16 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	/** If true, argument validation errors are non-fatal: raw args are passed to execute() instead of returning an error to the LLM. */
 	lenientArgValidation?: boolean;
 	/**
-	 * If true, the agent loop may abort this tool mid-execution to deliver a
-	 * queued steering message (instead of waiting for the tool to finish on its
-	 * own). Set only on tools that purely *wait* and observe their abort signal
-	 * cleanly (e.g. the `job` poll), so the abort surfaces the tool's current
+	 * Whether the agent loop may abort this tool mid-execution to deliver a
+	 * queued steering message. A function resolves this per call from the raw,
+	 * pre-validation arguments.
+	 *
+	 * Enable only for calls that purely *wait* and observe their abort signal
+	 * cleanly (e.g. `job` poll), so the abort surfaces the tool's current
 	 * snapshot rather than corrupting a side effect. Honored only when
 	 * `interruptMode` is "immediate".
 	 */
-	interruptible?: boolean;
+	interruptible?: boolean | ((args: Partial<Static<TParameters>>) => boolean);
 	/**
 	 * Controls how the INTENT_FIELD (`i`) is handled for this tool.
 	 * - `"require"` (default): `i` is injected and required in the parameter schema.

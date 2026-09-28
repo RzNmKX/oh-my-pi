@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -38,6 +38,7 @@ describe("ModelRegistry runtime provider registration", () => {
 	});
 
 	afterEach(() => {
+		vi.useRealTimers();
 		clearCustomApis();
 		for (const sourceId of sourceIds) {
 			unregisterOAuthProviders(sourceId);
@@ -89,6 +90,14 @@ describe("ModelRegistry runtime provider registration", () => {
 		expectProviderHeader(registry, providerName, headerName, expectedValue);
 	}
 
+	async function drainMicrotasksUntil(predicate: () => boolean, errorMessage: string): Promise<void> {
+		for (let i = 0; i < 1000; i++) {
+			if (predicate()) return;
+			await Promise.resolve();
+		}
+		throw new Error(errorMessage);
+	}
+
 	async function expectModelTransportAcrossRefresh(
 		registry: ModelRegistry,
 		providerName: string,
@@ -127,6 +136,46 @@ describe("ModelRegistry runtime provider registration", () => {
 
 		const afterAnthropicCount = registry.getAll().filter(model => model.provider === "anthropic").length;
 		expect(afterAnthropicCount).toBe(beforeAnthropicCount);
+	});
+
+	test("registerProvider rebuilds inferred computer capability after OpenAI runtime reroutes", async () => {
+		const modelId = "gpt-5.4";
+		const directModel = registry.find("openai", modelId);
+		expect(directModel?.supportsComputerUse).toBe(true);
+
+		registry.registerProvider("openai", { baseUrl: "https://runtime-proxy.example.com/v1" }, "ext://runtime");
+		expect(registry.find("openai", modelId)?.supportsComputerUse).toBe(false);
+
+		await registry.refresh("offline");
+		expect(registry.find("openai", modelId)?.supportsComputerUse).toBe(false);
+		await registry.refreshProvider("openai", "offline");
+		expect(registry.find("openai", modelId)?.supportsComputerUse).toBe(false);
+
+		registry.clearSourceRegistrations("ext://runtime");
+		expect(registry.find("openai", modelId)?.supportsComputerUse).toBe(true);
+	});
+
+	test("config.models re-registration rebuilds inferred capability after a saved transport override", () => {
+		const providerName = "openai";
+		const modelId = "gpt-5.4";
+		const proxyBaseUrl = "https://runtime-proxy.example.com/v1";
+
+		registry.registerProvider(providerName, { baseUrl: proxyBaseUrl }, "ext://runtime");
+		registry.registerProvider(
+			providerName,
+			{
+				baseUrl: "https://api.openai.com/v1",
+				api: "openai-responses",
+				apiKey: "RUNTIME_KEY",
+				models: [{ ...baseModel, id: modelId }],
+			},
+			"ext://runtime",
+		);
+
+		const model = registry.find(providerName, modelId);
+		expect(model?.baseUrl).toBe(proxyBaseUrl);
+		expect(model?.supportsComputerUse).toBe(false);
+		expect(model?.supportsComputerUseConfig).toBeUndefined();
 	});
 
 	test("registerProvider applies headers-only overrides to existing provider models across refresh", async () => {
@@ -252,6 +301,92 @@ describe("ModelRegistry runtime provider registration", () => {
 		});
 	});
 
+	test("configured discovery suppresses extension fetchDynamicModels for the same provider", async () => {
+		const providerName = "runtime-configured-provider";
+		fs.writeFileSync(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					[providerName]: {
+						baseUrl: "http://127.0.0.1:4893",
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
+		);
+		const configuredFetch: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:4893/v1/models") {
+				return Response.json({
+					data: [{ id: "shared-runtime-model", context_length: 32_768 }],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const configuredRegistry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: configuredFetch });
+		let runtimeFetchCalls = 0;
+		configuredRegistry.registerProvider(
+			providerName,
+			{
+				baseUrl: "https://runtime.example.com/v1",
+				apiKey: "RUNTIME_KEY",
+				api: "openai-completions",
+				fetchDynamicModels: async () => {
+					runtimeFetchCalls++;
+					return [{ ...baseModel, id: "shared-runtime-model", contextWindow: 999_999 }];
+				},
+			},
+			"ext://runtime",
+		);
+
+		await configuredRegistry.refreshProvider(providerName, "online");
+
+		expect(runtimeFetchCalls).toBe(0);
+		expect(configuredRegistry.find(providerName, "shared-runtime-model")?.contextWindow).toBe(32_768);
+	});
+
+	test("refreshRuntimeProviders times out extension fetchDynamicModels that never resolves", async () => {
+		vi.useFakeTimers();
+		const hangingFetch = Promise.withResolvers<readonly NonNullable<ProviderConfigInput["models"]>[number][]>();
+		registry.registerProvider(
+			"hanging-runtime-provider",
+			{
+				baseUrl: "https://runtime.example.com/v1",
+				apiKey: "RUNTIME_KEY",
+				api: "openai-completions",
+				fetchDynamicModels: () => hangingFetch.promise,
+			},
+			"ext://runtime",
+		);
+
+		const baselineTimers = vi.getTimerCount();
+		let outcome: "resolved" | "rejected" | undefined;
+		const refresh = registry.refreshRuntimeProviders("online").then(
+			() => {
+				outcome = "resolved";
+			},
+			error => {
+				outcome = "rejected";
+				throw error;
+			},
+		);
+
+		await drainMicrotasksUntil(
+			() => vi.getTimerCount() > baselineTimers,
+			"dynamic fetch timeout timer was not armed",
+		);
+		expect(outcome).toBeUndefined();
+		vi.advanceTimersByTime(14_999);
+		await Promise.resolve();
+		expect(outcome).toBeUndefined();
+		vi.advanceTimersByTime(1);
+		await refresh;
+		expect(outcome).toBe("resolved");
+		expect(registry.find("hanging-runtime-provider", "any-model")).toBeUndefined();
+	});
+
 	test("registerProvider preserves explicit thinking and backfills wire facts", () => {
 		const config: ProviderConfigInput = {
 			baseUrl: "https://runtime.example.com/v1",
@@ -276,9 +411,8 @@ describe("ModelRegistry runtime provider registration", () => {
 		expect(model?.thinking).toEqual({
 			mode: "anthropic-adaptive",
 			efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High],
-			// Wire facts are backfilled from identity; non-claude ids get the
-			// 4-tier adaptive map, filtered to the declared efforts (no xhigh).
-			effortMap: { minimal: "low" },
+			// Adaptive ladders are wire-exact (no backfilled effortMap); only
+			// requiresEffort is backfilled from identity.
 			requiresEffort: true,
 		});
 	});

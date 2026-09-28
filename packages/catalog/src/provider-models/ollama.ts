@@ -2,7 +2,8 @@ import { fetchWithRetry } from "@oh-my-pi/pi-utils";
 import { Effort } from "../effort";
 import { isGlm52ReasoningEffortModelId } from "../identity/family";
 import type { ModelManagerOptions } from "../model-manager";
-import type { FetchImpl, ThinkingConfig } from "../types";
+import type { FetchImpl, ModelSpec, ThinkingConfig } from "../types";
+import { discoveryFetch } from "../utils";
 import { createBundledReferenceMap, createReferenceResolver } from "./bundled-references";
 
 export interface OllamaCloudModelManagerConfig {
@@ -24,8 +25,7 @@ type OllamaShowResponse = {
 const OLLAMA_RETRY_DELAYS_MS = [2_000, 5_000, 10_000];
 const OLLAMA_CLOUD_GLM_52_THINKING: ThinkingConfig = {
 	mode: "effort",
-	efforts: [Effort.High, Effort.XHigh],
-	effortMap: { [Effort.XHigh]: "max" },
+	efforts: [Effort.High, Effort.Max],
 };
 
 function trimTrailingSlash(value: string): string {
@@ -75,7 +75,7 @@ async function fetchShowMetadata(
 	baseUrl: string,
 	apiKey: string,
 	model: string,
-	fetchImpl: FetchImpl = fetch,
+	fetchImpl: FetchImpl = discoveryFetch(),
 ): Promise<OllamaShowResponse | undefined> {
 	const response = await fetchImpl(`${baseUrl}/api/show`, {
 		method: "POST",
@@ -96,8 +96,10 @@ export function ollamaCloudModelManagerOptions(
 ): ModelManagerOptions<"ollama-chat"> {
 	const apiKey = config?.apiKey;
 	const baseUrl = normalizeOllamaCloudBaseUrl(config?.baseUrl);
-	const providerReferences = createBundledReferenceMap<"ollama-chat">("ollama-cloud");
-	const resolveReference = createReferenceResolver(providerReferences);
+	let providerReferences: Map<string, ModelSpec<"ollama-chat">> | undefined;
+	const getProviderReferences = () =>
+		(providerReferences ??= createBundledReferenceMap<"ollama-chat">("ollama-cloud"));
+	const resolveReference = createReferenceResolver(getProviderReferences);
 	return {
 		providerId: "ollama-cloud",
 		fetchDynamicModels: async () => {
@@ -107,7 +109,7 @@ export function ollamaCloudModelManagerOptions(
 			const response = await fetchWithRetry(`${baseUrl}/api/tags`, {
 				method: "GET",
 				headers: createCloudHeaders(apiKey),
-				fetch: config?.fetch,
+				fetch: discoveryFetch(config?.fetch),
 				defaultDelayMs: OLLAMA_RETRY_DELAYS_MS,
 			});
 			if (!response.ok) {
@@ -121,8 +123,8 @@ export function ollamaCloudModelManagerOptions(
 					if (!id) {
 						return undefined;
 					}
-					const providerReference = providerReferences.get(id);
 					const reference = resolveReference(id);
+					const providerReference = getProviderReferences().get(id);
 					let metadata: OllamaShowResponse | undefined;
 					try {
 						metadata = await fetchShowMetadata(baseUrl, apiKey, id, config?.fetch);

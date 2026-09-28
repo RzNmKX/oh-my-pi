@@ -13,6 +13,7 @@ import type {
 	AgentToolUpdateCallback,
 	ThinkingLevel,
 	ToolApproval,
+	ToolLoadMode,
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
@@ -24,13 +25,16 @@ import type {
 	Model,
 	ModelSpec,
 	ProviderResponseMetadata,
+	ServiceTier,
+	ServiceTierByFamily,
+	ServiceTierFamily,
 	SimpleStreamOptions,
 	Static,
 	TextContent,
 	TSchema,
 } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
-import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@oh-my-pi/pi-tui";
+import type { AutocompleteItem, AutocompleteProvider, Component, EditorTheme, KeyId, TUI } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
 import type { Type as arktype } from "arktype";
 import type * as zod from "zod/v4";
@@ -41,11 +45,12 @@ import type { PythonResult } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type * as PiCodingAgent from "../../index";
+import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
 import type { CompactMode } from "../../session/compact-modes";
-import type { CustomMessage } from "../../session/messages";
+import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
 import type {
 	BashToolDetails,
@@ -113,6 +118,46 @@ export interface ExtensionUISelectOption {
 
 export type ExtensionUISelectItem = string | ExtensionUISelectOption;
 
+export interface ExtensionAskDialogOption {
+	label: string;
+	description?: string;
+	preview?: string;
+}
+
+export interface ExtensionAskDialogQuestion {
+	id: string;
+	question: string;
+	header?: string;
+	options: ExtensionAskDialogOption[];
+	multi?: boolean;
+	recommended?: number;
+}
+
+export interface ExtensionAskDialogResultItem {
+	id: string;
+	question: string;
+	options: string[];
+	multi: boolean;
+	selectedOptions: string[];
+	customInput?: string;
+	note?: string;
+	timedOut?: boolean;
+}
+
+export interface ExtensionAskDialogSubmitResult {
+	kind: "submit";
+	results: ExtensionAskDialogResultItem[];
+}
+
+/** Chat-redirect result: the user chose "Chat about this" instead of
+ *  answering. Distinct from `undefined` (cancel) so AskTool can hand off to
+ *  the chat loop rather than aborting. */
+export interface ExtensionAskDialogChatResult {
+	kind: "chat";
+}
+
+export type ExtensionAskDialogResult = ExtensionAskDialogSubmitResult | ExtensionAskDialogChatResult;
+
 export function getExtensionUISelectOptionLabel(option: ExtensionUISelectItem): string {
 	return typeof option === "string" ? option : option.label;
 }
@@ -125,6 +170,10 @@ export interface ExtensionUIDialogOptions {
 	timeout?: number;
 	/** Invoked when the UI times out while waiting for a selection/input */
 	onTimeout?: () => void;
+	/** Invoked when the UI-managed timeout countdown starts */
+	onTimeoutStart?: () => void;
+	/** Invoked when user input resets a UI-managed timeout countdown */
+	onTimeoutReset?: () => void;
 	/** Initial cursor position for select dialogs (0-indexed) */
 	initialIndex?: number;
 	/** Render an outlined list for select dialogs */
@@ -163,6 +212,9 @@ export type ExtensionUiComponent = Component & { dispose?(): void };
 export type ExtensionUiComponentFactory = (tui: TUI, theme: Theme) => ExtensionUiComponent;
 export type ExtensionWidgetContent = string[] | ExtensionUiComponentFactory | undefined;
 
+/** Wrap the current autocomplete provider with additional behavior (pi-compatible). */
+export type AutocompleteProviderFactory = (current: AutocompleteProvider) => AutocompleteProvider;
+
 /**
  * UI context for extensions to request interactive UI.
  * Each mode (interactive, RPC, print) provides its own implementation.
@@ -173,6 +225,8 @@ export type ExtensionWidgetContent = string[] | ExtensionUiComponentFactory | un
 // and may be invoked from event handlers that have already taken the agent
 // loop's lock — hooks intentionally cannot.
 export interface ExtensionUIContext {
+	/** True when selector timeouts start only after the dialog is presented. */
+	timeoutStartsOnPresentation?: boolean;
 	/** Show a selector and return the selected label, even when an option also includes a description. */
 	select(
 		title: string,
@@ -185,6 +239,12 @@ export interface ExtensionUIContext {
 
 	/** Show a text input dialog. */
 	input(title: string, placeholder?: string, dialogOptions?: ExtensionUIDialogOptions): Promise<string | undefined>;
+
+	/** Show the rich ask dialog when the interactive TUI surface is available. */
+	askDialog?(
+		questions: ExtensionAskDialogQuestion[],
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<ExtensionAskDialogResult | undefined>;
 
 	/** Show a notification to the user. */
 	notify(message: string, type?: "info" | "warning" | "error"): void;
@@ -244,6 +304,14 @@ export interface ExtensionUIContext {
 	): Promise<string | undefined>;
 
 	/**
+	 * Stack additional autocomplete behavior on top of the built-in provider
+	 * (pi-compatible). Interactive mode rebuilds the editor's provider through
+	 * every registered factory, in registration order; headless modes (print,
+	 * RPC, ACP, subagents) accept and ignore the factory.
+	 */
+	addAutocompleteProvider(factory: AutocompleteProviderFactory): void;
+
+	/**
 	 * Set a custom editor component via factory function, or `undefined` to restore the default editor.
 	 *
 	 * The factory must return a {@link CustomEditor} subclass. Plain `EditorComponent`/`Editor`
@@ -294,6 +362,18 @@ export interface CompactOptions {
 	 * subcommands: `soft` | `remote` | `snapcompact`). Omitted = configured behavior.
 	 */
 	mode?: CompactMode;
+	/**
+	 * Internal summarizer guidance — piped only to native summarization, never
+	 * exposed as `customInstructions` on the `session_before_compact` extension
+	 * hook. Used by plan-mode "Approve and compact context" so extensions that
+	 * treat `customInstructions` as user focus don't mistake plan-mode
+	 * boilerplate for the operator's intent (issue #4359).
+	 *
+	 * When both `customInstructions` and `internalGuidance` are set, the
+	 * summarizer uses `internalGuidance`; the hook still sees only the public
+	 * `customInstructions`.
+	 */
+	internalGuidance?: string;
 }
 
 /**
@@ -316,7 +396,7 @@ export interface ExtensionModelQuery {
 	/** The current session model, if one is set. */
 	current(): Model | undefined;
 	/**
-	 * Resolve a model string (`provider/id`, bare id) or role alias (`pi/slow`, a
+	 * Resolve a model string (`provider/id`, bare id) or role alias (`@slow`, a
 	 * configured role) to a Model, using the same settings-backed aliases and match
 	 * preferences as core selection. Thinking/routing suffixes are accepted and resolved
 	 * to the base model (pass effort separately). Returns undefined when nothing matches.
@@ -345,6 +425,8 @@ export interface ExtensionContext {
 	sessionManager: ReadonlySessionManager;
 	/** Model registry for API key resolution */
 	modelRegistry: ModelRegistry;
+	/** Calling session's `local://` root mapping for external tool bridges. */
+	localProtocolOptions?: LocalProtocolOptions;
 	/** Current model (may be undefined) */
 	model: Model | undefined;
 	/** Read-only model query facade: list / current / resolve / family. */
@@ -361,6 +443,24 @@ export interface ExtensionContext {
 	getSystemPrompt(): string[];
 	/** Structured memory runtime for status/search/save across the configured backend. */
 	memory?: MemoryRuntimeContext;
+	/**
+	 * Schedule a repeating callback whose throws are contained. Unlike raw
+	 * `setInterval`, a synchronous throw or rejected promise from `callback` is
+	 * logged and surfaced through the extension error channel instead of
+	 * escaping as a process-fatal `uncaughtException` — one misbehaving timer
+	 * can no longer take down the whole session. The handle is `unref`'d and
+	 * cleared automatically on `session_shutdown`. Prefer this over raw
+	 * `setInterval` for any extension background work.
+	 */
+	setInterval(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): Timer;
+	/**
+	 * Schedule a one-shot callback whose throws are contained, mirroring
+	 * {@link setInterval}. Cleared automatically on `session_shutdown` if it has
+	 * not yet fired.
+	 */
+	setTimeout(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): Timer;
+	/** Clear a timer scheduled via {@link setInterval} or {@link setTimeout}. */
+	clearTimer(timer: Timer): void;
 }
 
 /**
@@ -439,11 +539,16 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	/** If true, tool is registered but not auto-included in the initial active set.
 	 *  The registering extension is responsible for activating/deactivating it via setActiveTools(). */
 	defaultInactive?: boolean;
+	/** How this tool is presented when enabled. See {@link ToolLoadMode}. Extension tools default to `"discoverable"`; set `"essential"` to stay top-level. */
+	loadMode?: ToolLoadMode;
 	/** If true, tool may stage deferred changes that require explicit resolve/discard. */
 	deferrable?: boolean;
 	/** Tool approval tier. Defaults to `"exec"` when omitted.
 	 *  `"read"`: read-only operations. `"write"`: mutations. `"exec"`: code execution. */
 	approval?: ToolApproval;
+	/** Structured-output strict grammar opt-in/out. `false` is meaningful: OpenAI-family
+	 *  serializers preserve an explicit `strict: false` on the wire (#4336/#4340). */
+	strict?: boolean;
 	/** MCP server name for discovery/search metadata when this tool fronts an MCP server. */
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
@@ -881,7 +986,7 @@ export interface UserPythonEventResult {
 export type { ToolResultEventResult } from "../shared-events";
 
 export interface BeforeAgentStartEventResult {
-	message?: Pick<CustomMessage, "customType" | "content" | "display" | "details" | "attribution">;
+	message?: CustomMessagePayload;
 	/** Replace the system prompt for this turn. If multiple extensions return this, they are chained. */
 	systemPrompt?: string[];
 }
@@ -939,8 +1044,14 @@ export interface RegisteredCommand {
 // ============================================================================
 
 /** Handler function type for events */
-// biome-ignore lint/suspicious/noConfusingVoidType: void allows bare return statements
 export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContext) => Promise<R | void> | R | void;
+
+/** Service tiers accepted by each provider family. */
+export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family extends "anthropic"
+	? "priority"
+	: Family extends "google"
+		? "flex" | "priority"
+		: ServiceTier;
 
 /**
  * ExtensionAPI passed to extension factory functions.
@@ -1091,11 +1202,11 @@ export interface ExtensionAPI {
 	 * an internal continuation that consumes the message on the next turn.
 	 */
 	sendMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
+		message: CustomMessagePayload<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): void;
 
-	/** Send a user message to the agent, or queue it when deliverAs is set. */
+	/** Send a user prompt: idle starts a turn; streaming queues as steer unless deliverAs is set. */
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
 		options?: { deliverAs?: "steer" | "followUp" },
@@ -1127,6 +1238,18 @@ export interface ExtensionAPI {
 
 	/** Set thinking level for the current session. */
 	setThinkingLevel(level: ThinkingLevel): void;
+
+	/** Get a snapshot of the current session's per-family service tiers. */
+	getServiceTiers(): Readonly<ServiceTierByFamily>;
+
+	/**
+	 * Set one provider family's service tier for subsequent requests, or clear
+	 * its session override with `undefined`.
+	 */
+	setServiceTier<Family extends ServiceTierFamily>(
+		family: Family,
+		tier: ExtensionServiceTier<Family> | undefined,
+	): void;
 
 	/** Get the current session name. */
 	getSessionName(): string | undefined;
@@ -1277,7 +1400,7 @@ export interface ExtensionShortcut {
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
 export type SendMessageHandler = <T = unknown>(
-	message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
+	message: CustomMessagePayload<T>,
 	/**
 	 * `deliverAs: "nextTurn"` queues hidden custom context for the next turn.
 	 * When paired with `triggerTurn: true` during prompt teardown, the session schedules
@@ -1307,6 +1430,10 @@ export type GetThinkingLevelHandler = () => ThinkingLevel | undefined;
 
 export type SetThinkingLevelHandler = (level: ThinkingLevel, persist?: boolean) => void;
 
+export type GetServiceTiersHandler = () => ServiceTierByFamily;
+
+export type SetServiceTierHandler = (family: ServiceTierFamily, tier: ServiceTier | undefined) => void;
+
 /** Shared state created by loader, used during registration and runtime. */
 export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
@@ -1327,6 +1454,8 @@ export interface ExtensionActions {
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
 	setThinkingLevel: SetThinkingLevelHandler;
+	getServiceTiers?: GetServiceTiersHandler;
+	setServiceTier?: SetServiceTierHandler;
 	getSessionName: () => string | undefined;
 	setSessionName: (name: string) => Promise<void>;
 }
@@ -1358,8 +1487,11 @@ export interface ExtensionCommandContextActions {
 	reload: () => Promise<void>;
 }
 
-/** Full runtime = state + actions. */
-export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {}
+/** Full runtime = state + actions, including host-compatible service-tier fallbacks. */
+export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {
+	getServiceTiers: GetServiceTiersHandler;
+	setServiceTier: SetServiceTierHandler;
+}
 
 /** Loaded extension with all registered items. */
 export interface Extension {

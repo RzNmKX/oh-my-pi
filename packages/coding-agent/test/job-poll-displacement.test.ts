@@ -1,27 +1,28 @@
 /**
- * Repeated `job` polls must not stack "waiting on N jobs" frames in the
- * transcript: a poll whose watched jobs are all still running stays live
- * (displaceable) and the next `job` call replaces it — one persistent poll.
+ * Repeated `hub` waits must not stack "waiting on N jobs" frames in the
+ * transcript: a wait whose watched jobs are all still running stays live
+ * (displaceable) and the next `hub` call replaces it — one persistent wait.
  *
  * Contracts under test:
  *  - ToolExecutionComponent: a waiting-poll result keeps the block
  *    un-finalized and displaceable; a settled/cancelled/error result
  *    finalizes normally; seal() always freezes.
- *  - EventController: a follow-up `job` call removes the tracked waiting
+ *  - EventController: a follow-up `hub` call removes the tracked waiting
  *    poll from the transcript; any other tool seals it in place.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
+import { TranscriptContainer } from "@oh-my-pi/pi-coding-agent/modes/components/transcript-container";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import type { SessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
-import { type Component, Container, type TUI } from "@oh-my-pi/pi-tui";
+import type { Component, TUI } from "@oh-my-pi/pi-tui";
 
-const uiStub = { requestRender() {} } as unknown as TUI;
+const uiStub = { requestRender() {}, requestComponentRender() {} } as unknown as TUI;
 
 type JobStatus = "running" | "completed" | "failed" | "cancelled";
 
@@ -30,6 +31,7 @@ function pollResult(statuses: JobStatus[], extra: { cancelled?: boolean; isError
 		content: [{ type: "text" as const, text: "" }],
 		isError: extra.isError,
 		details: {
+			op: "wait" as const,
 			jobs: statuses.map((status, i) => ({
 				id: `j${i}`,
 				type: "task" as const,
@@ -65,7 +67,7 @@ function trackComponent(components: ToolExecutionComponent[], component: ToolExe
 	return component;
 }
 
-describe("job waiting-poll block lifecycle", () => {
+describe("hub waiting-poll block lifecycle", () => {
 	const created: ToolExecutionComponent[] = [];
 
 	beforeEach(async () => {
@@ -83,7 +85,10 @@ describe("job waiting-poll block lifecycle", () => {
 	});
 
 	function makeJobComponent() {
-		return trackComponent(created, new ToolExecutionComponent("job", { poll: ["j0", "j1"] }, {}, undefined, uiStub));
+		return trackComponent(
+			created,
+			new ToolExecutionComponent("hub", { op: "wait", ids: ["j0", "j1"] }, {}, undefined, uiStub),
+		);
 	}
 
 	it("keeps an all-running poll live and displaceable until sealed", () => {
@@ -158,7 +163,8 @@ describe("EventController displaces consecutive waiting polls", () => {
 	});
 
 	function createFixture() {
-		const children: Component[] = [];
+		const chatContainer = new TranscriptContainer();
+		const children = chatContainer.children;
 		const pendingTools = new Map();
 		const ctx = {
 			isInitialized: true,
@@ -168,16 +174,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 			updateEditorTopBorder: vi.fn(),
 			toolOutputExpanded: false,
 			pendingTools,
-			chatContainer: {
-				children,
-				addChild: (component: Component) => {
-					children.push(component);
-				},
-				removeChild: (component: Component) => {
-					const index = children.indexOf(component);
-					if (index !== -1) children.splice(index, 1);
-				},
-			},
+			chatContainer,
 			session: { getToolByName: () => undefined },
 			showWarning: vi.fn(),
 			viewSession: { getToolByName: () => undefined },
@@ -191,15 +188,15 @@ describe("EventController displaces consecutive waiting polls", () => {
 		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId,
-			toolName: "job",
-			args: { poll: ["j0"] },
+			toolName: "hub",
+			args: { op: "wait", ids: ["j0"] },
 		});
 		const component = children[children.length - 1] as ToolExecutionComponent;
 		trackComponent(created, component);
 		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId,
-			toolName: "job",
+			toolName: "hub",
 			result: pollResult(["running", "running"]),
 			isError: false,
 		});
@@ -225,7 +222,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		return component;
 	}
 
-	it("removes the previous waiting poll when the next job call starts", async () => {
+	it("removes the previous waiting poll when the next hub call starts", async () => {
 		const { controller, children } = createFixture();
 
 		const first = await runPoll(controller, children, "t1");
@@ -380,14 +377,14 @@ describe("EventController displaces consecutive waiting polls", () => {
 		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: "t1",
-			toolName: "job",
-			args: { poll: ["j0"] },
+			toolName: "hub",
+			args: { op: "wait", ids: ["j0"] },
 		});
 		const settled = trackComponent(created, children[children.length - 1] as ToolExecutionComponent);
 		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: "t1",
-			toolName: "job",
+			toolName: "hub",
 			result: pollResult(["completed", "running"]),
 			isError: false,
 		});
@@ -412,10 +409,11 @@ describe("UiHelpers.renderSessionContext collapses repeated todo snapshots", () 
 	});
 
 	it("removes the earlier todo snapshot when an assistant message replays two todo calls", () => {
-		const chatContainer = new Container();
+		const chatContainer = new TranscriptContainer();
 		let helpers!: UiHelpers;
 		const ctx = {
 			chatContainer,
+			transcriptMessageComponents: new WeakMap(),
 			pendingTools: new Map(),
 			ui: { requestRender: vi.fn() },
 			statusLine: { invalidate: vi.fn() },
@@ -487,11 +485,12 @@ describe("UiHelpers.renderSessionContext collapses repeated todo snapshots", () 
 	});
 
 	it("hands the trailing todo snapshot to the controller during mid-turn rebuild", () => {
-		const chatContainer = new Container();
+		const chatContainer = new TranscriptContainer();
 		const inheritDisplaceableTodo = vi.fn();
 		let helpers!: UiHelpers;
 		const ctx = {
 			chatContainer,
+			transcriptMessageComponents: new WeakMap(),
 			pendingTools: new Map(),
 			ui: { requestRender: vi.fn() },
 			statusLine: { invalidate: vi.fn() },

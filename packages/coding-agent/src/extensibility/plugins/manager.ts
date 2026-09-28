@@ -11,7 +11,8 @@ import {
 	isEnoent,
 	logger,
 } from "@oh-my-pi/pi-utils";
-import { withExitGuard } from "../utils";
+import { withHostGuard } from "../utils";
+import { refreshBunGitCache } from "./bun-git-cache";
 import { type GitSource, parseGitUrl } from "./git-url";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "./legacy-pi-compat";
 import { resolvePluginManifestEntries } from "./loader";
@@ -211,6 +212,16 @@ export class PluginManager {
 		}
 	}
 
+	async #removeDependencyEntry(pkgJsonPath: string, name: string): Promise<void> {
+		const pkgJson: { dependencies?: Record<string, string>; [key: string]: unknown } =
+			await Bun.file(pkgJsonPath).json();
+		if (!pkgJson.dependencies || !(name in pkgJson.dependencies)) {
+			return;
+		}
+		delete pkgJson.dependencies[name];
+		await Bun.write(pkgJsonPath, JSON.stringify(pkgJson, null, 2));
+	}
+
 	#collectInstalledNames(deps: Record<string, string>, config: PluginRuntimeConfig): Set<string> {
 		const installedNames = new Set<string>();
 		for (const name of Object.keys(deps)) {
@@ -364,7 +375,7 @@ export class PluginManager {
 			installLegacyPiSpecifierShim();
 			for (const extensionPath of loadable) {
 				try {
-					const module = await withExitGuard(() => loadLegacyPiModule(extensionPath));
+					const module = await withHostGuard(() => loadLegacyPiModule(extensionPath));
 					if (!hasExtensionFactoryExport(module)) {
 						errors.push(`${extensionPath}: extension does not export a valid factory function`);
 					}
@@ -450,6 +461,17 @@ export class PluginManager {
 		// validation throws.
 		let actualName: string | undefined;
 		try {
+			// Bun treats a dependency replacement from `repo#old-ref` to the same
+			// package at `repo`/`repo#new-ref` as a self-edge and bails with
+			// DependencyLoop. Remove only the stale manifest edge; rollback restores
+			// the original package.json and node_modules snapshot on failure.
+			if (gitSource && existingActualName) {
+				const installedSource = parseGitUrl(depsBefore[existingActualName] ?? "");
+				if (installedSource && installedSource.ref !== gitSource.ref) {
+					await this.#removeDependencyEntry(pkgJsonPath, existingActualName);
+				}
+			}
+
 			// Step 1: write the spec into plugins/package.json + node_modules.
 			const installProc = Bun.spawn(["bun", "install", packageInstallSpec], {
 				cwd: getPluginsDir(),
@@ -458,10 +480,17 @@ export class PluginManager {
 				stderr: "pipe",
 				windowsHide: true,
 			});
-			const installExit = await installProc.exited;
+			// Drain stdout+stderr concurrently with proc.exited. Awaiting exited
+			// before reading either pipe risks a >64 KiB OS-pipe-buffer deadlock
+			// once bun install prints enough progress; even where Bun currently
+			// buffers eagerly, doing this leaks unbounded memory.
+			const [installExit, , installStderr] = await Promise.all([
+				installProc.exited,
+				new Response(installProc.stdout).text(),
+				new Response(installProc.stderr).text(),
+			]);
 			if (installExit !== 0) {
-				const stderr = await new Response(installProc.stderr).text();
-				throw new Error(`bun install failed: ${stderr}`);
+				throw new Error(`bun install failed: ${installStderr}`);
 			}
 			// Resolve actual package name. npm specs encode the name (strip version);
 			// git specs do not, so diff plugins/package.json deps to find the new entry.
@@ -493,14 +522,13 @@ export class PluginManager {
 
 			// Step 2: refresh the git lockfile pin when re-installing an existing
 			// git plugin. `bun install <spec>` is a no-op when the spec matches the
-			// lockfile entry — it never re-resolves the remote ref — so re-running
-			// `omp plugin install github:owner/repo` would silently keep the user on
-			// the original resolved commit even after upstream moved (#3063).
-			// `bun update <name>` re-resolves the ref against the remote and
-			// rewrites the pin; SHA-pinned refs stay put because the commit can't
-			// move. First-time installs skip this — the initial `bun install` already
-			// fetched HEAD. Rollback is handled by the outer catch.
+			// lockfile entry, while `bun update <name>` resolves through Bun's bare
+			// clone cache. Fetch the matching cache clone first so a stale cached
+			// ref cannot silently preserve the old pin (#3063, #5401). First-time
+			// installs skip this because the initial `bun install` populated the
+			// cache from the remote. Rollback is handled by the outer catch.
 			if (gitSource && existingActualName) {
+				await refreshBunGitCache(gitSource, getPluginsDir());
 				const updateProc = Bun.spawn(["bun", "update", actualName], {
 					cwd: getPluginsDir(),
 					stdin: "ignore",
@@ -508,10 +536,14 @@ export class PluginManager {
 					stderr: "pipe",
 					windowsHide: true,
 				});
-				const updateExit = await updateProc.exited;
+				// Same drain-concurrent-with-exit pattern as the bun install above.
+				const [updateExit, , updateStderr] = await Promise.all([
+					updateProc.exited,
+					new Response(updateProc.stdout).text(),
+					new Response(updateProc.stderr).text(),
+				]);
 				if (updateExit !== 0) {
-					const stderr = await new Response(updateProc.stderr).text();
-					throw new Error(`bun update ${actualName} failed: ${stderr}`);
+					throw new Error(`bun update ${actualName} failed: ${updateStderr}`);
 				}
 			}
 
@@ -608,7 +640,13 @@ export class PluginManager {
 			windowsHide: true,
 		});
 
-		const exitCode = await proc.exited;
+		// Drain both pipes concurrently with proc.exited to avoid a pipe-buffer
+		// deadlock if bun uninstall floods stdout/stderr.
+		const [exitCode] = await Promise.all([
+			proc.exited,
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+		]);
 		if (exitCode !== 0) {
 			throw new Error(`npm uninstall failed for ${name}`);
 		}
@@ -1007,7 +1045,14 @@ export class PluginManager {
 				stderr: "pipe",
 				windowsHide: true,
 			});
-			return (await proc.exited) === 0;
+			// Drain pipes concurrently with proc.exited; otherwise a chatty
+			// bun install can block on a full OS pipe buffer.
+			const [exit] = await Promise.all([
+				proc.exited,
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+			]);
+			return exit === 0;
 		} catch {
 			return false;
 		}

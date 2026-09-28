@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import * as ai from "@oh-my-pi/pi-ai";
 import { Effort, type Model } from "@oh-my-pi/pi-ai";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
 	classifyDifficulty,
@@ -19,6 +21,7 @@ import {
 	parseEffort,
 	parseThinkingLevel,
 	resolveProvisionalAutoLevel,
+	resolveTaskEffortLevel,
 } from "@oh-my-pi/pi-coding-agent/thinking";
 import type { TinyMemoryLocalModelKey } from "@oh-my-pi/pi-coding-agent/tiny/models";
 import { tinyModelClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
@@ -70,7 +73,7 @@ describe("auto thinking classifier helpers", () => {
 	it("parses CLI --thinking selectors while rejecting inherit", () => {
 		expect(parseCliThinkingLevel(ThinkingLevel.Off)).toBe(ThinkingLevel.Off);
 		expect(parseCliThinkingLevel(AUTO_THINKING)).toBe(AUTO_THINKING);
-		expect(parseCliThinkingLevel("max")).toBe(ThinkingLevel.XHigh);
+		expect(parseCliThinkingLevel("max")).toBe(ThinkingLevel.Max);
 		expect(parseCliThinkingLevel(ThinkingLevel.Inherit)).toBeUndefined();
 		expect(parseCliThinkingLevel("bogus")).toBeUndefined();
 	});
@@ -134,12 +137,95 @@ describe("auto thinking classifier helpers", () => {
 		}
 	});
 
+	it("uses shared tiny-message preprocessing before local classification", async () => {
+		let classifierPrompt = "";
+		const fixture = await createLocalClassifierFixture("qwen2.5-1.5b");
+		vi.spyOn(tinyModelClient, "complete").mockImplementation(async (_modelKey, promptText) => {
+			classifierPrompt = promptText;
+			return "moderate";
+		});
+
+		try {
+			await classifyDifficulty(
+				"\u001b[31minvestigate failure\u001b[0m 54783db3f0f17c74cae81976f0e825a909deb71e\n```\nnoisy code\n```",
+				{
+					settings: fixture.settings,
+					registry: fixture.registry,
+					model: fixture.model,
+				},
+			);
+
+			expect(classifierPrompt).toContain("investigate failure 54783db");
+			expect(classifierPrompt).not.toContain("54783db3f0f17c74cae81976f0e825a909deb71e");
+			expect(classifierPrompt).not.toContain("noisy code");
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	it("uses a reasoning-safe online classifier budget when the catalog disables reasoning", async () => {
+		const baseModel = getBundledModel("anthropic", "claude-sonnet-4-6");
+		if (!baseModel) throw new Error("Expected bundled Claude Sonnet 4.6 model");
+		const classifierModel = { ...baseModel, reasoning: false };
+		const settings = {
+			get(path: string) {
+				if (path === "providers.autoThinkingModel") return "online";
+				return undefined;
+			},
+			getModelRole(role: string) {
+				return role === "smol" ? `${classifierModel.provider}/${classifierModel.id}` : undefined;
+			},
+			getStorage() {
+				return undefined;
+			},
+		} as never;
+		const registry = {
+			getAvailable: () => [classifierModel],
+			getApiKey: async () => "test-key",
+			resolver: () => async () => "test-key",
+		} as never;
+		const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "stop",
+			content: [{ type: "text", text: "high" }],
+		} as never);
+
+		const effort = await classifyDifficulty("add validation around the retry path", {
+			settings,
+			registry,
+			model: baseModel,
+		});
+		const options = completeSimpleMock.mock.calls[0]?.[2] as
+			| { disableReasoning?: boolean; maxTokens?: number }
+			| undefined;
+
+		expect(effort).toBe(Effort.High);
+		expect(options).toMatchObject({ disableReasoning: true, maxTokens: 1024 });
+	});
+
 	it("clamps auto effort to model support while never resolving below low", () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-6");
 		if (!model) throw new Error("Expected bundled Claude Sonnet 4.6 model");
 
 		expect(clampAutoThinkingEffort(model, Effort.XHigh)).toBe(Effort.High);
 		expect(clampAutoThinkingEffort(model, Effort.Minimal)).toBe(Effort.Low);
+	});
+
+	it("clamps max down to the ladder ceiling on models without a max tier", () => {
+		const xhighCeilingModel = buildModel({
+			id: "mock-xhigh-ceiling",
+			name: "Mock XHigh Ceiling",
+			api: "openai-completions",
+			provider: "mock",
+			baseUrl: "https://example.com",
+			reasoning: true,
+			thinking: { mode: "effort", efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh] },
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 4096,
+		});
+
+		expect(clampAutoThinkingEffort(xhighCeilingModel, Effort.Max)).toBe(Effort.XHigh);
 	});
 
 	it("returns undefined for reasoning models without controllable efforts (devin-agent shape)", () => {
@@ -162,13 +248,79 @@ describe("auto thinking classifier helpers", () => {
 
 		expect(clampAutoThinkingEffort(devinModel, Effort.Low)).toBeUndefined();
 		expect(clampAutoThinkingEffort(devinModel, Effort.XHigh)).toBeUndefined();
+		expect(clampAutoThinkingEffort(devinModel, Effort.Max)).toBeUndefined();
 		expect(resolveProvisionalAutoLevel(devinModel)).toBeUndefined();
 	});
 
-	it("accepts max as the top configured thinking alias", () => {
-		expect(parseEffort("max")).toBe(Effort.XHigh);
-		expect(parseThinkingLevel("max")).toBeUndefined();
-		expect(parseConfiguredThinkingLevel("max")).toBe(ThinkingLevel.XHigh);
+	it("parses max as a real thinking level", () => {
+		expect(parseEffort("max")).toBe(Effort.Max);
+		expect(parseThinkingLevel("max")).toBe(ThinkingLevel.Max);
+		expect(parseConfiguredThinkingLevel("max")).toBe(ThinkingLevel.Max);
+	});
+
+	it("maps task effort selectors onto each model's supported thinking range", () => {
+		const xhighCeilingModel = buildModel({
+			id: "mock-xhigh-ceiling",
+			name: "Mock XHigh Ceiling",
+			api: "openai-completions",
+			provider: "mock",
+			baseUrl: "https://example.com",
+			reasoning: true,
+			thinking: { mode: "effort", efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh] },
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 4096,
+		});
+
+		// hi = whatever the model tops out at; lo = its floor; med = middle of
+		// the supported range (lower-middle for an even-sized range).
+		expect(resolveTaskEffortLevel(xhighCeilingModel, "hi")).toBe(Effort.XHigh);
+		expect(resolveTaskEffortLevel(xhighCeilingModel, "lo")).toBe(Effort.Low);
+		expect(resolveTaskEffortLevel(xhighCeilingModel, "med")).toBe(Effort.Medium);
+
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-6");
+		if (!sonnet) throw new Error("Expected bundled Claude Sonnet 4.6 model");
+		const sonnetEfforts = sonnet.thinking?.efforts ?? [];
+		expect(resolveTaskEffortLevel(sonnet, "hi")).toBe(sonnetEfforts[sonnetEfforts.length - 1]);
+		expect(resolveTaskEffortLevel(sonnet, "lo")).toBe(sonnetEfforts[0]);
+
+		const highOnlyModel = buildModel({
+			id: "mock-high-only",
+			name: "Mock High Only",
+			api: "openai-completions",
+			provider: "mock",
+			baseUrl: "https://example.com",
+			reasoning: true,
+			thinking: { mode: "effort", efforts: [Effort.High] },
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 4096,
+		});
+		expect(() => resolveTaskEffortLevel(highOnlyModel, "hi", Effort.Low)).toThrow(
+			"mock/mock-high-only has no supported thinking effort at or below task.maxEffort=low",
+		);
+
+		// No controllable effort surface (devin-agent shape) → undefined, so the
+		// spawn falls back to its default selector instead of forcing an effort.
+		const devinModel = {
+			id: "glm-5-2",
+			name: "GLM-5.2",
+			api: "devin-agent",
+			provider: "devin",
+			baseUrl: "https://server.codeium.com",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 4096,
+		} as Model;
+		expect(resolveTaskEffortLevel(devinModel, "hi")).toBeUndefined();
+
+		// No model at all → full canonical range.
+		expect(resolveTaskEffortLevel(undefined, "lo")).toBe(Effort.Minimal);
+		expect(resolveTaskEffortLevel(undefined, "hi")).toBe(Effort.Max);
 	});
 
 	it("rejects inherited object keys as thinking selectors", () => {

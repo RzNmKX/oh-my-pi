@@ -13,7 +13,8 @@ import type { Component } from "@oh-my-pi/pi-tui";
 import { getKeybindings, replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { pluralize } from "@oh-my-pi/pi-utils";
 import { formatKeyHints, type KeyId } from "../config/keybindings";
-import { settings } from "../config/settings";
+import { isSettingsInitialized, settings } from "../config/settings";
+import { getDefault } from "../config/settings-schema";
 import type { Theme } from "../modes/theme/theme";
 import { Hasher } from "../tui/utils";
 import { formatDimensionNote, type ResizedImage } from "../utils/image-resize";
@@ -27,8 +28,12 @@ export { replaceTabs, truncateToWidth, wrapTextWithAnsi } from "@oh-my-pi/pi-tui
 
 /** Resolve inline image dimension caps from settings and viewport. */
 export function resolveImageOptions(): { maxWidthCells: number; maxHeightCells?: number } {
-	const maxWidthCells = settings.get("tui.maxInlineImageColumns");
-	const rowSetting = Math.max(0, settings.get("tui.maxInlineImageRows"));
+	const activeSettings = isSettingsInitialized() ? settings : undefined;
+	const maxWidthCells = activeSettings?.get("tui.maxInlineImageColumns") ?? getDefault("tui.maxInlineImageColumns");
+	const rowSetting = Math.max(
+		0,
+		activeSettings?.get("tui.maxInlineImageRows") ?? getDefault("tui.maxInlineImageRows"),
+	);
 	const viewportRows = process.stdout.rows;
 	const viewportFraction = viewportRows ? Math.floor(viewportRows * 0.6) : 0;
 	let maxHeightCells: number | undefined;
@@ -61,6 +66,9 @@ export const PREVIEW_LIMITS = {
 	/** Max diff lines shown when collapsed (edit tool) */
 	DIFF_COLLAPSED_LINES: 40,
 } as const;
+
+/** Default number of terminal output rows shown before expansion. */
+export const DEFAULT_TERMINAL_PREVIEW_LINES = 10;
 
 /** Truncation lengths for different content types */
 export const TRUNCATE_LENGTHS = {
@@ -222,19 +230,21 @@ export function previewWindowRows(): number {
  * (ctrl+o) uncaps it.
  *
  * `prefix` (raw, e.g. a dim tree gutter) is prepended to the marker line so
- * nested previews stay aligned.
+ * nested previews stay aligned. `expandHint: false` drops the "ctrl+o: Expand"
+ * suffix for callers that cap even inside the expanded view (task recent
+ * output), where the hint would point the wrong way.
  */
 export function capPreviewLines(
 	lines: string[],
 	theme: Theme,
-	options: { max?: number; expanded?: boolean; prefix?: string } = {},
+	options: { max?: number; expanded?: boolean; prefix?: string; expandHint?: boolean } = {},
 ): string[] {
 	if (options.expanded) return lines;
 	const max = options.max ?? previewWindowRows();
 	if (lines.length <= max) return lines;
 	const visible = max <= 1 ? [] : lines.slice(lines.length - (max - 1));
 	const hidden = lines.length - visible.length;
-	const hint = formatExpandHint(theme, false, true);
+	const hint = options.expandHint === false ? "" : formatExpandHint(theme, false, true);
 	const marker = `… ${hidden} earlier ${pluralize("line", hidden)}${hint ? ` ${hint}` : ""}`;
 	return [`${options.prefix ?? ""}${theme.fg("dim", marker)}`, ...visible];
 }
@@ -667,7 +677,10 @@ export function truncateDiffByHunk(
 // Path Utilities
 // =============================================================================
 
-export function shortenPath(filePath: string, homeDir?: string): string {
+export function shortenPath(filePath: unknown, homeDir?: string): string {
+	if (typeof filePath !== "string") {
+		return "";
+	}
 	const home = homeDir ?? os.homedir();
 	if (home && filePath.startsWith(home)) {
 		const suffix = filePath.slice(home.length);

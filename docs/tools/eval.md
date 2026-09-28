@@ -179,9 +179,9 @@ Both runtimes expose `completion()` — a single stateless completion against a 
   - JS: `await completion(prompt, { model?, system?, schema? })`
   - Python: `completion(prompt, *, model="default", system=None, schema=None)`
 - `model` selects a tier (default `"default"`):
-  - `"smol"` → `pi/smol` role (fast / cheap)
-  - `"default"` → the session's active model, falling back to the `pi/default` role
-  - `"slow"` → `pi/slow` role; requests high reasoning effort only on reasoning-capable models
+  - `"smol"` → `@smol` role (fast / cheap)
+  - `"default"` → the session's active model, falling back to the `@default` role
+  - `"slow"` → `@slow` role; requests high reasoning effort only on reasoning-capable models
 - `system` (optional) supplies a system prompt.
 - `schema` (optional) is a plain JSON-Schema object. When present, the model is forced to call a single synthetic `respond` tool with that schema (loose, non-strict), and the helper returns the parsed object. When absent, the helper returns the completion string.
 - Errors surface as exceptions: unresolved tier, missing API key, an `error`/`aborted` stop reason, or empty output each raise.
@@ -194,7 +194,7 @@ Both runtimes expose `agent()` — a single subagent invocation routed through `
   - JS: `await agent(prompt, agent?, model?, label?, schema?)` or `await agent(prompt, { agent?, model?, label?, schema?, handle? })`
   - Python: `agent(prompt, *, agent="task", model=None, label=None, schema=None, handle=False)`
 - `agent` defaults to the bundled `task` agent and resolves through normal agent discovery, so project and user agents work.
-- `model` overrides the selected agent's model. Without it, normal per-agent settings and the agent frontmatter model apply.
+- `model` (optional) pins an exact per-call model selector or fallback chain (`string | string[]`) for the subagent, overriding the agent's configured model; omit it to use the agent's default. This route is eval-specific: the `task` tool's own wire schema no longer exposes a per-call `model` (see the 17.1.2 changelog "Removed" note), but the eval `agent()` bridge still accepts and forwards it (`model?` in `agentArgsSchema`, `packages/coding-agent/src/eval/agent-bridge.ts`).
 - Shared background is passed via files: write a `local://` file and reference it in the prompt. `label` controls the `agent://<id>` output label prefix.
 - `schema` passes a JSON Schema to the subagent structured-output path. When present, the helper parses the final JSON text and returns an object.
 - `handle` (default off) returns a DAG node dict — `{ text, output, handle: "agent://<id>", id, agent }`, plus a parsed `data` field when `schema` is set — instead of the bare output, so a downstream stage can reference the transcript by handle.

@@ -46,6 +46,15 @@ export interface HistoryFormatOptions {
 	 * this so it sees what changed without re-reading the file.
 	 */
 	expandEditDiffs?: boolean;
+	/**
+	 * Chunked rendering support: a caller formatting one logical transcript in
+	 * several calls (the advisor's chunked delta render) passes a result index
+	 * built over the WHOLE delta plus one shared consumed-id set, so a toolCall
+	 * finds its toolResult across chunk boundaries and the result is never
+	 * re-rendered as an orphan in a later chunk.
+	 */
+	toolResultIndex?: ReadonlyMap<string, ToolResultMessage>;
+	consumedToolCallIds?: Set<string>;
 }
 
 /** Max length of the primary-arg summary inside `→ tool(...)` lines. */
@@ -76,6 +85,10 @@ function oneLine(text: string, max = PRIMARY_ARG_MAX): string {
 	return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
+export function formatExecutionSourcePreview(source: string): string {
+	return oneLine(source);
+}
+
 /** Join the text blocks of a string-or-blocks content field. Images become `[image]`. */
 function contentToText(content: string | readonly (TextContent | ImageContent)[]): string {
 	if (typeof content === "string") return content;
@@ -101,7 +114,7 @@ function primaryArgValue(value: unknown): string {
 }
 
 /** Pick the most informative scalar argument of a tool call. */
-function primaryArg(name: string, args: Record<string, unknown> | undefined): string {
+export function formatToolCallPrimaryArg(name: string, args: Record<string, unknown> | undefined): string {
 	if (!args || typeof args !== "object") return "";
 	// Advisor note is the most informative summary; preserve severity too.
 	if (name === "advise") {
@@ -113,14 +126,18 @@ function primaryArg(name: string, args: Record<string, unknown> | undefined): st
 	}
 	if (name === "grep") {
 		const pattern = primaryArgValue(args.pattern);
-		const paths = primaryArgValue(args.paths);
+		const paths = primaryArgValue(args.path) || primaryArgValue(args.paths);
 		if (pattern && paths) return oneLine(`${pattern} @ ${paths}`);
 		if (pattern) return oneLine(pattern);
 		if (paths) return oneLine(paths);
 	}
 	if (name === "glob") {
-		const paths = primaryArgValue(args.paths);
+		const paths = primaryArgValue(args.path) || primaryArgValue(args.paths);
 		if (paths) return oneLine(paths);
+	}
+	if (name === "ast_grep") {
+		const pattern = primaryArgValue(args.pat);
+		if (pattern) return oneLine(pattern);
 	}
 	for (const key of PRIMARY_ARG_KEYS) {
 		const value = args[key];
@@ -145,6 +162,15 @@ function primaryArg(name: string, args: Record<string, unknown> | undefined): st
 	}
 }
 
+export function formatToolCallIntentPreview(args: Record<string, unknown> | undefined): string | undefined {
+	const intent = args?.[INTENT_FIELD];
+	return typeof intent === "string" && intent.trim() ? oneLine(intent, 80) : undefined;
+}
+
+export function formatToolResultErrorPreview(content: string | readonly (TextContent | ImageContent)[]): string {
+	return oneLine(contentToText(content).split("\n", 1)[0] ?? "");
+}
+
 /**
  * Wrap a diff body in a backtick fence sized to outlast the longest backtick
  * run inside it, so a diff that touches markdown (triple backticks) can't break
@@ -164,7 +190,7 @@ function toolCallLine(
 	includeToolIntent?: boolean,
 	expandEditDiffs?: boolean,
 ): string {
-	const head = `→ ${name}(${primaryArg(name, args)})`;
+	const head = `→ ${name}(${formatToolCallPrimaryArg(name, args)})`;
 	let base: string;
 	if (!result) {
 		base = `${head} ⇒ pending`;
@@ -173,7 +199,7 @@ function toolCallLine(
 		const lines = lineCount(text);
 		const count = `${lines} ${lines === 1 ? "line" : "lines"}`;
 		if (result.isError) {
-			const firstLine = oneLine(text.split("\n", 1)[0] ?? "");
+			const firstLine = formatToolResultErrorPreview(result.content);
 			base = firstLine ? `${head} ⇒ error · ${count} — ${firstLine}` : `${head} ⇒ error · ${count}`;
 		} else {
 			base = `${head} ⇒ ok · ${count}`;
@@ -187,11 +213,8 @@ function toolCallLine(
 		}
 	}
 
-	const intent = includeToolIntent ? args?.[INTENT_FIELD] : undefined;
-	if (typeof intent === "string" && intent.trim()) {
-		const formattedIntent = oneLine(intent, 80);
-		return `// ${formattedIntent}\n${base}`;
-	}
+	const formattedIntent = includeToolIntent ? formatToolCallIntentPreview(args) : undefined;
+	if (formattedIntent) return `// ${formattedIntent}\n${base}`;
 	return base;
 }
 
@@ -207,7 +230,8 @@ function executionLine(
 			? `error · exit ${msg.exitCode}`
 			: "ok";
 	const lines = lineCount(msg.output);
-	return `→ ${kind}! ${oneLine(source)} ⇒ ${status} · ${lines} ${lines === 1 ? "line" : "lines"}`;
+	const sourcePreview = formatExecutionSourcePreview(source);
+	return `→ ${kind}! ${sourcePreview} ⇒ ${status} · ${lines} ${lines === 1 ? "line" : "lines"}`;
 }
 
 /**
@@ -224,6 +248,11 @@ function executionLine(
  * targets.
  */
 export const PRIMARY_CONTEXT_CUSTOM_TYPES: ReadonlySet<string> = new Set(["plan-mode-context", "plan-mode-reference"]);
+
+/** Hidden non-primary custom messages whose content is needed to understand visible transcript entries. */
+const CONTEXTUAL_NON_PRIMARY_HIDDEN_CUSTOM_TYPES: Record<string, true> = {
+	"image-attachment-description": true,
+};
 
 /** One-liner for custom/hook messages: `[irc] A → B: body…`. */
 function customOneLiner(msg: CustomMessage | HookMessage): string {
@@ -264,13 +293,19 @@ export function formatSessionHistoryMarkdown(messages: unknown[], opts?: History
 	}
 
 	// Index tool results by call id so each toolCall collapses to one line.
-	const resultsByCallId = new Map<string, ToolResultMessage>();
-	for (const msg of typed) {
-		if (msg.role === "toolResult") {
-			resultsByCallId.set(msg.toolCallId, msg);
+	// Chunked callers supply a whole-delta index + shared consumed set so
+	// call/result pairs resolve across chunk boundaries.
+	let resultsByCallId = opts?.toolResultIndex;
+	if (!resultsByCallId) {
+		const local = new Map<string, ToolResultMessage>();
+		for (const msg of typed) {
+			if (msg.role === "toolResult") {
+				local.set(msg.toolCallId, msg);
+			}
 		}
+		resultsByCallId = local;
 	}
-	const consumed = new Set<string>();
+	const consumed = opts?.consumedToolCallIds ?? new Set<string>();
 	// In watched mode, consecutive same-role messages collapse under one label
 	// (the watched agent emits one assistant message per tool call, so otherwise
 	// every call repeats `**agent**:`). Cleared whenever a
@@ -351,6 +386,13 @@ export function formatSessionHistoryMarkdown(messages: unknown[], opts?: History
 			case "custom":
 			case "hookMessage": {
 				const custom = msg as CustomMessage | HookMessage;
+				if (
+					custom.display === false &&
+					!PRIMARY_CONTEXT_CUSTOM_TYPES.has(custom.customType) &&
+					CONTEXTUAL_NON_PRIMARY_HIDDEN_CUSTOM_TYPES[custom.customType] !== true
+				) {
+					break;
+				}
 				if (opts?.expandPrimaryContext && PRIMARY_CONTEXT_CUSTOM_TYPES.has(custom.customType)) {
 					const text = contentToText(custom.content).trim();
 					if (text) {

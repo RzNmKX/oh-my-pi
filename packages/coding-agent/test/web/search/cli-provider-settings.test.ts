@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { setExcludedSearchProviders, setPreferredSearchProvider } from "@oh-my-pi/pi-coding-agent/web/search/provider";
+import {
+	SEARCH_PROVIDER_ORDER,
+	setExcludedSearchProviders,
+	setSearchProviderOrder,
+} from "@oh-my-pi/pi-coding-agent/web/search/provider";
 import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { runSearchCommand } from "../../../src/cli/web-search-cli";
 
@@ -77,7 +81,7 @@ beforeEach(async () => {
 	process.exitCode = undefined;
 
 	resetSettingsForTest();
-	setPreferredSearchProvider("auto");
+	setSearchProviderOrder([]);
 	setExcludedSearchProviders([]);
 	tempAgentDir = TempDir.createSync("@omp-search-cli-");
 	setAgentDir(tempAgentDir.path());
@@ -85,7 +89,7 @@ beforeEach(async () => {
 		inMemory: true,
 		cwd: tempAgentDir.path(),
 		overrides: {
-			"providers.webSearch": "tavily",
+			"providers.webSearchOrder": ["tavily"],
 			"providers.webSearchExclude": ["jina"],
 		},
 	});
@@ -94,7 +98,7 @@ beforeEach(async () => {
 afterEach(async () => {
 	vi.restoreAllMocks();
 	resetSettingsForTest();
-	setPreferredSearchProvider("auto");
+	setSearchProviderOrder([]);
 	setExcludedSearchProviders([]);
 	process.exitCode = originalExitCode;
 	for (const key of WEB_SEARCH_ENV_KEYS) {
@@ -111,7 +115,7 @@ afterEach(async () => {
 });
 
 describe("runSearchCommand provider settings", () => {
-	it("applies configured web-search preference and exclusions before resolving the implicit chain", async () => {
+	it("applies the configured web-search order and exclusions before resolving the implicit chain", async () => {
 		vi.spyOn(globalThis, "fetch").mockImplementation(makeFetchMock());
 
 		let stdout = "";
@@ -127,18 +131,19 @@ describe("runSearchCommand provider settings", () => {
 		expect(plain).not.toContain("Provider: Jina");
 	});
 
-	it("treats explicit --provider auto as a one-shot override of the configured preferred provider", async () => {
-		// Same Tavily preference is configured by `beforeEach`, but no exclusions
-		// hide Jina here, so the auto chain order (Jina before Tavily) decides.
+	it("treats an explicit --provider as a one-shot override of the configured order", async () => {
+		// Tavily heads the configured order, but an explicit `--provider jina`
+		// forces Jina for this invocation without touching the configured chain.
 		const currentTempDir = tempAgentDir;
 		if (!currentTempDir) throw new Error("tempAgentDir missing");
+		const onlyJinaTavily = SEARCH_PROVIDER_ORDER.filter(id => id !== "jina" && id !== "tavily");
 		resetSettingsForTest();
-		setPreferredSearchProvider("auto");
-		setExcludedSearchProviders([]);
+		setSearchProviderOrder([]);
+		setExcludedSearchProviders(onlyJinaTavily);
 		await Settings.init({
 			inMemory: true,
 			cwd: currentTempDir.path(),
-			overrides: { "providers.webSearch": "tavily" },
+			overrides: { "providers.webSearchOrder": ["tavily"], "providers.webSearchExclude": onlyJinaTavily },
 		});
 
 		vi.spyOn(globalThis, "fetch").mockImplementation(makeFetchMock());
@@ -149,7 +154,7 @@ describe("runSearchCommand provider settings", () => {
 			return true;
 		});
 
-		await runSearchCommand({ query: "explicit auto chain", provider: "auto", limit: 1, expanded: false });
+		await runSearchCommand({ query: "explicit provider override", provider: "jina", limit: 1, expanded: false });
 
 		const plain = stripVTControlCharacters(stdout);
 		expect(plain).toContain("Provider: Jina");

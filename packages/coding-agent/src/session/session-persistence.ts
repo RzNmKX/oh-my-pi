@@ -1,3 +1,4 @@
+import { isAnthropicWebSearchHistoryBlock } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
 import {
 	type BlobStore,
 	externalizeImageDataSync,
@@ -59,9 +60,15 @@ function shouldExternalizeImagePayload(
 	return (key === TEXT_CONTENT_KEY && isImageBlock(value)) || key === "images";
 }
 
+/** True for a non-empty string — marks signature/encrypted fields whose block must persist verbatim. */
+function isNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0;
+}
+
 /**
  * Recursively truncate large strings in an object for session persistence.
- * - Truncates any oversized string fields (key-agnostic)
+ * - Truncates oversized string fields (key-agnostic), except signed/encrypted
+ *   blocks and signature keys, which persist verbatim
  * - Externalizes oversized image payloads to blob refs
  * - Updates lineCount when content is truncated
  * - Returns original object if no changes needed (structural sharing)
@@ -73,8 +80,52 @@ function shouldExternalizeImagePayload(
  */
 function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string): unknown {
 	if (obj === null || obj === undefined) return obj;
+	if (
+		typeof obj === "object" &&
+		"type" in obj &&
+		obj.type === "image_generation_call" &&
+		"result" in obj &&
+		typeof obj.result === "string" &&
+		!isBlobRef(obj.result) &&
+		obj.result.length >= BLOB_EXTERNALIZE_THRESHOLD
+	) {
+		return { ...obj, result: externalizeImageDataSync(blobStore, obj.result) };
+	}
 	if (shouldExternalizeImagePayload(obj, key)) {
 		return { ...obj, data: externalizeImageDataSync(blobStore, obj.data, obj.mimeType) };
+	}
+	// Signed content is bound to its exact bytes: a truncated `thinking`/`text`/
+	// `arguments` no longer matches its signature and a truncated
+	// `redacted_thinking` blob is undecryptable, so the provider 400s the replay.
+	// Persist signed blocks verbatim — never truncate, externalize, or descend.
+	// Unsigned blocks (e.g. an interrupted stream) have no such binding and stay
+	// truncatable for size control.
+	// Anthropic validates native web-search history byte-for-byte on replay.
+	// Keep the complete typed block atomic, including nested encrypted_content.
+	if (typeof obj === "object" && "type" in obj && obj.type === "anthropicServerTool" && "block" in obj) {
+		const block = obj.block;
+		if (typeof block === "object" && block !== null && "type" in block && typeof block.type === "string") {
+			const validationView = {
+				type: block.type,
+				...("name" in block ? { name: block.name } : {}),
+				...("id" in block ? { id: block.id } : {}),
+				...("tool_use_id" in block ? { tool_use_id: block.tool_use_id } : {}),
+				...("content" in block ? { content: block.content } : {}),
+			};
+			if (isAnthropicWebSearchHistoryBlock(validationView)) return obj;
+		}
+	}
+	if (typeof obj === "object" && "type" in obj) {
+		const signed =
+			(obj.type === "thinking" && "thinkingSignature" in obj && isNonEmptyString(obj.thinkingSignature)) ||
+			(obj.type === "text" && "textSignature" in obj && isNonEmptyString(obj.textSignature)) ||
+			(obj.type === "toolCall" && "thoughtSignature" in obj && isNonEmptyString(obj.thoughtSignature));
+		const redacted = obj.type === "redactedThinking" && "data" in obj && isNonEmptyString(obj.data);
+		// OpenAI Responses reasoning items (providerPayload.items) carry
+		// `encrypted_content`, server-validated on replay — atomic like signed blocks.
+		const encryptedReasoning =
+			obj.type === "reasoning" && "encrypted_content" in obj && isNonEmptyString(obj.encrypted_content);
+		if (signed || redacted || encryptedReasoning) return obj;
 	}
 
 	if (typeof obj === "string") {
@@ -82,10 +133,12 @@ function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string
 			return externalizeImageDataUrlSync(blobStore, obj);
 		}
 		if (obj.length > MAX_PERSIST_CHARS) {
-			// Cryptographic signatures must be preserved exactly or cleared entirely — never truncated.
-			// Truncation would produce an invalid signature that the API rejects.
+			// Defensive: signature keys normally sit on blocks the guard above returns
+			// verbatim, but if one is reached here (unknown carrier shape), preserve it —
+			// truncation produces an invalid signature the API rejects, and clearing
+			// drops reasoning context the provider needs on replay.
 			if (key === "thinkingSignature" || key === "thoughtSignature" || key === "textSignature") {
-				return "";
+				return obj;
 			}
 			const limit = Math.max(0, MAX_PERSIST_CHARS - TRUNCATION_NOTICE.length);
 			return `${truncateString(obj, limit)}${TRUNCATION_NOTICE}`;

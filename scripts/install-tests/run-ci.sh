@@ -43,7 +43,9 @@ find_tarball() {
 }
 
 section "Binary install smoke"
-bun --cwd=packages/natives run build
+if [ "${OMP_INSTALL_TEST_SKIP_NATIVE_BUILD:-0}" != "1" ]; then
+   bun --cwd=packages/natives run build
+fi
 bun --cwd=packages/coding-agent run build
 
 BINARY_DIR="$WORK_DIR/binary-bin"
@@ -170,7 +172,7 @@ mkdir -p "$TARBALL_APP_DIR"
       exit 1
    }
    wire_proto="$(bun -e 'import { COLLAB_PROTO } from "@oh-my-pi/pi-wire"; process.stdout.write(String(COLLAB_PROTO));')"
-   [ "$wire_proto" = "2" ] || {
+   [ "$wire_proto" = "3" ] || {
       echo "Unexpected @oh-my-pi/pi-wire COLLAB_PROTO: $wire_proto"
       exit 1
    }

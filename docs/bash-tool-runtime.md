@@ -25,11 +25,10 @@ Set `bash.enabled: false` in settings to remove the model-facing `bash` tool fro
 `BashTool.execute()` currently handles input before execution as follows:
 
 - validates optional `env` names against shell-variable syntax,
-- when `bash.stripTrailingHeadTail` is enabled (default), applies conservative native fixups that remove safe trailing `| head` / `| tail` pipes and redundant trailing `2>&1`,
 - extracts a leading single-line `cd <path> && ...` into `cwd` when `cwd` was not supplied,
 - rejects `async: true` when `async.enabled` is false.
 
-There are no structured `head` or `tail` tool parameters in the current schema. Output limiting is handled by `OutputSink` truncation/artifacts, and the optional trailing-pipe fixup exists to avoid hiding output before the harness can capture it.
+There are no structured `head` or `tail` tool parameters in the current schema, and commands run exactly as written — no pre-execution rewrites. Output limiting is handled by `OutputSink` truncation/artifacts.
 
 ## 2) Optional interception (blocked-command path)
 
@@ -105,6 +104,18 @@ Session-level bang-command executions pass `sessionKey: this.sessionId`.
 Tool-call executions pass `sessionKey: this.session.getSessionId?.()`, when available. In both surfaces, a session key isolates shell reuse per session; without one, reuse falls back to shell config/snapshot/env.
 
 Concurrent calls never share one `Shell`: the native session runs one command at a time and `Shell.abort()` kills every in-flight run on it. `executeBash()` tracks in-flight keys in `shellSessionsInUse`; while a key is busy, overlapping calls skip the cache and run through one-shot `executeShell()` (same isolation as quarantined sessions). Only the owning call releases the in-use flag or deletes the cached session in its `finally`.
+
+## Bundled `jq` compatibility
+
+The non-PTY shell registers a bundled `jq` command backed by vendored [jaq](https://github.com/01mf02/jaq), not the system `jq`. jaq errors when chained access indexes through a null or missing intermediate: `.a.b` over `{}` exits 5, whereas jq returns `null`.
+
+Guard the access with `[.a.b?][0]` when the parent may be null or absent. The `?` suppresses jaq's traversal error (jq never raises it), and `[…][0]` maps the suppressed empty output to `null` while preserving a legitimate `false` or `null` value:
+
+```jq
+{"c": [.a.b?][0]}
+```
+
+Avoid the naive `.a.b? // null`: `//` treats a legitimate `false` (and `null`) as absent, so it silently rewrites boolean data to the fallback. It also diverges on parse — `{"c": .a.b? // null}` is accepted by jaq but is a syntax error in jq (the value needs parentheses: `{"c": (.a.b? // null)}`).
 
 ## Shell config and snapshot behavior
 
@@ -275,7 +286,6 @@ This component is wired by `CommandController.handleBashCommand()` and fed from 
 
 - [`src/tools/bash.ts`](../packages/coding-agent/src/tools/bash.ts) — tool entrypoint, input handling/interception, async and PTY/non-PTY selection, result/error mapping, bash tool renderer.
 - [`src/tools/bash-pty-selection.ts`](../packages/coding-agent/src/tools/bash-pty-selection.ts) — `canUseInteractiveBashPty` predicate for choosing the local PTY overlay.
-- [`src/tools/bash-command-fixup.ts`](../packages/coding-agent/src/tools/bash-command-fixup.ts) — native-backed conservative cleanup for trailing `head`/`tail` pipes and redundant `2>&1`.
 - [`src/tools/bash-interceptor.ts`](../packages/coding-agent/src/tools/bash-interceptor.ts) — interceptor rule matching and blocked-command messages.
 - [`src/exec/bash-executor.ts`](../packages/coding-agent/src/exec/bash-executor.ts) — non-PTY executor, shell session reuse, cancellation wiring, output sink integration.
 - [`src/exec/non-interactive-env.ts`](../packages/coding-agent/src/exec/non-interactive-env.ts) — non-interactive child-process env defaults (`buildNonInteractiveEnv`) used by the non-PTY executor.

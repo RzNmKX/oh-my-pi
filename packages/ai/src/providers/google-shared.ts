@@ -14,6 +14,7 @@ import type {
 	FetchImpl,
 	ImageContent,
 	Model,
+	ServiceTier,
 	StopReason,
 	StreamOptions,
 	TextContent,
@@ -21,6 +22,7 @@ import type {
 	Tool,
 	ToolCall,
 } from "../types";
+import { shouldSendServiceTier } from "../types";
 import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import type { RawHttpRequestDump } from "../utils/http-inspector";
@@ -73,6 +75,21 @@ export interface GoogleSharedStreamOptions extends StreamOptions {
 		budgetTokens?: number;
 		level?: GoogleThinkingLevel;
 	};
+	/** Request that Google omit human-readable thought summaries while still allowing internal reasoning. */
+	hideThinkingSummary?: boolean;
+	/** Gemini/Vertex serving tier (`flex`/`priority`); other values are omitted. */
+	serviceTier?: ServiceTier;
+	/**
+	 * Caller-owned Google context-cache resource name for GenerateContent.
+	 * Passed through opaquely as the wire `cachedContent` field on
+	 * `google-generative-ai` and `google-vertex` only. OMP does not create,
+	 * refresh, validate model/project/location compatibility, or delete the
+	 * resource — callers own that lifecycle.
+	 *
+	 * @see https://ai.google.dev/api/generate-content
+	 * @see `@google/genai` `GenerateContentConfig.cachedContent`
+	 */
+	cachedContent?: string;
 }
 
 /**
@@ -126,11 +143,9 @@ function resolveThoughtSignature(isSameProviderAndModel: boolean, signature: str
 	return isSameProviderAndModel && isValidThoughtSignature(signature) ? signature : undefined;
 }
 
-/**
- * Claude models via Google APIs require explicit tool call IDs in function calls/responses.
- */
-export function requiresToolCallId(modelId: string): boolean {
-	return modelId.startsWith("claude-");
+function supportsFunctionPartId<T extends GoogleApiType>(model: Model<T>): boolean {
+	if (model.api === "google-vertex") return false;
+	return model.id.startsWith("claude-") || (model.api === "google-generative-ai" && isGemini3Model(model.id));
 }
 
 function getGeminiMajorVersion(modelId: string): number | undefined {
@@ -156,8 +171,9 @@ function isGemini3Model(modelId: string): boolean {
  */
 export function convertMessages<T extends GoogleApiType>(model: Model<T>, context: Context): Content[] {
 	const contents: Content[] = [];
+	const emittedToolCallNames = new Map<string, string>();
+
 	const normalizeToolCallId = (id: string): string => {
-		if (!requiresToolCallId(model.id)) return id;
 		return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
 	};
 
@@ -243,6 +259,7 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 						});
 					}
 				} else if (block.type === "toolCall") {
+					emittedToolCallNames.set(block.id, block.name);
 					const thoughtSignature = resolveThoughtSignature(isSameProviderAndModel, block.thoughtSignature);
 					const effectiveSignature =
 						thoughtSignature || (isGemini3Model(model.id) ? SKIP_THOUGHT_SIGNATURE : undefined);
@@ -251,11 +268,11 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 						functionCall: {
 							name: block.name,
 							args: block.arguments ?? {},
-							...(requiresToolCallId(model.id) ? { id: block.id } : {}),
+							...(supportsFunctionPartId(model) ? { id: block.id } : {}),
 						},
 					};
 					if (model.provider === "google-vertex" && part?.functionCall?.id) {
-						delete part.functionCall.id; // Vertex AI does not support 'id' in functionCall
+						delete part.functionCall.id; // Vertex AI GenerateContent rejects 'id' in functionCall parts.
 					}
 					if (effectiveSignature) {
 						part.thoughtSignature = effectiveSignature;
@@ -301,10 +318,11 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 				},
 			}));
 
-			const includeId = requiresToolCallId(model.id);
+			const includeId = supportsFunctionPartId(model);
+			const emittedName = emittedToolCallNames.get(msg.toolCallId);
 			const functionResponsePart: Part = {
 				functionResponse: {
-					name: msg.toolName,
+					name: emittedName ?? msg.toolName,
 					response: msg.isError ? { error: responseValue } : { output: responseValue },
 					...(hasImages && modelSupportsMultimodalFunctionResponse && { parts: imageParts }),
 					...(includeId ? { id: msg.toolCallId } : {}),
@@ -312,7 +330,7 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 			};
 
 			if (model.provider === "google-vertex" && functionResponsePart.functionResponse?.id) {
-				delete functionResponsePart.functionResponse.id; // Vertex AI does not support 'id' in functionResponse
+				delete functionResponsePart.functionResponse.id; // Vertex AI GenerateContent rejects 'id' in functionResponse parts.
 			}
 
 			// Cloud Code Assist API requires all function responses to be in a single user turn.
@@ -529,6 +547,24 @@ export function pushToolCallEvents(
  * `text_start` / `thinking_start` event. `onBeforeStartEvent` lets the SSE consumer
  * inject its `ensureStarted()` first-token side effect into the canonical event order.
  */
+export function startTextOrThinkingBlock(
+	isThinking: true,
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	onBeforeStartEvent?: () => void,
+): ThinkingContent;
+export function startTextOrThinkingBlock(
+	isThinking: false,
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	onBeforeStartEvent?: () => void,
+): TextContent;
+export function startTextOrThinkingBlock(
+	isThinking: boolean,
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	onBeforeStartEvent?: () => void,
+): TextContent | ThinkingContent;
 export function startTextOrThinkingBlock(
 	isThinking: boolean,
 	output: AssistantMessage,
@@ -791,6 +827,14 @@ export function buildGoogleGenerateContentParams<T extends "google-generative-ai
 		...(context.tools && context.tools.length > 0 && { tools: convertTools(context.tools, model) }),
 	};
 
+	// Gemini API (google-generative-ai) reads the tier from the request body;
+	// Vertex AI ignores a body field and requires the
+	// `X-Vertex-AI-LLM-Shared-Request-Type` header instead (added in
+	// streamGoogleVertex), so only emit the body field for the direct API.
+	if (model.provider === "google" && shouldSendServiceTier(options.serviceTier, model.provider)) {
+		config.serviceTier = options.serviceTier;
+	}
+
 	if (context.tools && context.tools.length > 0 && options.toolChoice) {
 		const choice = options.toolChoice;
 		if (typeof choice === "string") {
@@ -815,7 +859,7 @@ export function buildGoogleGenerateContentParams<T extends "google-generative-ai
 	}
 
 	if (options.thinking?.enabled && model.reasoning) {
-		const cfg: ThinkingConfig = { includeThoughts: true };
+		const cfg: ThinkingConfig = { includeThoughts: !options.hideThinkingSummary };
 		if (options.thinking.level !== undefined) {
 			// GoogleThinkingLevel mirrors the SDK's `ThinkingLevel` string enum values 1:1.
 			cfg.thinkingLevel = options.thinking.level as ThinkingLevel;
@@ -830,6 +874,25 @@ export function buildGoogleGenerateContentParams<T extends "google-generative-ai
 			throw new AIError.AbortError("Request aborted");
 		}
 		config.abortSignal = options.signal;
+	}
+
+	if (options.cachedContent !== undefined) {
+		// Blank names are never valid resource references; anything else stays
+		// opaque so we do not invent format/model/project checks here.
+		if (options.cachedContent.trim().length === 0) {
+			throw new AIError.ValidationError("cachedContent must not be blank");
+		}
+		const incompatibleFields = [
+			config.systemInstruction !== undefined && "systemInstruction",
+			config.tools !== undefined && "tools",
+			config.toolConfig !== undefined && "toolConfig",
+		].filter((field): field is string => Boolean(field));
+		if (incompatibleFields.length > 0) {
+			throw new AIError.ValidationError(
+				`cachedContent cannot be combined with request-level ${incompatibleFields.join(", ")}`,
+			);
+		}
+		config.cachedContent = options.cachedContent;
 	}
 
 	return {
@@ -852,6 +915,8 @@ export interface GoogleGenAIRequestPlan {
 	url: string;
 	headers: Record<string, string>;
 	fetch?: FetchImpl;
+	/** Optional URL retried once when {@link url} returns 404 (regional Vertex endpoint missing a global-only model). */
+	fallbackUrl?: string;
 }
 
 export function streamGoogleGenAI<T extends "google-generative-ai" | "google-vertex">(args: {
@@ -906,8 +971,8 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 
 			const bodyJson = JSON.stringify(paramsToWireBody(params));
 			const fetchImpl = plan.fetch ?? options?.fetch ?? (globalThis.fetch.bind(globalThis) as FetchImpl);
-			const openStream = async (): Promise<ReadableStream<Uint8Array>> => {
-				const response = await fetchImpl(plan.url, {
+			const openStreamAt = async (requestUrl: string): Promise<ReadableStream<Uint8Array>> => {
+				const response = await fetchImpl(requestUrl, {
 					method: "POST",
 					headers: { ...plan.headers, "Content-Type": "application/json", Accept: "text/event-stream" },
 					body: bodyJson,
@@ -928,6 +993,20 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 					});
 				}
 				return response.body as ReadableStream<Uint8Array>;
+			};
+			// A regional Vertex endpoint 404s for models published only on the
+			// global endpoint; retry global once so a stale/ambient region never
+			// breaks a request that worked before regional routing existed.
+			const openStream = async (): Promise<ReadableStream<Uint8Array>> => {
+				if (!plan.fallbackUrl) return openStreamAt(plan.url);
+				try {
+					return await openStreamAt(plan.url);
+				} catch (error) {
+					if (error instanceof AIError.GoogleApiError && error.status === 404) {
+						return openStreamAt(plan.fallbackUrl);
+					}
+					throw error;
+				}
 			};
 
 			let body = await openStream();
@@ -1007,6 +1086,7 @@ function paramsToWireBody(params: GenerateContentParameters): Record<string, unk
 	if (config.toolConfig !== undefined) body.toolConfig = config.toolConfig;
 	if (config.safetySettings !== undefined) body.safetySettings = config.safetySettings;
 	if (config.cachedContent !== undefined) body.cachedContent = config.cachedContent;
+	if (config.serviceTier !== undefined) body.serviceTier = config.serviceTier;
 
 	const gen: Record<string, unknown> = {};
 	if (config.temperature !== undefined) gen.temperature = config.temperature;

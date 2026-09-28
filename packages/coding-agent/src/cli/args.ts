@@ -4,7 +4,7 @@
 import { APP_NAME, CONFIG_DIR_NAME, logger } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import { CLI_THINKING_LEVELS, type ConfiguredThinkingLevel, parseCliThinkingLevel } from "../thinking";
-import { BUILTIN_TOOL_NAMES, normalizeToolNames } from "../tools/builtin-names";
+import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolNames } from "../tools/builtin-names";
 import {
 	OPTIONAL_FLAGS,
 	OPTIONAL_VALUE_FLAGS,
@@ -13,11 +13,14 @@ import {
 	STRING_SETTERS,
 	STRING_VALUE_FLAGS,
 } from "./flag-tables";
+import { CliUsageError } from "./usage-error";
 
 export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
 
 export interface Args {
 	cwd?: string;
+	/** Workspace directories beyond cwd for this session (repeatable `--add-dir`). */
+	addDir?: string[];
 	profile?: string;
 	alias?: string;
 	allowHome?: boolean;
@@ -27,6 +30,11 @@ export interface Args {
 	smol?: string;
 	slow?: string;
 	plan?: string;
+	prewalk?: boolean;
+	noPrewalk?: boolean;
+	prewalkInto?: string;
+	planYolo?: boolean;
+	planYoloInto?: string;
 	maxTime?: number;
 	apiKey?: string;
 	systemPrompt?: string;
@@ -42,6 +50,7 @@ export interface Args {
 	noSession?: boolean;
 	sessionDir?: string;
 	providerSessionId?: string;
+	providerPromptCacheKey?: string;
 	fork?: string;
 	/** Collab link to join at startup (set by the `join` subcommand; no CLI flag). */
 	join?: string;
@@ -89,7 +98,7 @@ export interface Args {
 const PARSE_DEPS: ParseDeps = {
 	logger,
 	parseThinking: parseCliThinkingLevel,
-	builtinToolNames: BUILTIN_TOOL_NAMES,
+	builtinToolNames: [...BUILTIN_TOOL_NAMES, ...HIDDEN_TOOL_NAMES],
 	normalizeToolNames,
 	thinkingEfforts: CLI_THINKING_LEVELS,
 };
@@ -230,6 +239,12 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.hideThinking = true;
 		} else if (arg === "--advisor") {
 			result.advisor = true;
+		} else if (arg === "--prewalk") {
+			result.prewalk = true;
+		} else if (arg === "--no-prewalk") {
+			result.noPrewalk = true;
+		} else if (arg === "--plan-yolo") {
+			result.planYolo = true;
 		} else if (arg === "--print" || arg === "-p") {
 			result.print = true;
 		} else if (arg === "--print-thoughts") {
@@ -298,6 +313,17 @@ export function reportUnrecognizedFlags(
 	return true;
 }
 
+/** Emit a clean CLI usage error without an internal stack trace. */
+export function reportCliUsageError(
+	error: unknown,
+	write: (text: string) => void = text => process.stderr.write(text),
+): boolean {
+	if (!(error instanceof CliUsageError)) return false;
+	write(`${chalk.red(`Error: ${error.message}`)}\n`);
+	write(`Run \`${APP_NAME} --help\` for available flags.\n`);
+	return true;
+}
+
 export function getExtraHelpText(): string {
 	return `${chalk.bold("Environment Variables:")}
   ${chalk.dim("# Core Providers")}
@@ -330,6 +356,7 @@ export function getExtraHelpText(): string {
   CURSOR_ACCESS_TOKEN        - Cursor AI models
   AI_GATEWAY_API_KEY         - Vercel AI Gateway
   WAFER_SERVERLESS_API_KEY   - Wafer Serverless (pay-as-you-go)
+  PALANTIR_API_KEY           - Palantir Foundry XOS model catalog
 
   ${chalk.dim("# Cloud Providers")}
   AWS_PROFILE                - AWS Bedrock (or AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY)
@@ -370,6 +397,7 @@ ${chalk.bold("Available Tools (default-enabled unless noted):")}
   notebook      - Edit Jupyter notebooks
   inspect_image - Analyze images with a vision model
   browser       - Browser automation (Puppeteer)
+  computer      - Native host desktop capture and input (disabled by default)
   task          - Launch sub-agents for parallel tasks
   todo          - Manage todo/task lists
   web_search    - Search the web

@@ -20,6 +20,13 @@ export interface ContextFile {
 	level: "user" | "project";
 	/** Distance from cwd (0 = in cwd, 1 = parent, etc.) for project files */
 	depth?: number;
+	/**
+	 * Optional dedupe scope. Files that set this compete only with same-scope
+	 * files at the same depth instead of the shared one-file-per-depth slot.
+	 * Used by standalone `CLAUDE.md`, which is a parallel convention to
+	 * `AGENTS.md` rather than a competing source for the same slot.
+	 */
+	scope?: string;
 	/** Source metadata */
 	_source: SourceMeta;
 }
@@ -33,7 +40,14 @@ export const contextFileCapability = defineCapability<ContextFile>({
 	// This supports monorepo hierarchies where AGENTS.md exists at multiple ancestor levels.
 	// Clamp depth >= 0: files inside config subdirectories of an ancestor (e.g. .claude/, .github/)
 	// are same-scope as the ancestor itself.
-	key: file => (file.level === "user" ? "user" : `project:${Math.max(0, file.depth ?? 0)}`),
+	// A file carrying an explicit `scope` gets its own slot per depth, so a standalone
+	// CLAUDE.md sits alongside AGENTS.md instead of shadowing it.
+	key: file =>
+		file.level === "user"
+			? file.scope
+				? `user:${file.scope}`
+				: "user"
+			: `project:${file.scope ? `${file.scope}:` : ""}${Math.max(0, file.depth ?? 0)}`,
 	toExtensionId: file => `context-file:${file.level}:${path.basename(file.path)}`,
 	validate: file => {
 		if (!file.path) return "Missing path";

@@ -1,3 +1,4 @@
+export * from "./amazon-bedrock";
 export * from "./antigravity";
 export * from "./codex";
 export * from "./gemini";

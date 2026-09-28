@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, withTimeout } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import type { Browser, CDPSession } from "puppeteer-core";
 import { ToolAbortError, ToolError } from "../tool-errors";
@@ -16,6 +16,13 @@ export type PuppeteerBrowserKind =
 export type BrowserKind = PuppeteerBrowserKind | CmuxKind;
 
 export type BrowserKindTag = BrowserKind["kind"];
+
+/**
+ * Upper bound on `browser.close()` for headless Chromium. Puppeteer waits for
+ * the process to fully exit; a wedged Chromium would otherwise hang cleanup
+ * forever (issue #5260), so we cap the wait and force-kill on timeout.
+ */
+const HEADLESS_CLOSE_TIMEOUT_MS = 5_000;
 
 interface BrowserHandleCommon {
 	key: string;
@@ -39,6 +46,13 @@ export interface CmuxBrowserHandle extends BrowserHandleCommon {
 }
 
 export type BrowserHandle = PuppeteerBrowserHandle | CmuxBrowserHandle;
+
+/** Controls bounded browser-handle teardown and identifies the owning resource in timeout diagnostics. */
+export interface ReleaseBrowserOptions {
+	kill: boolean;
+	timeoutMs?: number;
+	resource?: string;
+}
 
 const browsers = new Map<string, BrowserHandle>();
 
@@ -71,8 +85,28 @@ export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOpti
 		browsers.delete(key);
 		await disposeBrowserHandle(existing, { kill: false });
 	}
+	// Short-circuit before launching: the tool wrapper's `untilAborted` only
+	// rejects its outer promise on abort; without this check `openBrowserHandle`
+	// would still fire and its result would land in `browsers` below.
+	if (opts.signal?.aborted) throw new ToolAbortError("Browser open aborted");
 
 	const handle = await openBrowserHandle(kind, opts);
+	// The launch may resolve AFTER the caller has already aborted (the outer
+	// `untilAborted` rejects immediately on abort but does not cancel the
+	// inner promise, and `launchHeadlessBrowser` does not accept a signal).
+	// Without this branch the completed handle sits in `browsers` at
+	// refCount:0 forever — no tab ever takes a hold, `releaseBrowser` never
+	// fires, and `releaseAllTabs` walks `tabs`, not `browsers`, so the
+	// orphaned Chromium/app process / puppeteer handle survives to process
+	// exit. (Issue #3963.)
+	if (opts.signal?.aborted) {
+		await disposeBrowserHandle(handle, { kill: kind.kind === "spawned" }).catch(err => {
+			logger.debug("Failed to dispose orphan browser after abort", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
+		throw new ToolAbortError("Browser open aborted");
+	}
 	browsers.set(key, handle);
 	return handle;
 }
@@ -194,7 +228,7 @@ export function holdBrowser(handle: BrowserHandle): void {
 	handle.refCount++;
 }
 
-export async function releaseBrowser(handle: BrowserHandle, opts: { kill: boolean }): Promise<void> {
+export async function releaseBrowser(handle: BrowserHandle, opts: ReleaseBrowserOptions): Promise<void> {
 	handle.refCount = Math.max(0, handle.refCount - 1);
 	if (handle.refCount === 0) {
 		// Only evict if the registry still points at THIS handle. After a disconnect,
@@ -205,17 +239,24 @@ export async function releaseBrowser(handle: BrowserHandle, opts: { kill: boolea
 	}
 }
 
-async function disposeBrowserHandle(handle: BrowserHandle, opts: { kill: boolean }): Promise<void> {
+async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserOptions): Promise<void> {
 	if ("client" in handle) {
 		handle.client.close();
 		return;
 	}
 	if (handle.kind.kind === "headless") {
 		if (handle.browser.connected) {
+			// Puppeteer's `browser.close()` resolves only once the Chromium
+			// process fully exits. A wedged Chromium (a known Windows failure
+			// mode) leaves this await pending forever, freezing `releaseTab` in
+			// the "Closing tab" phase (issue #5260). Bound it, then SIGKILL the
+			// process tree so cleanup always completes.
+			const proc = handle.browser.process();
 			try {
-				await handle.browser.close();
+				await withTimeout(handle.browser.close(), HEADLESS_CLOSE_TIMEOUT_MS, "Timed out closing headless browser");
 			} catch (err) {
-				logger.debug("Failed to close headless browser", { error: (err as Error).message });
+				logger.debug("Failed to close headless browser; force-killing", { error: (err as Error).message });
+				if (proc?.pid !== undefined) await gracefulKillTreeOnce(proc.pid).catch(() => undefined);
 			}
 		}
 		return;
@@ -238,4 +279,9 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: { kill: boolean
 		}
 	}
 	if (opts.kill && handle.pid !== undefined) await gracefulKillTreeOnce(handle.pid);
+}
+
+/** Test-only accessor for the module-global browsers map. */
+export function getBrowsersMapForTest(): ReadonlyMap<string, BrowserHandle> {
+	return browsers;
 }

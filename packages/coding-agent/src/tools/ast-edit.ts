@@ -16,6 +16,7 @@ import { Ellipsis, fileHyperlink, framedBlock, renderStatusLine, truncateToWidth
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
+import { parseReadUrlTarget } from "./fetch";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { classifyGroupedLines, formatGroupedFiles, groupLineIndicesByBlank } from "./grouped-file-output";
 import type { OutputMeta } from "./output-meta";
@@ -31,7 +32,7 @@ import {
 	formatParseErrorsCountLabel,
 	PREVIEW_LIMITS,
 } from "./render-utils";
-import { queueResolveHandler } from "./resolve";
+import { PREVIEW_PENDING_NOTICE, queueResolveHandler } from "./resolve";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
@@ -284,6 +285,12 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				signal,
 				localProtocolOptions: this.session.localProtocolOptions,
 				skills: this.session.skills,
+				resolveExternalUrl: async rawPath => {
+					if (!parseReadUrlTarget(rawPath)) return undefined;
+					throw new ToolError(
+						`Cannot rewrite external URL: ${rawPath}. Use \`read\` or \`search\` to inspect fetched web content; ast_edit only applies to local files.`,
+					);
+				},
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
 
@@ -513,6 +520,9 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						return toolResult(appliedDetails).text(text).done();
 					},
 				});
+				// The renderer's ⟨proposed⟩ badge is TUI-only; this line is the model's
+				// in-result signal that the diff above is staged, not applied.
+				outputLines.unshift(PREVIEW_PENDING_NOTICE, "");
 			}
 
 			const details: AstEditToolDetails = {

@@ -111,7 +111,10 @@ export const MCP_CONFIG_SCHEMA_URL =
 export interface MCPConfigFile {
 	$schema?: string;
 	mcpServers?: Record<string, MCPServerConfig>;
+	/** Names to hide regardless of any source `enabled` flag. Highest precedence. */
 	disabledServers?: string[];
+	/** Names to force-enable when a non-writable source reports `enabled: false`. */
+	enabledServers?: string[];
 }
 
 // =============================================================================
@@ -203,10 +206,17 @@ export interface MCPResourceContent {
 
 export type MCPContent = MCPTextContent | MCPImageContent | MCPResourceContent;
 
+/** Structured authentication challenge returned in a tool result. */
+export interface MCPAuthChallenge {
+	/** Values from `_meta["mcp/www_authenticate"]`. */
+	readonly wwwAuthenticate: readonly string[];
+}
+
 /** tools/call response */
 export interface MCPToolCallResult {
 	content: MCPContent[];
 	isError?: boolean;
+	_meta?: Record<string, unknown>;
 }
 
 // =============================================================================

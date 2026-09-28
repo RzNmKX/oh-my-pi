@@ -18,6 +18,7 @@ import { fetchWithRetry } from "@oh-my-pi/pi-utils";
 
 import type { SearchCitation, SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
+import { formatQuery, GOOGLE_QUERY_SYNTAX, parseSearchQuery, type StructuredQuery } from "../query";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
@@ -33,6 +34,13 @@ const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
 const RATE_LIMIT_BUDGET_MS = 5 * 60 * 1000;
 
+function resolveGeminiSearchModel(configuredModel: string | undefined): string {
+	const envModel = Bun.env.GEMINI_SEARCH_MODEL?.trim();
+	if (envModel) return envModel;
+	const model = configuredModel?.trim();
+	return model || DEFAULT_MODEL;
+}
+
 const GEMINI_PROVIDERS = ["google-gemini-cli", "google-antigravity"] as const;
 type GeminiProviderId = (typeof GEMINI_PROVIDERS)[number];
 
@@ -44,6 +52,8 @@ interface GeminiToolParams {
 
 export interface GeminiSearchParams extends GeminiToolParams {
 	query: string;
+	/** Pre-parsed structured query; falls back to parsing `query` when omitted. */
+	parsedQuery?: StructuredQuery;
 	system_prompt?: string;
 	num_results?: number;
 	/** Maximum output tokens. */
@@ -55,6 +65,7 @@ export interface GeminiSearchParams extends GeminiToolParams {
 	sessionId?: string;
 	fetch?: FetchImpl;
 	antigravityEndpointMode?: "auto" | "production" | "sandbox";
+	geminiModel?: string;
 }
 
 export function buildGeminiRequestTools(params: GeminiToolParams): Array<Record<string, Record<string, unknown>>> {
@@ -160,13 +171,16 @@ interface CloudCodeResponseChunk {
 	response?: GeminiModelResponse;
 }
 
-async function parseGeminiSearchStream(body: ReadableStream<Uint8Array>): Promise<GeminiSearchResult> {
+async function parseGeminiSearchStream(
+	body: ReadableStream<Uint8Array>,
+	fallbackModel: string,
+): Promise<GeminiSearchResult> {
 	const answerParts: string[] = [];
 	const sources: SearchSource[] = [];
 	const citations: SearchCitation[] = [];
 	const searchQueries: string[] = [];
 	const seenUrls = new Set<string>();
-	let model = DEFAULT_MODEL;
+	let model = fallbackModel;
 	let usage: { inputTokens: number; outputTokens: number; totalTokens: number } | undefined;
 
 	const reader = body.getReader();
@@ -287,6 +301,7 @@ async function parseGeminiSearchStream(body: ReadableStream<Uint8Array>): Promis
  */
 async function callGeminiSearch(
 	auth: GeminiAuth,
+	model: string,
 	query: string,
 	systemPrompt: string | undefined,
 	maxOutputTokens: number | undefined,
@@ -330,7 +345,7 @@ async function callGeminiSearch(
 
 	const requestBody: Record<string, unknown> = {
 		project: auth.projectId,
-		model: DEFAULT_MODEL,
+		model,
 		request: {
 			contents: [
 				{
@@ -414,11 +429,12 @@ async function callGeminiSearch(
 		throw new SearchProviderError("gemini", "Gemini API returned no response body", 500);
 	}
 
-	return parseGeminiSearchStream(response.body);
+	return parseGeminiSearchStream(response.body, model);
 }
 
 async function callGeminiDeveloperSearch(
 	apiKey: string,
+	model: string,
 	query: string,
 	systemPrompt: string | undefined,
 	maxOutputTokens: number | undefined,
@@ -455,7 +471,7 @@ async function callGeminiDeveloperSearch(
 	}
 
 	const response = await fetchWithRetry(
-		() => `${DEVELOPER_API_ENDPOINT}/models/${DEFAULT_MODEL}:streamGenerateContent?alt=sse`,
+		() => `${DEVELOPER_API_ENDPOINT}/models/${model}:streamGenerateContent?alt=sse`,
 		{
 			method: "POST",
 			headers: {
@@ -487,13 +503,20 @@ async function callGeminiDeveloperSearch(
 		throw new SearchProviderError("gemini", "Gemini API returned no response body", 500);
 	}
 
-	return parseGeminiSearchStream(response.body);
+	return parseGeminiSearchStream(response.body, model);
 }
 
 /**
  * Executes a web search using Google Gemini with Google Search grounding.
  */
 export async function searchGemini(params: GeminiSearchParams): Promise<SearchResponse> {
+	const selectedModel = resolveGeminiSearchModel(params.geminiModel);
+	// Gemini's googleSearch grounding forwards the query to Google Search, which
+	// understands the classic operator set natively. Normalize directive aliases
+	// (domain: → site:, since: → after:, …) to canonical Google forms; leave
+	// directive-free queries byte-identical.
+	const parsed = params.parsedQuery ?? parseSearchQuery(params.query);
+	const searchQuery = parsed.hasDirectives ? formatQuery(parsed, GOOGLE_QUERY_SYNTAX) : params.query;
 	const seed = await findGeminiAuth(params.authStorage, params.sessionId, params.signal);
 	let result: GeminiSearchResult;
 
@@ -513,7 +536,8 @@ export async function searchGemini(params: GeminiSearchParams): Promise<SearchRe
 						projectId: access.projectId ?? seed.projectId,
 						isAntigravity,
 					},
-					params.query,
+					selectedModel,
+					searchQuery,
 					params.system_prompt,
 					params.max_output_tokens,
 					params.temperature,
@@ -539,7 +563,8 @@ export async function searchGemini(params: GeminiSearchParams): Promise<SearchRe
 		}
 		result = await callGeminiDeveloperSearch(
 			apiKey,
-			params.query,
+			selectedModel,
+			searchQuery,
 			params.system_prompt,
 			params.max_output_tokens,
 			params.temperature,
@@ -585,6 +610,7 @@ export class GeminiProvider extends SearchProvider {
 	search(params: SearchParams): Promise<SearchResponse> {
 		return searchGemini({
 			query: params.query,
+			parsedQuery: params.parsedQuery,
 			system_prompt: params.systemPrompt,
 			num_results: params.numSearchResults ?? params.limit,
 			max_output_tokens: params.maxOutputTokens,
@@ -596,6 +622,7 @@ export class GeminiProvider extends SearchProvider {
 			authStorage: params.authStorage,
 			sessionId: params.sessionId,
 			fetch: params.fetch,
+			geminiModel: params.geminiModel,
 		});
 	}
 }

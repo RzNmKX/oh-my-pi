@@ -16,9 +16,23 @@
  */
 
 import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
+import { applyCodexResponsesLiteShape } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
+import {
+	createOpenAICodexCompactionRequestContext,
+	createOpenAICodexCompatibilityMetadata,
+	getCodexAttestationHeader,
+} from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { parseAzureDeploymentNameMap, parseTextSignature } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
-import type { Api, AssistantMessage, FetchImpl, Message, Model } from "@oh-my-pi/pi-ai/types";
+import type {
+	Api,
+	AssistantMessage,
+	CodexCompactionContext,
+	FetchImpl,
+	Message,
+	Model,
+	ProviderSessionState,
+} from "@oh-my-pi/pi-ai/types";
 import {
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
@@ -30,7 +44,9 @@ import {
 	OPENAI_HEADER_VALUES,
 	OPENAI_HEADERS,
 } from "@oh-my-pi/pi-catalog/wire/codex";
-import { $env, logger } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, logger, prompt, stringifyJson, structuredCloneJSON } from "@oh-my-pi/pi-utils";
+import { countTokensConservatively } from "../tokenizer";
+import contextWindowTruncatedOutputPrompt from "./prompts/context-window-truncated-output.md" with { type: "text" };
 
 export * from "./compaction-v2-streaming";
 
@@ -51,6 +67,141 @@ export const OPENAI_REMOTE_COMPACTION_PRESERVE_KEY = "openaiRemoteCompaction";
 export const REMOTE_COMPACTION_TIMEOUT_MS = 180_000;
 
 const DEFAULT_AZURE_API_VERSION = "v1";
+
+export const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE = prompt.render(contextWindowTruncatedOutputPrompt);
+
+const REMOTE_COMPACTION_REQUEST_OVERHEAD_TOKENS = 256;
+const REMOTE_COMPACTION_IMAGE_TOKEN_ESTIMATE = 12_000;
+const TOOL_RESULT_IMAGE_ATTACHMENT_TEXT = "Attached image(s) from tool result:";
+
+interface NormalizedEstimateValue {
+	value: unknown;
+	imageTokens: number;
+}
+
+function normalizeRemoteCompactionEstimateValue(value: unknown): NormalizedEstimateValue {
+	if (Array.isArray(value)) {
+		const normalized: unknown[] = [];
+		let imageTokens = 0;
+		for (const item of value) {
+			const result = normalizeRemoteCompactionEstimateValue(item);
+			normalized.push(result.value);
+			imageTokens += result.imageTokens;
+		}
+		return { value: normalized, imageTokens };
+	}
+	if (!value || typeof value !== "object") return { value, imageTokens: 0 };
+
+	const record = value as Record<string, unknown>;
+	if (record.type === "input_image") {
+		return {
+			value: { ...record, image_url: "<image>" },
+			imageTokens: REMOTE_COMPACTION_IMAGE_TOKEN_ESTIMATE,
+		};
+	}
+
+	const normalized: Record<string, unknown> = {};
+	let imageTokens = 0;
+	for (const [key, item] of Object.entries(record)) {
+		const result = normalizeRemoteCompactionEstimateValue(item);
+		normalized[key] = result.value;
+		imageTokens += result.imageTokens;
+	}
+	return { value: normalized, imageTokens };
+}
+
+export interface TrimRemoteCompactionInputResult {
+	input: Array<Record<string, unknown>>;
+	rewrittenOutputs: number;
+	estimatedTokensBefore: number;
+	estimatedTokensAfter: number;
+}
+
+function estimateRemoteCompactionInputTokens(
+	input: Array<Record<string, unknown>>,
+	instructions: string,
+	tools?: unknown[],
+): number {
+	const normalized = normalizeRemoteCompactionEstimateValue({ instructions, input, ...(tools ? { tools } : {}) });
+	const serialized = stringifyJson(normalized.value) ?? "";
+	return countTokensConservatively(serialized) + normalized.imageTokens + REMOTE_COMPACTION_REQUEST_OVERHEAD_TOKENS;
+}
+
+function rewriteToolOutputForContextWindow(item: Record<string, unknown>): Record<string, unknown> | undefined {
+	if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
+		return { ...item, output: CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE };
+	}
+	if (item.type === "tool_search_output") {
+		return { ...item, tools: [] };
+	}
+	return undefined;
+}
+
+function isToolResultImageAttachment(item: Record<string, unknown>): boolean {
+	if (item.type !== "message" || item.role !== "user" || !Array.isArray(item.content)) return false;
+
+	let hasLabel = false;
+	let hasImage = false;
+	for (const block of item.content) {
+		if (!isRecord(block)) continue;
+		if (block.type === "input_text" && block.text === TOOL_RESULT_IMAGE_ATTACHMENT_TEXT) hasLabel = true;
+		if (block.type === "input_image") hasImage = true;
+	}
+	return hasLabel && hasImage;
+}
+
+/**
+ * Preserve the full native transcript unless trailing tool outputs alone push a
+ * remote compaction request beyond the model window. Replacing only those
+ * outputs keeps call/result pairing and all earlier assistant/reasoning history,
+ * matching Codex's recovery path for oversized tool turns.
+ */
+export function trimRemoteCompactionInputToContextWindow(
+	input: Array<Record<string, unknown>>,
+	contextWindow: number | null | undefined,
+	instructions: string,
+	tools?: unknown[],
+): TrimRemoteCompactionInputResult {
+	const estimatedTokensBefore = estimateRemoteCompactionInputTokens(input, instructions, tools);
+	if (!contextWindow || contextWindow <= 0 || estimatedTokensBefore <= contextWindow) {
+		return {
+			input,
+			rewrittenOutputs: 0,
+			estimatedTokensBefore,
+			estimatedTokensAfter: estimatedTokensBefore,
+		};
+	}
+
+	let rewrittenInput: Array<Record<string, unknown>> | undefined;
+	let estimatedTokensAfter = estimatedTokensBefore;
+	let rewrittenOutputs = 0;
+	for (let index = input.length - 1; index >= 0 && estimatedTokensAfter > contextWindow; index--) {
+		const item = input[index];
+		if (isToolResultImageAttachment(item)) continue;
+		const rewritten = rewriteToolOutputForContextWindow(item);
+		if (!rewritten) break;
+		rewrittenInput ??= input.slice();
+		rewrittenInput[index] = rewritten;
+		rewrittenOutputs++;
+		estimatedTokensAfter = estimateRemoteCompactionInputTokens(rewrittenInput, instructions, tools);
+	}
+
+	if (!rewrittenInput || estimatedTokensAfter > contextWindow) {
+		return {
+			input,
+			rewrittenOutputs: 0,
+			estimatedTokensBefore,
+			estimatedTokensAfter: estimatedTokensBefore,
+		};
+	}
+
+	return {
+		input: rewrittenInput,
+		rewrittenOutputs,
+		estimatedTokensBefore,
+		estimatedTokensAfter,
+	};
+}
 
 /** Race the caller's signal against the request timeout; `timeoutMs <= 0` disables the watchdog. */
 function withRequestTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal | undefined {
@@ -75,6 +226,11 @@ export interface OpenAiRemoteCompactionRequest {
 	model: string;
 	input: Array<Record<string, unknown>>;
 	instructions: string;
+	reasoning?: {
+		context?: string;
+		[key: string]: unknown;
+	};
+	include?: string[];
 }
 
 export interface OpenAiRemoteCompactionResponse extends OpenAiRemoteCompactionPreserveData {}
@@ -236,6 +392,7 @@ function addOpenAiCallIds(
 	items: Array<Record<string, unknown>>,
 	knownCallIds: Set<string>,
 	customCallIds: Set<string>,
+	computerCallIds: Set<string>,
 ): void {
 	for (const item of items) {
 		if (typeof item.call_id !== "string") continue;
@@ -244,8 +401,55 @@ function addOpenAiCallIds(
 		} else if (item.type === "custom_tool_call") {
 			knownCallIds.add(item.call_id);
 			customCallIds.add(item.call_id);
+		} else if (item.type === "computer_call") {
+			knownCallIds.add(item.call_id);
+			computerCallIds.add(item.call_id);
 		}
 	}
+}
+
+function computerHistoryNote(item: Record<string, unknown>): Record<string, unknown> {
+	const serialized = stringifyJson(item) ?? "";
+	return {
+		type: "message",
+		id: `msg_${Bun.hash(`computer-history:${serialized}`).toString(36)}`,
+		role: "assistant",
+		content: [
+			{
+				type: "output_text",
+				text: `[Previous computer history unavailable to this model]: ${serialized}`,
+				annotations: [],
+			},
+		],
+		status: "completed",
+	};
+}
+
+function adaptComputerHistoryForCompaction(
+	items: Array<Record<string, unknown>>,
+	supportsComputerUse: boolean,
+): Array<Record<string, unknown>> {
+	if (supportsComputerUse) return items;
+	return items.map(item =>
+		item.type === "computer_call" || item.type === "computer_call_output" ? computerHistoryNote(item) : item,
+	);
+}
+
+function computerFailureNote(call: Record<string, unknown>, output: string): Record<string, unknown> {
+	const serialized = stringifyJson(call) ?? "";
+	return {
+		type: "message",
+		id: `msg_${Bun.hash(`computer-failure:${serialized}:${output}`).toString(36)}`,
+		role: "assistant",
+		content: [
+			{
+				type: "output_text",
+				text: `[Computer call failed before a screenshot was recorded]: ${serialized}${output ? `\n${output}` : ""}`,
+				annotations: [],
+			},
+		],
+		status: "completed",
+	};
 }
 
 // ============================================================================
@@ -269,20 +473,32 @@ export function buildOpenAiNativeHistory(
 	model: Model,
 	previousReplacementHistory?: Array<Record<string, unknown>>,
 ): Array<Record<string, unknown>> {
-	const input: Array<Record<string, unknown>> = previousReplacementHistory ? [...previousReplacementHistory] : [];
+	const input: Array<Record<string, unknown>> = previousReplacementHistory
+		? adaptComputerHistoryForCompaction([...previousReplacementHistory], model.supportsComputerUse === true)
+		: [];
 	const transformedMessages = transformMessages(messages, model, id => normalizeOpenAiCompactionToolCallId(id));
 
 	let msgIndex = 0;
 	const knownCallIds = new Set<string>();
 	const customCallIds = new Set<string>();
-	addOpenAiCallIds(input, knownCallIds, customCallIds);
+	const computerCallIds = new Set<string>();
+	const demotedComputerCallIds = new Set<string>();
+	addOpenAiCallIds(input, knownCallIds, customCallIds, computerCallIds);
 	for (const message of transformedMessages) {
 		if (message.role === "user" || message.role === "developer") {
 			const providerPayload = (message as { providerPayload?: AssistantMessage["providerPayload"] }).providerPayload;
-			const historyItems = getOpenAIResponsesHistoryItems(providerPayload, model.provider);
-			if (historyItems) {
+			const rawHistoryItems = getOpenAIResponsesHistoryItems(providerPayload, model.provider);
+			if (rawHistoryItems) {
+				if (model.supportsComputerUse !== true) {
+					for (const item of rawHistoryItems) {
+						if (item.type === "computer_call" && typeof item.call_id === "string") {
+							demotedComputerCallIds.add(item.call_id);
+						}
+					}
+				}
+				const historyItems = adaptComputerHistoryForCompaction(rawHistoryItems, model.supportsComputerUse === true);
 				input.push(...historyItems);
-				addOpenAiCallIds(historyItems, knownCallIds, customCallIds);
+				addOpenAiCallIds(historyItems, knownCallIds, customCallIds, computerCallIds);
 				msgIndex++;
 				continue;
 			}
@@ -323,14 +539,27 @@ export function buildOpenAiNativeHistory(
 				assistant.provider,
 			);
 			if (providerPayload) {
+				if (!providerPayload.dt) demotedComputerCallIds.clear();
+				if (model.supportsComputerUse !== true) {
+					for (const item of providerPayload.items) {
+						if (item.type === "computer_call" && typeof item.call_id === "string") {
+							demotedComputerCallIds.add(item.call_id);
+						}
+					}
+				}
+				const historyItems = adaptComputerHistoryForCompaction(
+					providerPayload.items,
+					model.supportsComputerUse === true,
+				);
 				if (providerPayload.dt) {
-					input.push(...providerPayload.items);
-					addOpenAiCallIds(providerPayload.items, knownCallIds, customCallIds);
+					input.push(...historyItems);
+					addOpenAiCallIds(historyItems, knownCallIds, customCallIds, computerCallIds);
 				} else {
-					input.splice(0, input.length, ...providerPayload.items);
+					input.splice(0, input.length, ...historyItems);
 					knownCallIds.clear();
 					customCallIds.clear();
-					addOpenAiCallIds(input, knownCallIds, customCallIds);
+					computerCallIds.clear();
+					addOpenAiCallIds(input, knownCallIds, customCallIds, computerCallIds);
 				}
 				msgIndex++;
 				continue;
@@ -376,6 +605,25 @@ export function buildOpenAiNativeHistory(
 
 				if (block.type === "toolCall") {
 					const normalized = normalizeResponsesToolCallId(block.id, block.customWireName ? "ctc" : "fc");
+					if (block.providerMetadata?.type === "computer") {
+						const computerCall = {
+							type: "computer_call",
+							id: block.providerMetadata.providerItemId,
+							call_id: normalized.callId,
+							actions: structuredCloneJSON(block.providerMetadata.actions),
+							pending_safety_checks: structuredCloneJSON(block.providerMetadata.pendingSafetyChecks),
+							status: "completed",
+						};
+						if (model.supportsComputerUse !== true) {
+							input.push(computerHistoryNote(computerCall));
+							demotedComputerCallIds.add(normalized.callId);
+							continue;
+						}
+						knownCallIds.add(normalized.callId);
+						computerCallIds.add(normalized.callId);
+						input.push(computerCall);
+						continue;
+					}
 					let itemId: string | undefined = normalized.itemId;
 					if (
 						isDifferentModel &&
@@ -401,7 +649,7 @@ export function buildOpenAiNativeHistory(
 						id: itemId,
 						call_id: normalized.callId,
 						name: block.name,
-						arguments: JSON.stringify(block.arguments),
+						arguments: stringifyJson(block.arguments) ?? "null",
 					});
 				}
 			}
@@ -412,17 +660,58 @@ export function buildOpenAiNativeHistory(
 
 		if (message.role === "toolResult") {
 			const normalized = normalizeResponsesToolCallId(message.toolCallId);
-			if (!knownCallIds.has(normalized.callId)) {
-				msgIndex++;
-				continue;
-			}
-
 			const textOutput = message.content
 				.filter(block => block.type === "text")
 				.map(block => block.text)
 				.join("\n");
 			const hasImages = message.content.some(block => block.type === "image");
 			const outputText = textOutput.length > 0 ? textOutput : hasImages ? "(see attached image)" : "";
+			if (demotedComputerCallIds.has(normalized.callId)) {
+				const resultItem =
+					message.providerMetadata?.type === "computer"
+						? {
+								type: "computer_call_output",
+								call_id: normalized.callId,
+								output: structuredCloneJSON(message.providerMetadata.screenshot),
+								acknowledged_safety_checks: structuredCloneJSON(
+									message.providerMetadata.acknowledgedSafetyChecks,
+								),
+							}
+						: { type: "computer_call_output", call_id: normalized.callId, error: outputText };
+				input.push(computerHistoryNote(resultItem));
+				demotedComputerCallIds.delete(normalized.callId);
+				msgIndex++;
+				continue;
+			}
+			if (!knownCallIds.has(normalized.callId)) {
+				msgIndex++;
+				continue;
+			}
+			if (computerCallIds.has(normalized.callId)) {
+				if (message.providerMetadata?.type === "computer") {
+					input.push({
+						type: "computer_call_output",
+						call_id: normalized.callId,
+						output: structuredCloneJSON(message.providerMetadata.screenshot),
+						acknowledged_safety_checks: structuredCloneJSON(message.providerMetadata.acknowledgedSafetyChecks),
+					});
+					msgIndex++;
+					continue;
+				}
+
+				const callIndex = input.findLastIndex(
+					item => item.type === "computer_call" && item.call_id === normalized.callId,
+				);
+				if (callIndex >= 0) {
+					const [call] = input.splice(callIndex, 1);
+					if (call) input.splice(callIndex, 0, computerFailureNote(call, outputText));
+				}
+				knownCallIds.delete(normalized.callId);
+				computerCallIds.delete(normalized.callId);
+				msgIndex++;
+				continue;
+			}
+
 			input.push({
 				type: customCallIds.has(normalized.callId) ? "custom_tool_call_output" : "function_call_output",
 				call_id: normalized.callId,
@@ -431,7 +720,7 @@ export function buildOpenAiNativeHistory(
 
 			if (hasImages && model.input.includes("image")) {
 				const contentBlocks: Array<Record<string, unknown>> = [
-					{ type: "input_text", text: "Attached image(s) from tool result:" },
+					{ type: "input_text", text: TOOL_RESULT_IMAGE_ATTACHMENT_TEXT },
 				];
 				for (const block of message.content) {
 					if (block.type !== "image") continue;
@@ -460,19 +749,38 @@ export async function requestOpenAiRemoteCompaction(
 	compactInput: Array<Record<string, unknown>>,
 	instructions: string,
 	signal?: AbortSignal,
-	opts?: { fetch?: FetchImpl; timeoutMs?: number },
+	opts?: {
+		fetch?: FetchImpl;
+		timeoutMs?: number;
+		sessionId?: string;
+		providerSessionState?: Map<string, ProviderSessionState>;
+		codexCompaction?: CodexCompactionContext;
+	},
 ): Promise<OpenAiRemoteCompactionResponse> {
 	const endpoint = resolveOpenAiCompactEndpoint(model);
 	const requestModel = resolveOpenAiCompactModel(model);
+	const trimmed = trimRemoteCompactionInputToContextWindow(compactInput, model.contextWindow, instructions);
+	if (trimmed.rewrittenOutputs > 0) {
+		logger.info("Rewrote trailing tool outputs before OpenAI remote compaction", {
+			model: model.id,
+			provider: model.provider,
+			rewrittenOutputs: trimmed.rewrittenOutputs,
+			estimatedTokensBefore: trimmed.estimatedTokensBefore,
+			estimatedTokensAfter: trimmed.estimatedTokensAfter,
+			contextWindow: model.contextWindow,
+		});
+	}
 	const request: OpenAiRemoteCompactionRequest = {
 		model: requestModel,
-		// Send full history to the endpoint - don't trim locally.
-		// The provider handles compression via the compaction endpoint.
-		// Trimming before sending loses assistant messages and thinking blocks.
-		input: compactInput,
+		// Preserve the native transcript. Only oversized trailing tool outputs are
+		// rewritten above, reducing the request without losing assistant turns,
+		// reasoning, or call/result pairing.
+		input: trimmed.input,
 		instructions,
 	};
 	const isAzureOpenAiResponses = (model.remoteCompaction?.api ?? model.api) === "azure-openai-responses";
+	const isCodexResponses =
+		model.provider === "openai-codex" || (model.remoteCompaction?.api ?? model.api) === "openai-codex-responses";
 	const headers: Record<string, string> = isAzureOpenAiResponses
 		? {
 				"content-type": "application/json",
@@ -486,19 +794,48 @@ export async function requestOpenAiRemoteCompaction(
 			};
 
 	// Codex endpoints require additional auth headers
-	if (model.provider === "openai-codex") {
+	if (isCodexResponses) {
 		const accountId = getCodexAccountId(apiKey);
 		if (accountId) {
 			headers[OPENAI_HEADERS.ACCOUNT_ID] = accountId;
 		}
+		const attestation = await getCodexAttestationHeader(accountId);
+		if (attestation) {
+			headers[OPENAI_HEADERS.ATTESTATION] = attestation;
+		}
 		headers[OPENAI_HEADERS.BETA] = OPENAI_HEADER_VALUES.BETA_RESPONSES;
 		headers[OPENAI_HEADERS.ORIGINATOR] = OPENAI_HEADER_VALUES.ORIGINATOR_CODEX;
+		Object.assign(
+			headers,
+			createOpenAICodexCompatibilityMetadata({
+				sessionId: opts?.sessionId,
+				providerSessionState: opts?.providerSessionState,
+				requestKind: "compaction",
+				compaction: createOpenAICodexCompactionRequestContext({
+					context: opts?.codexCompaction,
+					implementation: "responses_compact",
+				}),
+				includeInstallationHeader: true,
+			}).headers,
+		);
+		// Responses Lite models take the same rewrite on `/responses/compact`:
+		// instructions ride as an input item and the lite marker header is set
+		// (codex-rs routes compaction through `build_responses_request`).
+		if (model.useResponsesLite) {
+			applyCodexResponsesLiteShape(request);
+			headers[OPENAI_HEADERS.RESPONSES_LITE] = "true";
+			request.reasoning = {
+				...request.reasoning,
+				context: "all_turns",
+			};
+			request.include = Array.from(new Set([...(request.include ?? []), "reasoning.encrypted_content"]));
+		}
 	}
 
 	const response = await (opts?.fetch ?? fetch)(endpoint, {
 		method: "POST",
 		headers,
-		body: JSON.stringify(request),
+		body: stringifyJson(request),
 		signal: withRequestTimeout(signal, opts?.timeoutMs ?? REMOTE_COMPACTION_TIMEOUT_MS),
 	});
 
@@ -547,16 +884,55 @@ export async function requestOpenAiRemoteCompaction(
 	return { provider: model.provider, replacementHistory, compactionItem };
 }
 
+/**
+ * Generic remote-compaction POST. Two wire shapes are auto-selected by
+ * endpoint suffix so a single `compaction.remoteEndpoint` setting can point at
+ * either a purpose-built omp summarizer (`{systemPrompt, prompt}` → `{summary}`)
+ * or any OpenAI-compatible chat-completions server (`/chat/completions`,
+ * `/v1/chat/completions`, …) as reported for llama.cpp / vLLM / etc. in
+ * issue #4630: without this, the omp payload was rejected with
+ * HTTP 400 `"'messages' is required"`, compaction silently fell back to
+ * local summarization, and context grew unbounded.
+ *
+ * When `context.model` is provided the chat-completions body is tagged with
+ * that model's wire id (llama.cpp requires the field) and `context.apiKey` is
+ * forwarded as `Authorization: Bearer`. Callers wrap this in `withAuth` so
+ * 401s force-refresh through the standard credential rotation policy.
+ */
 export async function requestRemoteCompaction(
 	endpoint: string,
 	request: RemoteCompactionRequest,
 	signal?: AbortSignal,
-	opts?: { fetch?: FetchImpl; timeoutMs?: number },
+	opts?: { fetch?: FetchImpl; timeoutMs?: number; model?: Model; apiKey?: string },
 ): Promise<RemoteCompactionResponse> {
+	let endpointPath = endpoint;
+	try {
+		endpointPath = new URL(endpoint).pathname;
+	} catch {
+		// Keep the raw endpoint for relative/custom fetch implementations.
+	}
+	const isChatCompletions = /\/chat\/completions\/?$/.test(endpointPath);
+	const headers: Record<string, string> = { "content-type": "application/json" };
+	if (isChatCompletions) {
+		if (opts?.apiKey) headers.Authorization = `Bearer ${opts.apiKey}`;
+		if (opts?.model?.headers) Object.assign(headers, opts.model.headers);
+	}
+
+	const body: Record<string, unknown> = isChatCompletions
+		? {
+				model: opts?.model ? resolveOpenAiCompactModel(opts.model) : undefined,
+				messages: [
+					{ role: "system", content: request.systemPrompt },
+					{ role: "user", content: request.prompt },
+				],
+				stream: false,
+			}
+		: { systemPrompt: request.systemPrompt, prompt: request.prompt };
+
 	const response = await (opts?.fetch ?? fetch)(endpoint, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(request),
+		headers,
+		body: stringifyJson(body),
 		signal: withRequestTimeout(signal, opts?.timeoutMs ?? REMOTE_COMPACTION_TIMEOUT_MS),
 	});
 
@@ -575,6 +951,31 @@ export async function requestRemoteCompaction(
 				headers: response.headers,
 			},
 		);
+	}
+
+	if (isChatCompletions) {
+		type ChatCompletionsResponse = {
+			choices?: Array<{
+				message?: {
+					content?: string | Array<{ type?: string; text?: string }> | null;
+				};
+			}>;
+		};
+		const data = (await response.json()) as ChatCompletionsResponse | undefined;
+		const choice = data?.choices?.[0]?.message?.content;
+		let summary: string | undefined;
+		if (typeof choice === "string") {
+			summary = choice;
+		} else if (Array.isArray(choice)) {
+			summary = choice
+				.filter((part): part is { type?: string; text: string } => typeof part?.text === "string")
+				.map(part => part.text)
+				.join("");
+		}
+		if (typeof summary !== "string" || summary.length === 0) {
+			throw new Error("Remote compaction response missing choices[0].message.content");
+		}
+		return { summary };
 	}
 
 	const data = (await response.json()) as RemoteCompactionResponse | undefined;

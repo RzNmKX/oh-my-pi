@@ -3,6 +3,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
+import { isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { isVertexExpressOpenAIUrl, isVertexRawPredictUrl } from "@oh-my-pi/pi-catalog/hosts";
 import {
@@ -13,13 +14,16 @@ import {
 	resolveWireModelId,
 } from "@oh-my-pi/pi-catalog/model-thinking";
 import { CATALOG_PROVIDERS, type ProviderCatalogEntry } from "@oh-my-pi/pi-catalog/provider-models";
-import { $env, $pickenv, getConfigRootDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { CODEX_BASE_URL } from "@oh-my-pi/pi-catalog/wire/codex";
+import { $env, $pickenv, getConfigRootDir, isEnoent, logger, withExtraCaFetch } from "@oh-my-pi/pi-utils";
 import { getCustomApi } from "./api-registry";
-import { AUTH_RETRY_STEPS, isApiKeyResolver, resolveRetryKey } from "./auth-retry";
+import { createAuthRetryKeyState, isApiKeyResolver, resolveNextAuthRetryKey } from "./auth-retry";
 import * as AIError from "./error";
 import { ProviderHttpError } from "./error";
+import { isInvalidatedOAuthTokenError } from "./error/auth-classify";
 import { isUsageLimitOutcome } from "./error/rate-limit";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
+import type { BedrockOpenAIOptions } from "./providers/amazon-bedrock-openai";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { CursorOptions } from "./providers/cursor";
 import type { DevinOptions } from "./providers/devin";
@@ -45,6 +49,7 @@ import {
 	streamAnthropic,
 	streamAzureOpenAIResponses,
 	streamBedrock,
+	streamBedrockOpenAI,
 	streamCursor,
 	streamDevin,
 	streamGoogle,
@@ -70,7 +75,10 @@ import type {
 	ThinkingBudgets,
 	ToolChoice,
 } from "./types";
+import { resolveCacheRetention } from "./utils";
 import { AssistantMessageEventStream } from "./utils/event-stream";
+import { isFoundryEnabled } from "./utils/foundry";
+import { wrapLeakedThinkingStream } from "./utils/leaked-thinking-stream";
 import { wrapFetchForProxy } from "./utils/proxy";
 import { withRequestDebugFetch } from "./utils/request-debug";
 import { withGeminiThinkingLoopGuard } from "./utils/thinking-loop";
@@ -81,6 +89,62 @@ function isGoogleVertexAuthenticatedModel(model: Model<Api>): boolean {
 		((model.api === "openai-completions" && isVertexExpressOpenAIUrl(model.baseUrl)) ||
 			(model.api === "anthropic-messages" && isVertexRawPredictUrl(model.baseUrl)))
 	);
+}
+
+/**
+ * Whether {@link model} is an official first-party endpoint whose stream needs
+ * no leaked-thinking healing — the official Anthropic API and the official
+ * OpenAI / OpenAI-Codex endpoints return structured thinking blocks and never
+ * leak reasoning idioms into the visible text channel.
+ *
+ * The gate is provider id **and** official endpoint URL: pointing
+ * `provider: "anthropic"` (or `openai`) at a custom proxy via `models.yml`
+ * still routes through {@link wrapLeakedThinkingStream}, since a third-party
+ * gateway may well leak. URL checks are strict (exact origin / path boundary
+ * or parsed hostname) — a substring match would accept lookalikes like
+ * `https://api.openai.com.evil/`. Anthropic Foundry (`CLAUDE_CODE_USE_FOUNDRY`)
+ * redirects an empty `baseUrl` to `FOUNDRY_BASE_URL`, so the check runs against
+ * that effective endpoint — exempt only when it resolves to the official host.
+ */
+function isLeakedThinkingHealExempt(model: Model<Api>): boolean {
+	switch (model.provider) {
+		case "anthropic":
+			// Mirror resolveAnthropicBaseUrl: Foundry redirects an empty baseUrl to
+			// FOUNDRY_BASE_URL, so exempt only when the effective endpoint is official.
+			return isOfficialAnthropicApiUrl((isFoundryEnabled() && $env.FOUNDRY_BASE_URL?.trim()) || model.baseUrl);
+		case "openai":
+			return isOfficialOpenAIApiUrl(model.baseUrl);
+		case "openai-codex":
+			return isOfficialCodexApiUrl(model.baseUrl);
+		default:
+			return false;
+	}
+}
+
+/** Strict official-OpenAI endpoint check; missing baseUrl defaults to `api.openai.com`. */
+function isOfficialOpenAIApiUrl(baseUrl: string | undefined): boolean {
+	if (!baseUrl) return true;
+	try {
+		return new URL(baseUrl).hostname === "api.openai.com";
+	} catch {
+		return false;
+	}
+}
+
+/** Strict official-Codex endpoint check; exact origin or a path boundary after {@link CODEX_BASE_URL}. */
+function isOfficialCodexApiUrl(baseUrl: string | undefined): boolean {
+	if (!baseUrl) return true;
+	const lower = baseUrl.toLowerCase().replace(/\/+$/, "");
+	return lower === CODEX_BASE_URL || lower.startsWith(`${CODEX_BASE_URL}/`);
+}
+
+/**
+ * Apply live leaked-thinking healing unless {@link model} is an official
+ * first-party endpoint ({@link isLeakedThinkingHealExempt}), which emits
+ * structured thinking and needs no healing.
+ */
+function healLeakedThinking(model: Model<Api>, inner: AssistantMessageEventStream): AssistantMessageEventStream {
+	return isLeakedThinkingHealExempt(model) ? inner : wrapLeakedThinkingStream(inner);
 }
 
 type ProviderInFlightLease = {
@@ -499,8 +563,12 @@ function withProviderInFlightLimit<TOptions extends Pick<StreamOptions, "signal"
 	options: TOptions | undefined,
 	dispatch: () => AssistantMessageEventStream,
 ): AssistantMessageEventStream {
+	// Leaked-thinking healing folds in here — the one shared provider-dispatch
+	// chokepoint — so the loop guard (which wraps this) sees healed events and all
+	// provider exits are covered by one wrap. Official first-party providers are
+	// exempt (see `healLeakedThinking`); healing is otherwise idempotent.
 	const limit = resolveProviderInFlightLimit(model.provider, options);
-	if (limit === undefined) return dispatch();
+	if (limit === undefined) return healLeakedThinking(model, dispatch());
 
 	const outer = new AssistantMessageEventStream();
 	void (async () => {
@@ -520,7 +588,7 @@ function withProviderInFlightLimit<TOptions extends Pick<StreamOptions, "signal"
 			if (options?.signal?.aborted) {
 				throw options.signal.reason ?? new AIError.AbortError("Provider request aborted before dispatch");
 			}
-			const inner = dispatch();
+			const inner = healLeakedThinking(model, dispatch());
 			try {
 				for await (const event of inner) {
 					outer.push(event);
@@ -705,11 +773,12 @@ function streamDispatch<TApi extends Api>(
 	options?: OptionsForApi<TApi>,
 ): AssistantMessageEventStream {
 	const baseOptions = (options || {}) as StreamOptions;
-	const debugOptions = withRequestDebugFetch(baseOptions);
+	const debugOptions = withExtraCaFetch(withRequestDebugFetch(baseOptions));
 	const requestOptions = {
 		...debugOptions,
 		fetch: wrapFetchForProxy(debugOptions.fetch ?? (globalThis.fetch as FetchImpl), model.provider),
 	} as OptionsForApi<TApi>;
+	assertExplicitOpenAIResponsesPromptCacheSupport(model, requestOptions);
 
 	// Check custom API registry first (extension-provided APIs like "vertex-claude-api")
 	const customApiProvider = getCustomApi(model.api);
@@ -745,6 +814,13 @@ function streamDispatch<TApi extends Api>(
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
 		return streamBedrock(model as Model<"bedrock-converse-stream">, context, requestOptions as BedrockOptions);
+	} else if (model.api === "bedrock-openai-responses") {
+		// Bedrock OpenAI (bedrock-mantle) also uses SigV4, no API keys.
+		return streamBedrockOpenAI(
+			model as Model<"bedrock-openai-responses">,
+			context,
+			(requestOptions || {}) as BedrockOpenAIOptions,
+		);
 	}
 
 	const apiKey = requestOptions.apiKey || getEnvApiKey(model.provider);
@@ -914,17 +990,20 @@ function isRetryableUpstreamError(error: unknown, status: number | undefined, me
 	// per-minute caps) classify as RATE_LIMIT_EXCEEDED in
 	// `parseRateLimitReason` and stay in the provider's own backoff layer
 	// instead of burning siblings.
+	if (AIError.isUsageLimit(error)) return true;
+	if (isInvalidatedOAuthTokenError(error)) return true;
 	if (status === 401) return true;
-	void error;
 	return isUsageLimitOutcome(status, message);
 }
 
 function createAssistantAuthError(message: AssistantMessage): Error {
 	const text = message.errorMessage ?? "Provider authentication failed";
 	const status = extractStatusFromAssistantError(message);
-	return status === undefined
-		? new AIError.ProviderResponseError(text, { kind: "runtime" })
-		: new ProviderHttpError(text, status);
+	const error =
+		status === undefined
+			? new AIError.ProviderResponseError(text, { kind: "runtime" })
+			: new ProviderHttpError(text, status);
+	return typeof message.errorId === "number" ? AIError.attach(error, message.errorId) : error;
 }
 
 function emitBufferedEvents(stream: AssistantMessageEventStream, events: AssistantMessageEvent[]): void {
@@ -939,21 +1018,22 @@ export function streamSimple<TApi extends Api>(
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
 	const baseOptions = (options || {}) as SimpleStreamOptions;
-	const debugOptions = withRequestDebugFetch(baseOptions);
+	const debugOptions = withExtraCaFetch(withRequestDebugFetch(baseOptions));
 	const requestOptions = {
 		...debugOptions,
 		fetch: wrapFetchForProxy(debugOptions.fetch ?? (globalThis.fetch as FetchImpl), model.provider),
 	} as SimpleStreamOptions;
+
 	const apiKeyResolver = isApiKeyResolver(requestOptions?.apiKey) ? requestOptions.apiKey : undefined;
 	if (apiKeyResolver) {
 		const outer = new AssistantMessageEventStream();
 		const signal = requestOptions?.signal;
-		// One inner attempt against a resolved string key. When
-		// `captureAuthFailure` is set, a retryable auth error that arrives before
-		// any replay-unsafe event is buffered and returned (so the caller can
-		// retry with a fresh key) instead of surfaced. The terminal attempt
-		// clears the flag and emits whatever it gets.
-		const runAttempt = async (apiKey: string, captureAuthFailure: boolean): Promise<AuthRetryFailure | undefined> => {
+		// One inner attempt against a resolved string key. A retryable auth error
+		// that arrives before any replay-unsafe event is buffered and returned
+		// (so the caller can retry with a fresh key) instead of surfaced. Once any
+		// non-start event escapes, retry is no longer safe and the failure is
+		// emitted directly.
+		const runAttempt = async (apiKey: string): Promise<AuthRetryFailure | undefined> => {
 			const bufferedEvents: AssistantMessageEvent[] = [];
 			let emittedReplayUnsafeEvent = false;
 			const flushBuffered = (): void => {
@@ -970,7 +1050,6 @@ export function streamSimple<TApi extends Api>(
 					}
 					if (
 						!emittedReplayUnsafeEvent &&
-						captureAuthFailure &&
 						event.type === "error" &&
 						isRetryableUpstreamError(
 							event.error,
@@ -990,7 +1069,6 @@ export function streamSimple<TApi extends Api>(
 			} catch (error) {
 				if (
 					!emittedReplayUnsafeEvent &&
-					captureAuthFailure &&
 					isRetryableUpstreamError(
 						error,
 						AIError.status(error),
@@ -1032,21 +1110,16 @@ export function streamSimple<TApi extends Api>(
 				outer.fail(new AIError.MissingApiKeyError(model.provider));
 				return;
 			}
-			let failure = await runAttempt(lastKey, true);
+			const retryState = createAuthRetryKeyState(lastKey);
+			let failure = await runAttempt(lastKey);
 			if (!failure) return;
-			// a/b/c policy: refresh the same account (lastChance=false), then
-			// switch to a sibling (lastChance=true). A step is skipped when the
-			// resolver yields the same key it just tried or `undefined`; the
-			// final step's attempt clears the capture flag so it emits directly.
-			for (let step = 0; step < AUTH_RETRY_STEPS.length; step++) {
+			while (true) {
 				// Caller aborted between attempts: don't mint a fresh token or fire
 				// another doomed request — emit the captured failure instead.
 				if (signal?.aborted) break;
-				const nextKey = await resolveRetryKey(apiKeyResolver, AUTH_RETRY_STEPS[step]!, failure.error, signal);
-				if (nextKey === undefined || nextKey === lastKey) continue;
-				lastKey = nextKey;
-				const isLastStep = step === AUTH_RETRY_STEPS.length - 1;
-				const next = await runAttempt(nextKey, !isLastStep);
+				const nextKey = await resolveNextAuthRetryKey(retryState, apiKeyResolver, failure.error, signal);
+				if (nextKey === undefined) break;
+				const next = await runAttempt(nextKey);
 				if (!next) return;
 				failure = next;
 			}
@@ -1083,6 +1156,10 @@ export function streamSimple<TApi extends Api>(
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
 		const providerOptions = mapOptionsForApi(model, requestOptions, undefined);
 		return stream(model, context, providerOptions);
+	} else if (model.api === "bedrock-openai-responses") {
+		// Bedrock OpenAI (bedrock-mantle) also uses SigV4 credentials, no API keys.
+		const providerOptions = mapOptionsForApi(model, requestOptions, undefined);
+		return stream(model, context, providerOptions);
 	}
 
 	// The resolver form is handled by the wrapper above; only a static string
@@ -1105,20 +1182,29 @@ export function streamSimple<TApi extends Api>(
 
 	// GitLab Duo Workflow - IDE workflow protocol + WebSocket action bridge
 	if (model.api === "gitlab-duo-agent") {
-		return streamGitLabDuoWorkflow(model as Model<"gitlab-duo-agent">, context, {
-			...requestOptions,
-			apiKey,
-		});
+		// Does not route through withProviderInFlightLimit, so heal explicitly.
+		return healLeakedThinking(
+			model,
+			streamGitLabDuoWorkflow(model as Model<"gitlab-duo-agent">, context, {
+				...requestOptions,
+				apiKey,
+			}),
+		);
 	}
 
 	// Kimi Code - route to dedicated handler that wraps OpenAI or Anthropic API
 	if (isKimiModel(model)) {
-		// Pass raw SimpleStreamOptions - streamKimi handles mapping internally
-		return withProviderInFlightLimit(model, requestOptions, () =>
+		// streamKimi handles openai/anthropic format mapping internally, but the
+		// mandatory-reasoning clamp is a request-shaping concern owned here: K3's
+		// `supports_thinking_type: "only"` endpoint rejects disabled/omitted
+		// thinking, so clamp disabled requests to the lowest supported effort
+		// (mirrors the mapOptionsForApi path every other provider takes).
+		const kimiOptions = normalizeMandatoryReasoningOptions(model, requestOptions);
+		return withProviderInFlightLimit(model, kimiOptions, () =>
 			streamKimi(model as Model<"openai-completions">, context, {
-				...requestOptions,
+				...kimiOptions,
 				apiKey,
-				format: requestOptions?.kimiApiFormat ?? "anthropic",
+				format: kimiOptions?.kimiApiFormat,
 			}),
 		);
 	}
@@ -1170,6 +1256,7 @@ export const ANTHROPIC_THINKING: Record<Effort, number> = {
 	medium: 8192,
 	high: 16384,
 	xhigh: 32768,
+	max: 32768,
 };
 
 const GOOGLE_THINKING: Record<Effort, number> = {
@@ -1178,6 +1265,7 @@ const GOOGLE_THINKING: Record<Effort, number> = {
 	medium: 8192,
 	high: 16384,
 	xhigh: 24575,
+	max: 32768,
 };
 
 const BEDROCK_CLAUDE_THINKING: Record<Effort, number> = {
@@ -1186,6 +1274,7 @@ const BEDROCK_CLAUDE_THINKING: Record<Effort, number> = {
 	medium: 8192,
 	high: 16384,
 	xhigh: 16384,
+	max: 32768,
 };
 
 function resolveBedrockThinkingBudget(
@@ -1328,6 +1417,41 @@ function normalizeMandatoryReasoningOptions<TApi extends Api>(
 	return { ...options, reasoning: floor, disableReasoning: undefined };
 }
 
+function supportsExplicitOpenAIResponsesPromptCache(compat: unknown): boolean {
+	return (
+		typeof compat === "object" &&
+		compat !== null &&
+		"supportsPromptCacheBreakpoints" in compat &&
+		compat.supportsPromptCacheBreakpoints === true
+	);
+}
+
+function isOpenAIResponsesPromptCacheSurface<TApi extends Api>(model: Model<TApi>): boolean {
+	return (
+		model.api === "openai-responses" ||
+		model.api === "azure-openai-responses" ||
+		(model.api === "openrouter" && $env.PI_OPENROUTER_RESPONSES !== "0")
+	);
+}
+
+function assertExplicitOpenAIResponsesPromptCacheSupport<TApi extends Api>(
+	model: Model<TApi>,
+	options?: StreamOptions,
+): void {
+	if (
+		model.transport === "pi-native" ||
+		resolveCacheRetention(options?.cacheRetention) === "none" ||
+		options?.promptCache?.mode !== "explicit" ||
+		!isOpenAIResponsesPromptCacheSurface(model) ||
+		supportsExplicitOpenAIResponsesPromptCache(model.compat)
+	) {
+		return;
+	}
+	throw new AIError.ConfigurationError(
+		`OpenAI explicit prompt caching is unsupported for ${model.provider}/${model.id}; enable compat.supportsPromptCacheBreakpoints only for a compatible endpoint.`,
+	);
+}
+
 function mapOptionsForApi<TApi extends Api>(
 	model: Model<TApi>,
 	rawOptions?: SimpleStreamOptions,
@@ -1354,6 +1478,7 @@ function mapOptionsForApi<TApi extends Api>(
 		promptCacheKey: options?.promptCacheKey,
 		streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
 		streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
+		codexSseMaxAttempts: options?.codexSseMaxAttempts,
 		providerSessionState: options?.providerSessionState,
 		maxInFlightRequests: options?.maxInFlightRequests,
 		onPayload: options?.onPayload,
@@ -1361,13 +1486,18 @@ function mapOptionsForApi<TApi extends Api>(
 		onSseEvent: options?.onSseEvent,
 		execHandlers: options?.execHandlers,
 		fetch: options?.fetch,
+		fallbacks: options?.fallbacks,
 	};
 
 	switch (model.api) {
 		case "anthropic-messages": {
-			// Explicitly disable thinking when reasoning is not specified or model doesn't support it
+			// Explicitly disable thinking when reasoning is not specified, the caller
+			// disabled it, or the model doesn't support it. `disableReasoning` is a
+			// SimpleStreamOptions flag that never reaches AnthropicOptions on its own,
+			// so it must be folded into `thinkingEnabled` here (mandatory-reasoning
+			// models already clamp it away in normalizeMandatoryReasoningOptions).
 			const reasoning = options?.reasoning;
-			if (!reasoning || !model.reasoning) {
+			if (!reasoning || !model.reasoning || options?.disableReasoning) {
 				return castApi<"anthropic-messages">({
 					...base,
 					requestModelId: resolveWireModelId(model, undefined),
@@ -1501,6 +1631,8 @@ function mapOptionsForApi<TApi extends Api>(
 					maxTokensExplicit: rawOptions?.maxTokens !== undefined,
 					disableReasoning: options?.disableReasoning,
 					textVerbosity: options?.textVerbosity,
+					promptCache: options?.promptCache,
+					statefulResponses: options?.statefulResponses,
 				});
 			}
 			return castApi<"openai-completions">({
@@ -1511,6 +1643,7 @@ function mapOptionsForApi<TApi extends Api>(
 				serviceTier: options?.serviceTier,
 				openrouterVariant: options?.openrouterVariant,
 				maxTokensExplicit: rawOptions?.maxTokens !== undefined,
+				promptCache: options?.promptCache,
 			});
 		}
 
@@ -1523,6 +1656,7 @@ function mapOptionsForApi<TApi extends Api>(
 				serviceTier: options?.serviceTier,
 				openrouterVariant: options?.openrouterVariant,
 				maxTokensExplicit: rawOptions?.maxTokens !== undefined,
+				promptCache: options?.promptCache,
 			});
 
 		case "openai-responses":
@@ -1536,6 +1670,8 @@ function mapOptionsForApi<TApi extends Api>(
 				maxTokensExplicit: rawOptions?.maxTokens !== undefined,
 				disableReasoning: options?.disableReasoning,
 				textVerbosity: options?.textVerbosity,
+				promptCache: options?.promptCache,
+				statefulResponses: options?.statefulResponses,
 			});
 
 		case "azure-openai-responses":
@@ -1545,6 +1681,8 @@ function mapOptionsForApi<TApi extends Api>(
 				toolChoice: mapOpenAiToolChoice(options?.toolChoice),
 				serviceTier: options?.serviceTier,
 				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
+				promptCache: options?.promptCache,
+				statefulResponses: options?.statefulResponses,
 			});
 
 		case "openai-codex-responses":
@@ -1554,6 +1692,7 @@ function mapOptionsForApi<TApi extends Api>(
 				toolChoice: mapOpenAiToolChoice(options?.toolChoice),
 				serviceTier: options?.serviceTier,
 				preferWebsockets: options?.preferWebsockets,
+				codexCompaction: options?.codexCompaction,
 				reasoningSummary: options?.hideThinkingSummary ? null : "detailed",
 				textVerbosity: options?.textVerbosity,
 			});
@@ -1565,8 +1704,10 @@ function mapOptionsForApi<TApi extends Api>(
 			if (!reasoning || !model.reasoning) {
 				return castApi<"google-generative-ai">({
 					...base,
+					serviceTier: options?.serviceTier,
 					thinking: { enabled: false },
 					toolChoice: mapGoogleToolChoice(options?.toolChoice),
+					cachedContent: options?.cachedContent,
 				});
 			}
 
@@ -1578,21 +1719,26 @@ function mapOptionsForApi<TApi extends Api>(
 			if (googleModel.thinking?.mode === "google-level") {
 				return castApi<"google-generative-ai">({
 					...base,
+					serviceTier: options?.serviceTier,
 					thinking: {
 						enabled: true,
 						level: mapEffortToGoogleThinkingLevel(effort),
 					},
+					hideThinkingSummary: options?.hideThinkingSummary,
 					toolChoice: mapGoogleToolChoice(options?.toolChoice),
+					cachedContent: options?.cachedContent,
 				});
 			}
 
-			return castApi<"google-gemini-cli">({
+			return castApi<"google-generative-ai">({
 				...base,
 				thinking: {
 					enabled: true,
 					budgetTokens: getGoogleBudget(googleModel, effort, options?.thinkingBudgets),
 				},
+				hideThinkingSummary: options?.hideThinkingSummary,
 				toolChoice: mapGoogleToolChoice(options?.toolChoice),
+				cachedContent: options?.cachedContent,
 			});
 		}
 
@@ -1611,6 +1757,7 @@ function mapOptionsForApi<TApi extends Api>(
 							enabled: true,
 							level: mapEffortToGoogleThinkingLevel(effort),
 						},
+						hideThinkingSummary: options?.hideThinkingSummary,
 						toolChoice,
 						antigravityEndpointMode: options?.antigravityEndpointMode,
 					});
@@ -1633,6 +1780,7 @@ function mapOptionsForApi<TApi extends Api>(
 						maxTokens,
 						requestModelId: resolveWireModelId(model, effort),
 						thinking: { enabled: true, budgetTokens: thinkingBudget },
+						hideThinkingSummary: options?.hideThinkingSummary,
 						toolChoice,
 						antigravityEndpointMode: options?.antigravityEndpointMode,
 					});
@@ -1661,8 +1809,10 @@ function mapOptionsForApi<TApi extends Api>(
 			if (!reasoning || !model.reasoning) {
 				return castApi<"google-vertex">({
 					...base,
+					serviceTier: options?.serviceTier,
 					thinking: { enabled: false },
 					toolChoice: mapGoogleToolChoice(options?.toolChoice),
+					cachedContent: options?.cachedContent,
 				});
 			}
 
@@ -1673,21 +1823,27 @@ function mapOptionsForApi<TApi extends Api>(
 			if (geminiModel.thinking?.mode === "google-level") {
 				return castApi<"google-vertex">({
 					...base,
+					serviceTier: options?.serviceTier,
 					thinking: {
 						enabled: true,
 						level: mapEffortToGoogleThinkingLevel(effort),
 					},
+					hideThinkingSummary: options?.hideThinkingSummary,
 					toolChoice: mapGoogleToolChoice(options?.toolChoice),
+					cachedContent: options?.cachedContent,
 				});
 			}
 
 			return castApi<"google-vertex">({
 				...base,
+				serviceTier: options?.serviceTier,
 				thinking: {
 					enabled: true,
 					budgetTokens: getGoogleBudget(geminiModel, effort, options?.thinkingBudgets),
 				},
+				hideThinkingSummary: options?.hideThinkingSummary,
 				toolChoice: mapGoogleToolChoice(options?.toolChoice),
+				cachedContent: options?.cachedContent,
 			});
 		}
 
@@ -1726,6 +1882,13 @@ function mapOptionsForApi<TApi extends Api>(
 				chatModelUid: resolveWireModelId(devinModel, effort),
 			});
 		}
+		case "bedrock-openai-responses":
+			return castApi<"bedrock-openai-responses">({
+				...base,
+				reasoning: resolveOpenAiReasoningEffort(model, options),
+				toolChoice: options?.toolChoice,
+				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
+			});
 		default:
 			throw new AIError.ConfigurationError(`Unhandled API in mapOptionsForApi: ${model.api}`);
 	}
@@ -1752,7 +1915,9 @@ function getGoogleBudget(
 				return 2048;
 			case "medium":
 				return 8192;
-			default:
+			case "high":
+			case "xhigh":
+			case "max":
 				return model.id.includes("2.5-flash") ? 24576 : 32768;
 		}
 	}

@@ -1,4 +1,4 @@
-import { fetchWithRetry, parseStreamingJson } from "@oh-my-pi/pi-utils";
+import { fetchWithRetry, parseStreamingJson, readJsonl } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { getEnvApiKey } from "../stream";
 import type {
@@ -16,6 +16,7 @@ import type {
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
 import { clearStreamingPartialJson, kStreamingPartialJson } from "../utils/block-symbols";
+import { withEmptyCompletionRetry } from "../utils/empty-completion-retry";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import type { CapturedHttpErrorResponse, RawHttpRequestDump } from "../utils/http-inspector";
 import {
@@ -23,7 +24,7 @@ import {
 	getOpenAIStreamFirstEventTimeoutMs,
 	getOpenAIStreamIdleTimeoutMs,
 } from "../utils/idle-iterator";
-import { toolWireSchema } from "../utils/schema/wire";
+import { sanitizeSchemaForOllama, toolWireSchema } from "../utils/schema";
 import {
 	getStreamMarkupHealingPattern,
 	type HealedToolCall,
@@ -34,7 +35,7 @@ import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, partitionVisionContent } from "./vision-guard";
 
 export interface OllamaChatOptions extends StreamOptions {
-	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
+	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	disableReasoning?: boolean;
 	toolChoice?: ToolChoice;
 }
@@ -140,6 +141,7 @@ function mapToolChoice(toolChoice: ToolChoice | undefined): "auto" | "none" | "r
 	if (toolChoice === "required" || toolChoice === "any") {
 		return "required";
 	}
+	if (typeof toolChoice === "object" && toolChoice.type === "computer") return undefined;
 	if (typeof toolChoice === "object") {
 		return "required";
 	}
@@ -150,6 +152,7 @@ function getNamedToolChoiceName(toolChoice: ToolChoice | undefined): string | un
 	if (!toolChoice || typeof toolChoice === "string") {
 		return undefined;
 	}
+	if (toolChoice.type === "computer") return undefined;
 	if ("function" in toolChoice) {
 		return toolChoice.function.name;
 	}
@@ -280,7 +283,7 @@ function convertTools(tools: Tool[] | undefined): OllamaFunctionTool[] | undefin
 		function: {
 			name: tool.name,
 			description: tool.description,
-			parameters: toolWireSchema(tool),
+			parameters: sanitizeSchemaForOllama(toolWireSchema(tool)),
 		},
 	}));
 }
@@ -323,6 +326,10 @@ function createChatBody(model: Model<"ollama-chat">, context: Context, options: 
 	};
 }
 
+function shouldRetryOllamaResponse(response: Response, bodyText: string): boolean {
+	return response.status < 500 || !AIError.LLAMA_CPP_TOOL_CALL_PARSE_PATTERN.test(bodyText);
+}
+
 async function captureHttpErrorResponse(response: Response): Promise<CapturedHttpErrorResponse> {
 	let bodyText: string | undefined;
 	let bodyJson: unknown;
@@ -340,36 +347,6 @@ async function captureHttpErrorResponse(response: Response): Promise<CapturedHtt
 		bodyText,
 		bodyJson,
 	};
-}
-
-async function* iterateNdjson(stream: ReadableStream<Uint8Array>): AsyncGenerator<OllamaChatChunk> {
-	const reader = stream.getReader();
-	const decoder = new TextDecoder();
-	let buffer = "";
-	while (true) {
-		const { done, value } = await reader.read();
-		if (done) {
-			break;
-		}
-		buffer += decoder.decode(value, { stream: true });
-		while (true) {
-			const newlineIndex = buffer.indexOf("\n");
-			if (newlineIndex < 0) {
-				break;
-			}
-			const line = buffer.slice(0, newlineIndex).trim();
-			buffer = buffer.slice(newlineIndex + 1);
-			if (!line) {
-				continue;
-			}
-			yield JSON.parse(line) as OllamaChatChunk;
-		}
-	}
-	buffer += decoder.decode();
-	const tail = buffer.trim();
-	if (tail) {
-		yield JSON.parse(tail) as OllamaChatChunk;
-	}
 }
 
 function createEmptyOutput(model: Model<"ollama-chat">): AssistantMessage {
@@ -445,10 +422,10 @@ function hasVisibleAssistantContent(output: AssistantMessage): boolean {
 
 const OLLAMA_RETRY_DELAYS_MS = [2_000, 5_000, 10_000];
 
-export const streamOllama: StreamFunction<"ollama-chat"> = (
+const streamOllamaOnce = (
 	model: Model<"ollama-chat">,
 	context: Context,
-	options: OllamaChatOptions,
+	options: OllamaChatOptions = {},
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
 	void (async () => {
@@ -598,6 +575,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 					body: JSON.stringify(body),
 					signal: watchdog.signal,
 					defaultDelayMs: OLLAMA_RETRY_DELAYS_MS,
+					shouldRetryResponse: shouldRetryOllamaResponse,
 					fetch: options.fetch,
 					timeout: false,
 				});
@@ -616,7 +594,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 				});
 			}
 			stream.push({ type: "start", partial: output });
-			for await (const chunk of iterateNdjson(response.body)) {
+			for await (const chunk of readJsonl<OllamaChatChunk>(response.body)) {
 				if (chunk.message?.thinking) {
 					suppressHealedThinking = true;
 					endActiveTextBlock();
@@ -747,6 +725,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 			}
 			const result = await AIError.finalize(error, {
 				api: model.api,
+				provider: model.provider,
 				signal: options.signal,
 				rawRequestDump,
 				capturedErrorResponse,
@@ -765,3 +744,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 	})();
 	return stream;
 };
+
+/** Retry EOS-only Ollama completions before the agent loop sees an empty stop. */
+export const streamOllama: StreamFunction<"ollama-chat"> = (model, context, options) =>
+	withEmptyCompletionRetry(model, context, options, streamOllamaOnce);

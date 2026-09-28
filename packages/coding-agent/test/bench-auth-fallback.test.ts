@@ -9,7 +9,7 @@ import type {
 	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
 import { type BenchModelRegistry, type BenchSummary, runBenchCommand } from "@oh-my-pi/pi-coding-agent/cli/bench-cli";
-import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 
 function fakeModel(provider: string, id: string): Model<Api> {
 	return {
@@ -59,27 +59,16 @@ function emptyStream(): AssistantMessageEventStream {
 interface FakeRegistryOptions {
 	models: Model<Api>[];
 	authedProviders: string[];
-	canonicalId?: (model: Model<Api>) => string | undefined;
-	canonicalVariants?: Record<string, Model<Api>[]>;
 }
 
 function fakeRegistry(opts: FakeRegistryOptions): BenchModelRegistry {
 	const authed = new Set(opts.authedProviders);
 	return {
 		getAll: () => opts.models,
+		getAvailable: () => opts.models.filter(model => authed.has(model.provider)),
 		hasConfiguredAuth: model => authed.has(model.provider),
 		getApiKey: async model => (authed.has(model.provider) ? "sk-test" : undefined),
 		resolver: () => (() => Promise.resolve("sk-test")) as unknown as ApiKeyResolver,
-		getCanonicalId: opts.canonicalId,
-		getCanonicalVariants: opts.canonicalVariants
-			? canonicalId =>
-					(opts.canonicalVariants?.[canonicalId] ?? []).map(model => ({
-						canonicalId,
-						selector: `${model.provider}/${model.id}`,
-						model,
-						source: "bundled" as const,
-					}))
-			: undefined,
 	};
 }
 
@@ -87,12 +76,13 @@ async function runBench(
 	selector: string,
 	registry: BenchModelRegistry,
 	streamFactory: () => AssistantMessageEventStream = fakeStream,
+	settings?: Settings,
 ) {
 	const stderr: string[] = [];
 	const summary = await runBenchCommand(
 		{ models: [selector], flags: { runs: 1, maxTokens: 64, json: false } },
 		{
-			createRuntime: async () => ({ modelRegistry: registry, settings: undefined, close: () => {} }),
+			createRuntime: async () => ({ modelRegistry: registry, settings, close: () => {} }),
 			randomSessionId: () => "sess-1",
 			writeStdout: () => {},
 			writeStderr: text => stderr.push(text),
@@ -121,24 +111,20 @@ describe("bench credential-aware provider selection", () => {
 		expect(stderr).toContain("openrouter/openai/gpt-oss-20b");
 	});
 
-	it("redirects across providers whose local ids differ, via canonical variants", async () => {
-		// Bare `gpt-oss-20b` resolves to fireworks (unauthed) by flat-id match; the
-		// only authenticated equivalent is openrouter under a *different* local id,
-		// so the swap must travel through the canonical variant index.
-		const fireworks = fakeModel("fireworks", "gpt-oss-20b");
-		const openrouter = fakeModel("openrouter", "openai/gpt-oss-20b");
+	it("does not redirect across providers whose local ids differ", async () => {
+		// Bare `gpt-oss-20b` resolves to fireworks (unauthed) by flat-id match.
+		// The authenticated openrouter entry has a different local id, so it is
+		// not considered an equivalent fallback.
 		const registry = fakeRegistry({
-			models: [fireworks, openrouter],
+			models: [fakeModel("fireworks", "gpt-oss-20b"), fakeModel("openrouter", "openai/gpt-oss-20b")],
 			authedProviders: ["openrouter"],
-			canonicalId: model => (model === fireworks || model === openrouter ? "gpt-oss-20b" : undefined),
-			canonicalVariants: { "gpt-oss-20b": [fireworks, openrouter] },
 		});
 
-		const { summary, stderr } = await runBench("gpt-oss-20b", registry);
+		const { summary } = await runBench("gpt-oss-20b", registry);
 
-		expect(summary.models[0].model).toBe("openrouter/openai/gpt-oss-20b");
-		expect(summary.failures).toBe(0);
-		expect(stderr).toContain('no credentials for "fireworks"');
+		expect(summary.models[0].model).toBe("fireworks/gpt-oss-20b");
+		expect(summary.failures).toBe(1);
+		expect(summary.models[0].results[0]).toMatchObject({ ok: false });
 	});
 
 	it("honors an explicitly pinned provider even without credentials", async () => {
@@ -150,6 +136,36 @@ describe("bench credential-aware provider selection", () => {
 		const { summary, stderr } = await runBench("groq/openai/gpt-oss-20b", registry);
 
 		// Pinned selector is authoritative: no redirect, surfaces the no-credentials failure.
+		expect(summary.models[0].model).toBe("groq/openai/gpt-oss-20b");
+		expect(summary.failures).toBe(1);
+		expect(summary.models[0].results[0]).toMatchObject({ ok: false });
+		expect(stderr).not.toContain("benchmarking");
+	});
+});
+
+describe("bench configured role selection", () => {
+	it("resolves configured bare role names", async () => {
+		const model = fakeModel("acme", "bench-model");
+		const registry = fakeRegistry({ models: [model], authedProviders: ["acme"] });
+		const settings = Settings.isolated({ modelRoles: { task: "acme/bench-model" } });
+
+		const { summary } = await runBench("task", registry, fakeStream, settings);
+
+		expect(summary.models[0].model).toBe("acme/bench-model");
+		expect(summary.failures).toBe(0);
+	});
+
+	it("honors provider-pinned configured role targets", async () => {
+		const registry = fakeRegistry({
+			models: [fakeModel("groq", "openai/gpt-oss-20b"), fakeModel("openrouter", "openai/gpt-oss-20b")],
+			authedProviders: ["openrouter"],
+		});
+		const settings = Settings.isolated({
+			modelRoles: { task: "groq/openai/gpt-oss-20b" },
+		});
+
+		const { summary, stderr } = await runBench("task", registry, fakeStream, settings);
+
 		expect(summary.models[0].model).toBe("groq/openai/gpt-oss-20b");
 		expect(summary.failures).toBe(1);
 		expect(summary.models[0].results[0]).toMatchObject({ ok: false });
@@ -173,13 +189,16 @@ describe("bench empty-output guard", () => {
 
 function settingsStub(serviceTier: string | undefined): Settings | undefined {
 	if (serviceTier === undefined) return undefined;
-	return { get: (key: string) => (key === "serviceTier" ? serviceTier : undefined) } as unknown as Settings;
+	return {
+		get: (key: string) =>
+			key === "tier.openai" ? serviceTier : key === "tier.anthropic" || key === "tier.google" ? "none" : undefined,
+	} as unknown as Settings;
 }
 
 async function captureServiceTier(opts: {
 	flag?: string;
 	setting?: string;
-}): Promise<{ wire: SimpleStreamOptions["serviceTier"]; summary: BenchSummary["serviceTier"] }> {
+}): Promise<{ wire: SimpleStreamOptions["serviceTier"]; summary: BenchSummary["serviceTierByFamily"] }> {
 	const registry = fakeRegistry({ models: [fakeModel("openai-codex", "gpt-5.5")], authedProviders: ["openai-codex"] });
 	let captured: SimpleStreamOptions | undefined;
 	const summary = await runBenchCommand(
@@ -205,7 +224,7 @@ async function captureServiceTier(opts: {
 			stdoutIsTTY: false,
 		},
 	);
-	return { wire: captured?.serviceTier, summary: summary.serviceTier };
+	return { wire: captured?.serviceTier, summary: summary.serviceTierByFamily };
 }
 
 describe("bench provider session state and websocket preference", () => {
@@ -245,24 +264,24 @@ describe("bench service tier", () => {
 	it("sends the configured serviceTier setting when no flag is passed", async () => {
 		const { wire, summary } = await captureServiceTier({ setting: "flex" });
 		expect(wire).toBe("flex");
-		expect(summary).toBe("flex");
+		expect(summary).toEqual({ openai: "flex" });
 	});
 
 	it("lets an explicit --service-tier override the configured setting", async () => {
 		const { wire, summary } = await captureServiceTier({ flag: "priority", setting: "flex" });
 		expect(wire).toBe("priority");
-		expect(summary).toBe("priority");
+		expect(summary).toEqual({ openai: "priority", anthropic: "priority", google: "priority" });
 	});
 
 	it("omits service_tier when the setting is none and no flag is passed", async () => {
 		const { wire, summary } = await captureServiceTier({ setting: "none" });
 		expect(wire).toBeUndefined();
-		expect(summary).toBeUndefined();
+		expect(summary).toEqual({});
 	});
 
 	it("omits service_tier when neither flag nor settings are present", async () => {
 		const { wire, summary } = await captureServiceTier({});
 		expect(wire).toBeUndefined();
-		expect(summary).toBeUndefined();
+		expect(summary).toEqual({});
 	});
 });

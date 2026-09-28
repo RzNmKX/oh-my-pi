@@ -11,6 +11,8 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
+const UNRENDERABLE_SNAPCOMPACT_TEXT = "\uE000\uE001\uE002\uE003\uE004\uE005\uE006\uE007\uE008\uE009";
+
 interface Harness {
 	session: AgentSession;
 	sessionManager: SessionManager;
@@ -42,7 +44,7 @@ async function createHarness(tempDir: TempDir, authStorage: AuthStorage, options
 	const settings = Settings.isolated({
 		"compaction.strategy": "snapcompact",
 		// Force a 1-token recent window so the post-turn cut always splits off the
-		// last turn and summarizes the seeded (CJK) history. With the default
+		// last turn and summarizes the seeded unrenderable history. With the default
 		// 20k window the cut keeps both tiny messages, leaving nothing for
 		// snapcompact's renderability preflight to scan.
 		"compaction.keepRecentTokens": 1,
@@ -145,15 +147,15 @@ describe("AgentSession auto-snapcompact local-blocker fallback", () => {
 		});
 	});
 
-	it("downgrades to context-full when the transcript is too non-ASCII for snapcompact to render", async () => {
-		tempDir = TempDir.createSync("@pi-snapcompact-non-ascii-");
+	it("downgrades to context-full when unsupported glyphs make snapcompact unsafe", async () => {
+		tempDir = TempDir.createSync("@pi-snapcompact-unsupported-glyphs-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		const harness = await createHarness(tempDir, authStorage, {
 			activeModel: { provider: "aimlapi", id: "claude-sonnet-4-5-20250929" },
 			seedMessages: [
 				{
 					role: "user",
-					content: "你好,请帮我审查这段代码。它的逻辑似乎有问题,我无法理解为何返回空结果。",
+					content: UNRENDERABLE_SNAPCOMPACT_TEXT.repeat(10),
 					timestamp: Date.now(),
 				},
 			],
@@ -165,11 +167,11 @@ describe("AgentSession auto-snapcompact local-blocker fallback", () => {
 		expect(result.action).toBe("context-full");
 		expect(result.errorMessage).toBeUndefined();
 		expect(compactionModule.compact).toHaveBeenCalled();
-		const cjkNotice = harness.notices.find(message =>
-			message.startsWith("snapcompact disabled: high non-ASCII rate detected"),
+		const unsupportedGlyphNotice = harness.notices.find(message =>
+			message.startsWith("snapcompact disabled: unsupported characters for selected snapcompact font"),
 		);
-		expect(cjkNotice).toBeDefined();
-		expect(cjkNotice).toContain("using context-full auto-compaction instead.");
+		expect(unsupportedGlyphNotice).toBeDefined();
+		expect(unsupportedGlyphNotice).toContain("using context-full auto-compaction instead.");
 		expect(harness.sessionManager.getBranch().find(entry => entry.type === "compaction")).toMatchObject({
 			type: "compaction",
 			summary: "compacted",

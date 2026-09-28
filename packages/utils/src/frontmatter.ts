@@ -37,6 +37,31 @@ function normalizeKeys<T>(obj: T): T {
 	return (changed ? result : obj) as T;
 }
 
+const PLAIN_SCALAR_KEY_VALUE = /^(\s*[A-Za-z_][\w-]*:\s+)(\S.*?)(\s*)$/;
+const FLOW_OR_EXPLICIT_VALUE_START = new Set(['"', "'", "[", "{", "|", ">", "!", "&", "*", "#"]);
+
+function quoteAmbiguousPlainScalars(metadata: string): string | undefined {
+	let changed = false;
+	const lines = metadata.split("\n").map(line => {
+		const match = line.match(PLAIN_SCALAR_KEY_VALUE);
+		if (!match) return line;
+		const [, prefix, rawValue, suffix] = match;
+		const value = rawValue.trimEnd();
+		if (!value.includes(": ")) return line;
+		if (FLOW_OR_EXPLICIT_VALUE_START.has(value[0])) return line;
+		changed = true;
+		return `${prefix}${JSON.stringify(value)}${suffix}`;
+	});
+	return changed ? lines.join("\n") : undefined;
+}
+
+function parseYamlRecord(metadata: string): Record<string, unknown> | null {
+	const loaded = YAML.parse(metadata.replaceAll("\t", "  "));
+	if (loaded === null || loaded === undefined) return null;
+	if (typeof loaded !== "object" || Array.isArray(loaded)) return null;
+	return loaded as Record<string, unknown>;
+}
+
 export class FrontmatterError extends Error {
 	constructor(
 		error: Error,
@@ -100,10 +125,19 @@ export function parseFrontmatter(
 	const body = normalized.slice(endIndex + 4).trim();
 
 	try {
-		// Replace tabs with spaces for YAML compatibility, use failsafe mode for robustness
-		const loaded = YAML.parse(metadata.replaceAll("\t", "  ")) as Record<string, unknown> | null;
+		const loaded = parseYamlRecord(metadata);
 		return { frontmatter: normalizeKeys({ ...frontmatter, ...loaded }), body };
 	} catch (error) {
+		const quotedMetadata = quoteAmbiguousPlainScalars(metadata);
+		if (quotedMetadata) {
+			try {
+				const loaded = parseYamlRecord(quotedMetadata);
+				return { frontmatter: normalizeKeys({ ...frontmatter, ...loaded }), body };
+			} catch {
+				// Fall through to the existing warning + simple key/value fallback.
+			}
+		}
+
 		const err = new FrontmatterError(
 			error instanceof Error ? error : new Error(`YAML: ${error}`),
 			loc ?? `Inline '${truncate(content, 64)}'`,
@@ -115,12 +149,25 @@ export function parseFrontmatter(
 			throw err;
 		}
 
-		// Simple YAML parsing - just key: value pairs
+		// Simple key: value fallback. Reparse each value on its own so one
+		// malformed line (e.g. `scope: "text","thinking"`) can't leave sibling
+		// values wrapped in literal quotes; values that don't parse as YAML fall
+		// back to the raw trimmed string (issue #4796).
 		for (const line of metadata.split("\n")) {
 			const match = line.match(/^([\w-]+):\s*(.*)$/);
-			if (match) {
-				frontmatter[match[1]] = match[2].trim();
+			if (!match) continue;
+			const raw = match[2].trim();
+			let value: unknown = raw;
+			if (raw.length > 0) {
+				try {
+					const parsed = YAML.parse(raw);
+					if (parsed !== null && typeof parsed !== "object") value = parsed;
+					else if (Array.isArray(parsed)) value = parsed;
+				} catch {
+					// keep the raw string
+				}
 			}
+			frontmatter[match[1]] = value;
 		}
 
 		return { frontmatter: normalizeKeys(frontmatter) as Record<string, unknown>, body };

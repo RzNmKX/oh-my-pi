@@ -80,8 +80,35 @@ describe("mcp oauth flow", () => {
 
 		expect(registrationPayload).not.toBeNull();
 		expect((registrationPayload as { client_name?: string } | null)?.client_name).toBe("oh-my-pi");
+		expect((registrationPayload as { scope?: string } | null)?.scope).toBeUndefined();
 		expect(authUrl.searchParams.get("client_id")).toBe("registered-client-id");
 		expect(authUrl.searchParams.get("state")).toBe("test-state");
+	});
+
+	it("includes discovered scopes in dynamic client registration", async () => {
+		let registrationPayload: Record<string, unknown> | null = null;
+		const scopes = "openid profile email offline_access";
+
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://www.figma.com/oauth/mcp",
+				tokenUrl: "https://api.figma.com/v1/oauth/token",
+				registrationUrl: "https://www.figma.com/oauth/register",
+				scopes,
+				fetch: mockFigmaRegistration(payload => {
+					registrationPayload = payload;
+				}),
+			},
+			{},
+		);
+
+		const { url } = await flow.generateAuthUrl("test-state", "http://127.0.0.1:53173/callback");
+		const authUrl = new URL(url);
+
+		expect(registrationPayload).not.toBeNull();
+		expect((registrationPayload as { scope?: string } | null)?.scope).toBe(scopes);
+		expect(authUrl.searchParams.get("scope")).toBe(scopes);
+		expect(authUrl.searchParams.get("client_id")).toBe("registered-client-id");
 	});
 
 	it("omits prompt by default so provider-specific reauth pages can use returning grants", async () => {
@@ -426,7 +453,7 @@ describe("mcp oauth flow", () => {
 		);
 
 		await expect(flow.login()).rejects.toThrow(
-			"OAuth callback port 80 unavailable; cannot fall back to a random port when oauth.redirectUri is set",
+			"OAuth callback port 80 is in use, but oauth.redirectUri (http://localhost/callback) requires this exact port",
 		);
 		expect(serveSpy).toHaveBeenCalledTimes(1);
 	});
@@ -447,7 +474,7 @@ describe("mcp oauth flow", () => {
 		);
 
 		await expect(flow.login()).rejects.toThrow(
-			"OAuth callback port 3000 unavailable; cannot fall back to a random port when oauth.redirectUri is set",
+			"OAuth callback port 3000 is in use, but oauth.redirectUri (http://localhost:3000/callback) requires this exact port",
 		);
 		expect(serveSpy).toHaveBeenCalledTimes(1);
 	});
@@ -468,7 +495,127 @@ describe("mcp oauth flow", () => {
 			{ signal: AbortSignal.timeout(1_000) },
 		);
 
-		await expect(flow.login()).rejects.toThrow("cannot fall back to a random port when oauth.redirectUri is set");
+		await expect(flow.login()).rejects.toThrow(
+			/oauth\.redirectUri \(https:\/\/public\.example\/slack\/oauth_redirect\) requires this exact port/,
+		);
+	});
+
+	it("fails fast when the preferred port is busy and a static clientId pins the registered redirect URI", async () => {
+		const serveSpy = vi.spyOn(Bun, "serve").mockImplementation(options => {
+			expect(options.port).toBe(14572);
+			throw new Error("EADDRINUSE");
+		});
+
+		const progress: string[] = [];
+		const onAuth = vi.fn();
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+				clientId: "demo-client",
+				callbackPort: 14572,
+			},
+			{
+				onAuth,
+				onProgress: msg => progress.push(msg),
+				signal: AbortSignal.timeout(1_000),
+			},
+		);
+
+		await expect(flow.login()).rejects.toThrow(
+			/OAuth callback port 14572 is in use\. The OAuth provider validates redirect URIs/,
+		);
+		// Fallback must NOT have been attempted: only the preferred-port serve call.
+		expect(serveSpy).toHaveBeenCalledTimes(1);
+		// Browser must not be opened — the error fires before generateAuthUrl runs.
+		expect(onAuth).not.toHaveBeenCalled();
+		// And the silent "Preferred port X unavailable, using port Y" message must
+		// never reach the user — that's the regression this test guards against.
+		expect(progress.some(msg => msg.includes("Preferred port"))).toBe(false);
+	});
+
+	it("falls back to a random port when DCR will re-register with the actual loopback URI", async () => {
+		// The bot reviewer's concern: blocking fallback for *every* MCP flow
+		// would break first-install DCR users whose preferred port is busy.
+		// Here `clientId` is unset, so `MCPOAuthFlow.#tryRegisterClient` will
+		// register the actual fallback URI with the provider and the
+		// authorization request will use that fresh client_id.
+		// Occupy 127.0.0.1 explicitly — the interface callback flows bind for
+		// `localhost` — because macOS lets a specific-address bind coexist with a
+		// wildcard one, which would let the flow bind the "blocked" port.
+		const blocker = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("blocker") });
+		const blockerPort = blocker.port;
+		if (typeof blockerPort !== "number") {
+			blocker.stop(true);
+			throw new Error("Bun.serve({ port: 0 }) did not assign a numeric port");
+		}
+
+		const registrations: unknown[] = [];
+		const fetchImpl: FetchImpl = async (input, init) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url.endsWith("/.well-known/oauth-authorization-server")) {
+				return new Response(JSON.stringify({ registration_endpoint: "https://provider.example/register" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "https://provider.example/register") {
+				registrations.push(JSON.parse(String(init?.body)));
+				return new Response(JSON.stringify({ client_id: "dcr-issued-client" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			return new Response("not implemented", { status: 501 });
+		};
+
+		const progress: string[] = [];
+		let authCalls = 0;
+		let advertisedUrl = "";
+		try {
+			const flow = new MCPOAuthFlow(
+				{
+					authorizationUrl: "https://provider.example/authorize",
+					tokenUrl: "https://provider.example/token",
+					registrationUrl: "https://provider.example/register",
+					// No clientId, no redirectUri — pure DCR flow.
+					callbackPort: blockerPort,
+					fetch: fetchImpl,
+				},
+				{
+					onAuth: ({ url }) => {
+						authCalls += 1;
+						advertisedUrl = url;
+					},
+					onProgress: msg => progress.push(msg),
+					// Abort once the flow is waiting for the browser callback we never deliver.
+					signal: AbortSignal.timeout(500),
+				},
+			);
+
+			await expect(flow.login()).rejects.toThrow(); // aborted while awaiting callback
+
+			// 1. The user saw the silent-fallback notice — fallback was attempted, not refused.
+			const fallbackNotice = progress.find(msg => msg.startsWith(`Preferred port ${blockerPort} unavailable`));
+			expect(fallbackNotice).toBeDefined();
+			expect(fallbackNotice).not.toContain(`using port ${blockerPort}`);
+
+			// 2. generateAuthUrl ran with a random-port redirect URI.
+			expect(authCalls).toBe(1);
+			const authParams = new URL(advertisedUrl).searchParams;
+			const advertisedRedirect = authParams.get("redirect_uri") ?? "";
+			expect(advertisedRedirect).toMatch(/^http:\/\/localhost:\d+\/callback$/);
+			expect(advertisedRedirect).not.toContain(`:${blockerPort}/`);
+
+			// 3. DCR re-registered with that same fallback URI, so the
+			//    provider's authorization server will accept it.
+			expect(registrations).toEqual([expect.objectContaining({ redirect_uris: [advertisedRedirect] })]);
+			// And the issued client_id was used in the authorize request.
+			expect(authParams.get("client_id")).toBe("dcr-issued-client");
+			expect(flow.resolvedClientId).toBe("dcr-issued-client");
+		} finally {
+			blocker.stop(true);
+		}
 	});
 
 	it("exposes the dynamically registered client_id and client_secret after generateAuthUrl", async () => {
@@ -476,6 +623,7 @@ describe("mcp oauth flow", () => {
 			{
 				authorizationUrl: "https://www.figma.com/oauth/mcp",
 				tokenUrl: "https://api.figma.com/v1/oauth/token",
+				registrationUrl: "https://www.figma.com/oauth/register",
 				fetch: mockFigmaRegistration(() => {}),
 			},
 			{},
@@ -513,6 +661,106 @@ describe("mcp oauth flow", () => {
 		expect(flow.resolvedClientId).toBe("configured-client-id");
 		expect(flow.registeredClientSecret).toBeUndefined();
 		expect(registrationCalled).toBe(false);
+	});
+
+	// Issue #5852: a rejected DCR request must stop reauthentication before an
+	// authorization URL without client_id reaches the browser.
+	it("blocks authorization when dynamic client registration is rejected", async () => {
+		let authorizationRequests = 0;
+		const fetchImpl: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "https://cropwise.example/oauth/register") {
+				return new Response(
+					JSON.stringify({
+						error: "unapproved_client",
+						error_description: "client_name 'oh-my-pi' is not on the approved list.",
+					}),
+					{ status: 403, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			if (url.startsWith("https://cropwise.example/authorize?")) {
+				authorizationRequests += 1;
+				return new Response("Missing required parameter: client_id", { status: 400 });
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		};
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://cropwise.example/authorize",
+				tokenUrl: "https://cropwise.example/token",
+				registrationUrl: "https://cropwise.example/oauth/register",
+				fetch: fetchImpl,
+			},
+			{},
+		);
+
+		await expect(flow.generateAuthUrl("state", "http://127.0.0.1:53190/callback")).rejects.toThrow(
+			/HTTP 403.*unapproved_client.*approved list.*oauth\.clientId/s,
+		);
+		expect(authorizationRequests).toBe(0);
+	});
+
+	it.each([
+		["server error", 503, "upstream unavailable"],
+		["rate limit", 429, "slow down"],
+		["invalid client metadata", 400, '{"error":"invalid_client_metadata"}'],
+		["unrelated forbidden response", 403, "Forbidden"],
+	] as const)("keeps the clientless authorization fallback after a %s DCR failure", async (_case, status, body) => {
+		let authorizationProbes = 0;
+		const fetchImpl: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "https://provider.example/oauth/register") {
+				return new Response(body, { status });
+			}
+			if (url.startsWith("https://provider.example/authorize?")) {
+				authorizationProbes += 1;
+				return new Response("ok", { status: 200 });
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		};
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+				registrationUrl: "https://provider.example/oauth/register",
+				fetch: fetchImpl,
+			},
+			{},
+		);
+
+		const { url } = await flow.generateAuthUrl("state", "http://127.0.0.1:53192/callback");
+
+		expect(new URL(url).searchParams.has("client_id")).toBe(false);
+		expect(authorizationProbes).toBe(1);
+	});
+
+	it("names the missing-DCR case when no registration endpoint is advertised", async () => {
+		const fetchImpl: FetchImpl = async input => {
+			const url = String(input);
+			// Well-known metadata exists but omits `registration_endpoint`.
+			if (url === "https://provider.example/.well-known/oauth-authorization-server") {
+				return new Response(JSON.stringify({ issuer: "https://provider.example" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url.startsWith("https://provider.example/authorize?")) {
+				return new Response("client_id is required", { status: 400 });
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		};
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+				fetch: fetchImpl,
+			},
+			{},
+		);
+
+		await expect(flow.generateAuthUrl("state", "http://127.0.0.1:53191/callback")).rejects.toThrow(
+			/no dynamic-client-registration endpoint was advertised.*oauth\.clientId/s,
+		);
 	});
 
 	it("accepts pasted redirect URLs through manual input", async () => {

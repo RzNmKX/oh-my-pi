@@ -14,7 +14,7 @@
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { CompactionPreparation, CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
-import type { ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantRetryRecovery, ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { Rule } from "../capability/rule";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry } from "../session/session-entries";
@@ -33,7 +33,7 @@ export interface SessionStartEvent {
 export interface SessionBeforeSwitchEvent {
 	type: "session_before_switch";
 	/** Reason for the switch */
-	reason: "new" | "resume" | "fork";
+	reason: "new" | "resume" | "fork" | "handoff";
 	/** Session file we're switching to (only for "resume") */
 	targetSessionFile?: string;
 }
@@ -42,7 +42,7 @@ export interface SessionBeforeSwitchEvent {
 export interface SessionSwitchEvent {
 	type: "session_switch";
 	/** Reason for the switch */
-	reason: "new" | "resume" | "fork";
+	reason: "new" | "resume" | "fork" | "handoff";
 	/** Session file we came from */
 	previousSessionFile: string | undefined;
 }
@@ -102,6 +102,8 @@ export interface SessionStopEvent {
 	session_id: string;
 	session_file?: string;
 	stop_hook_active: boolean;
+	/** Cancels handler waiting when the active settle pass is aborted. */
+	signal: AbortSignal;
 }
 
 /** Preparation data for tree navigation (used by session_before_tree event) */
@@ -191,6 +193,12 @@ export interface AgentStartEvent {
 export interface AgentEndEvent {
 	type: "agent_end";
 	messages: AgentMessage[];
+	/**
+	 * When true, the session has already scheduled an automatic continuation
+	 * (auto-retry, empty/unexpected-stop retry, etc.). Subscribers must not
+	 * treat this as a user-visible terminal settle.
+	 */
+	willContinue?: boolean;
 }
 
 /** Fired at the start of each turn */
@@ -241,12 +249,20 @@ export interface AutoRetryStartEvent {
 	errorId?: number;
 }
 
+export interface RecoveredRetryError {
+	entryId: string;
+	persistenceKey?: string;
+	note: string;
+	retryRecovery: AssistantRetryRecovery;
+}
+
 /** Fired when auto-retry ends */
 export interface AutoRetryEndEvent {
 	type: "auto_retry_end";
 	success: boolean;
 	attempt: number;
 	finalError?: string;
+	recoveredErrors?: RecoveredRetryError[];
 }
 
 // ============================================================================

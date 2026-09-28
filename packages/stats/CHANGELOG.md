@@ -2,6 +2,76 @@
 
 ## [Unreleased]
 
+## [17.1.2] - 2026-07-24
+
+### Added
+
+- Added a Providers dashboard section: per-provider totals, stacked token/cost burn over time, peak-burn-hours histogram, subscription-window insights (windows burned, estimated tokens per window, peak concurrent utilization, ideal account count, exhaustion events), and latest window utilization per account — window analytics read the auth broker's `/v1/usage/history` when a broker is configured (falling back to the local agent DB), since broker deployments record usage history on the broker host
+
+## [17.1.0] - 2026-07-24
+
+### Fixed
+
+- Fixed an issue where malformed persisted content blocks could abort stats ingestion for subsequent projects, and ensured pending full-session migrations are properly settled after successful backfills.
+
+## [17.0.6] - 2026-07-20
+
+### Changed
+
+- Clarified overview token accounting by separating uncached input from cache reads and showing the conversation-token total used by the agent breakdown.
+
+## [17.0.5] - 2026-07-18
+
+### Fixed
+
+- Fixed an EADDRINUSE error by properly reusing the live stats dashboard on the requested port and reclaiming stale listeners (#5970).
+
+## [17.0.2] - 2026-07-17
+
+### Fixed
+
+- Fixed the Recent Errors list to honor the selected dashboard time range before returning the newest 50 failures.
+
+## [16.4.7] - 2026-07-12
+
+### Fixed
+
+- Fixed a `SQLITE_CONSTRAINT_NOTNULL` crash (`messages.stop_reason`) aborting the entire session sync when a persisted assistant message lacks a `stopReason`. Malformed entries — missing stop reason, token counts, or message timestamp — are now coerced at the parser boundary, and entries with no usage or model attribution are skipped instead of failing the batch insert.
+
+## [16.4.2] - 2026-07-10
+
+### Fixed
+
+- Fixed a crash during stats synchronization on legacy session entries that lack a cost breakdown by falling back to catalog pricing when available.
+
+## [16.3.9] - 2026-07-06
+
+### Changed
+
+- Refined behavior metrics to significantly reduce false positives in profanity, yelling, and anguish detection by excluding technical terms (e.g., "dummy", "trash", "garbage"), neutral punctuation (e.g., dot runs), and single-word capitalization (e.g., filenames or environment variables).
+- Re-categorized frustration interjections (such as "ugh", "argh", and "grr") from profanity to anguish.
+- Improved negation and blame detection to exclude determiners (e.g., "no auto start") and compounds (e.g., "no-op") while adding support for phrases like "why did you" and "makes no sense".
+- Added sad emoticons as a signal for anguish while excluding code-like patterns.
+- Triggered a one-time automatic re-ingestion of sessions on the next database sync to apply the updated metrics.
+
+## [16.3.7] - 2026-07-05
+
+### Changed
+
+- Optimized session-entry lookup and file reading performance by caching file metadata to avoid repeated full-file scans.
+
+## [16.3.1] - 2026-07-02
+
+### Added
+
+- Added a Tools tab to the `omp stats` dashboard (`/#/tools`): per-tool call counts, error rates, result/argument payload sizes, per-model breakdown, and a stacked calls-over-time chart. Token and cost columns attribute each invoking turn's real provider usage evenly across that turn's tool calls. Existing databases re-parse sessions once on the next sync to backfill historical tool calls.
+
+## [16.2.7] - 2026-06-30
+
+### Fixed
+
+- Improved premium request calculation accuracy by correctly accounting for specific model families.
+
 ## [16.2.6] - 2026-06-29
 
 ### Fixed

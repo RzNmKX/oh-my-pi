@@ -129,9 +129,9 @@ const modelSegment: StatusLineSegment = {
 
 		// Fast-mode icon and thinking-level suffix trail the model name and are
 		// colored together with it as `statusLineModel`. The advisor "++" badge
-		// sits between the name and that tail in `accent`, so it reads as a
-		// distinct marker. theme.fg resets only the fg, so the spans are
-		// concatenated (not nested) to keep each color intact.
+		// sits between the name and that tail, so it reads as a distinct marker.
+		// theme.fg resets only the fg, so the spans are concatenated (not
+		// nested) to keep each color intact.
 		let tail = "";
 		if (ctx.session.isFastModeActive() && theme.icon.fast) {
 			tail += ` ${theme.icon.fast}`;
@@ -141,10 +141,25 @@ const modelSegment: StatusLineSegment = {
 		}
 
 		// `statusLineModel` is aliased to `accent` in many themes, so the badge
-		// uses `success` to stay visibly distinct from the model name color.
+		// uses status colors to stay visibly distinct from the model name color.
 		let content = theme.fg("statusLineModel", withIcon(modelIcon, modelName));
-		if (ctx.session.isAdvisorActive()) {
-			content += theme.fg("success", "++");
+		// Advisor "++" badge, colored by the worst status in the roster:
+		// success = all running, warning = quota-exhausted, error = failed,
+		// dim = everything paused/no-model. Per-advisor detail lives in
+		// `/advisor status`.
+		// Optional chaining: lightweight session doubles (test mocks) that don't
+		// implement getAdvisorStatusOverview skip the badge instead of crashing.
+		const advisorStats = ctx.session.getAdvisorStatusOverview?.();
+		if (advisorStats?.configured && advisorStats.advisors.length > 0) {
+			const statuses = advisorStats.advisors.map(a => a.status);
+			const badgeColor = statuses.includes("error")
+				? "error"
+				: statuses.includes("quota_exhausted")
+					? "warning"
+					: statuses.includes("running")
+						? "success"
+						: "dim";
+			content += theme.fg(badgeColor, "++");
 		}
 		if (tail) {
 			content += theme.fg("statusLineModel", tail);
@@ -195,6 +210,19 @@ function renderGoalMode(ctx: SegmentContext, mode: { enabled: boolean; paused: b
 	return { content: theme.fg(color, parts.join(" ")), visible: true };
 }
 
+function formatLoopLimit(limit: NonNullable<SegmentContext["loopMode"]>["limit"]): string | undefined {
+	if (!limit) return undefined;
+	if (limit.kind === "iterations") return `${limit.remaining}/${limit.initial}`;
+
+	const totalSeconds = Math.max(0, Math.ceil((limit.deadlineMs - Date.now()) / 1_000));
+	const hours = Math.floor(totalSeconds / 3_600);
+	const minutes = Math.floor((totalSeconds % 3_600) / 60);
+	const seconds = totalSeconds % 60;
+	if (hours > 0) return `${hours}h${minutes > 0 ? `${minutes}m` : ""} left`;
+	if (minutes > 0) return `${minutes}m${seconds > 0 ? `${seconds}s` : ""} left`;
+	return `${seconds}s left`;
+}
+
 const modeSegment: StatusLineSegment = {
 	id: "mode",
 	render(ctx) {
@@ -208,15 +236,31 @@ const modeSegment: StatusLineSegment = {
 			return { content: theme.fg(color, content), visible: true };
 		}
 
+		const prewalk = ctx.prewalk;
+		if (prewalk?.enabled) {
+			const content = withIcon(theme.icon.prewalk, "Prewalk");
+			return { content: theme.fg("accent", content), visible: true };
+		}
+
 		const goal = ctx.goalMode;
 		if (goal && (goal.enabled || goal.paused)) {
 			return renderGoalMode(ctx, goal);
 		}
 
+		const vibe = ctx.vibeMode;
+		if (vibe?.enabled) {
+			const content = withIcon(theme.icon.agents, "Vibe");
+			return { content: theme.fg("accent", content), visible: true };
+		}
+
 		const loop = ctx.loopMode;
-		if (loop?.enabled) {
-			const content = withIcon(theme.icon.loop, "Loop");
-			return { content: theme.fg("customMessageLabel", content), visible: true };
+		if (loop) {
+			const icon = loop.state === "paused" ? theme.icon.pause || theme.icon.loop : theme.icon.loop;
+			const color: ThemeColor = loop.state === "paused" ? "warning" : "customMessageLabel";
+			const parts = [withIcon(icon, `Loop ${loop.state}`)];
+			const limit = formatLoopLimit(loop.limit);
+			if (limit) parts.push(limit);
+			return { content: theme.fg(color, parts.join(" ")), visible: true };
 		}
 
 		return { content: "", visible: false };
@@ -362,10 +406,11 @@ const tokenTotalSegment: StatusLineSegment = {
 	id: "token_total",
 	render(ctx) {
 		// Excludes cacheRead: that field re-reads the full cached context every
-		// turn, making the cumulative sum N×context_size. The dedicated cache_read
-		// segment handles cache monitoring; the cost segment handles billing.
-		const { input, output, cacheWrite } = ctx.usageStats;
-		const total = input + output + cacheWrite;
+		// turn, making the cumulative sum N×context_size. Orchestration cache read
+		// follows the same rule; orchestration input/output remain in the total so
+		// provider-side service work is preserved without labeling it prompt input.
+		const { input, output, cacheWrite, orchestrationInput, orchestrationOutput } = ctx.usageStats;
+		const total = input + output + cacheWrite + orchestrationInput + orchestrationOutput;
 		if (!total) return { content: "", visible: false };
 
 		const content = withIcon(theme.icon.tokens, formatNumber(total));
@@ -379,7 +424,7 @@ const tokenRateSegment: StatusLineSegment = {
 		const { tokensPerSecond } = ctx.usageStats;
 		if (!tokensPerSecond) return { content: "", visible: false };
 
-		const content = withIcon(theme.icon.output, `${tokensPerSecond.toFixed(1)}/s`);
+		const content = withIcon(theme.icon.throughput, `${tokensPerSecond.toFixed(1)} tok/s`);
 		return { content: theme.fg("statusLineOutput", content), visible: true };
 	},
 };
@@ -388,11 +433,12 @@ const costSegment: StatusLineSegment = {
 	id: "cost",
 	render(ctx) {
 		const { cost, premiumRequests } = ctx.usageStats;
+		const advisorCost = ctx.session.getAdvisorCost?.() ?? 0;
 		const normalizedPremiumRequests = normalizePremiumRequests(premiumRequests);
 		const state = ctx.session.state;
 		const usingSubscription = state.model ? ctx.session.modelRegistry.isUsingOAuth(state.model) : false;
 
-		if (!cost && !usingSubscription && !normalizedPremiumRequests) {
+		if (!cost && !advisorCost && !usingSubscription && !normalizedPremiumRequests) {
 			return { content: "", visible: false };
 		}
 
@@ -400,6 +446,7 @@ const costSegment: StatusLineSegment = {
 		if (cost) billingParts.push(`$${cost.toFixed(2)}`);
 		if (normalizedPremiumRequests) billingParts.push(`★ ${formatNumber(normalizedPremiumRequests)}`);
 		if (usingSubscription) billingParts.push("(sub)");
+		if (advisorCost) billingParts.push(`${billingParts.length ? "+ " : ""}$${advisorCost.toFixed(2)} (adv)`);
 
 		return { content: theme.fg("statusLineCost", billingParts.join(" ")), visible: true };
 	},
@@ -498,7 +545,7 @@ const cacheReadSegment: StatusLineSegment = {
 		const { cacheRead } = ctx.usageStats;
 		if (!cacheRead) return { content: "", visible: false };
 
-		const parts = [theme.icon.cache, theme.icon.output, formatNumber(cacheRead)].filter(Boolean);
+		const parts = [theme.icon.cache, formatNumber(cacheRead)].filter(Boolean);
 		const content = parts.join(" ");
 		return { content: theme.fg("statusLineSpend", content), visible: true };
 	},
@@ -510,7 +557,7 @@ const cacheWriteSegment: StatusLineSegment = {
 		const { cacheWrite } = ctx.usageStats;
 		if (!cacheWrite) return { content: "", visible: false };
 
-		const parts = [theme.icon.cache, theme.icon.input, formatNumber(cacheWrite)].filter(Boolean);
+		const parts = [theme.icon.cache, formatNumber(cacheWrite)].filter(Boolean);
 		const content = parts.join(" ");
 		return { content: theme.fg("statusLineOutput", content), visible: true };
 	},
