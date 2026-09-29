@@ -2,10 +2,15 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { Tool as AiTool } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { EvalPreludeDefinition } from "@oh-my-pi/pi-coding-agent/eval/preludes";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EvalTool, getEvalToolDescription } from "@oh-my-pi/pi-coding-agent/tools/eval";
 
-function makeSession(opts: { spawns?: string | null; backends?: Record<string, boolean> }): ToolSession {
+function makeSession(opts: {
+	spawns?: string | null;
+	backends?: Record<string, boolean>;
+	preludes?: () => readonly EvalPreludeDefinition[];
+}): ToolSession {
 	const settings = Settings.isolated();
 	for (const [key, value] of Object.entries(opts.backends ?? {})) settings.set(key as never, value);
 	return {
@@ -13,33 +18,56 @@ function makeSession(opts: { spawns?: string | null; backends?: Record<string, b
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => opts.spawns ?? "*",
+		...(opts.preludes ? { getEvalPreludes: opts.preludes } : {}),
 		settings,
 	} as unknown as ToolSession;
 }
 
-/** Pull the model-facing cell-schema fields (sorted `language` enum + descriptions) from the flat wire schema. */
-function wireCellFields(tool: EvalTool): {
+interface WireProperty {
+	const?: string;
+	enum?: string[];
+	description?: string;
+}
+
+interface EvalWireSchema {
+	type?: string;
+	anyOf?: unknown[];
+	properties?: {
+		action?: WireProperty;
+		language?: WireProperty;
+		code?: WireProperty;
+	};
+}
+
+/** Pull the provider-facing eval fields from its single root object schema. */
+function wireEvalFields(tool: EvalTool): {
+	rootType?: string;
+	hasRootUnion: boolean;
 	languages: string[];
+	actions: string[];
 	languageDescription?: string;
 	codeDescription?: string;
 } {
-	const wire = toolWireSchema(tool as unknown as AiTool) as {
-		properties?: {
-			language?: { enum?: string[]; const?: string; description?: string };
-			code?: { description?: string };
-		};
-	};
-	const props = wire.properties;
-	const language = props?.language;
+	const wire = toolWireSchema(tool as unknown as AiTool) as EvalWireSchema;
+	const language = wire.properties?.language;
+	const action = wire.properties?.action;
 	const languages = Array.isArray(language?.enum)
 		? [...language.enum].sort()
 		: typeof language?.const === "string"
 			? [language.const]
 			: [];
+	const actions = Array.isArray(action?.enum)
+		? [...action.enum]
+		: typeof action?.const === "string"
+			? [action.const]
+			: [];
 	return {
+		rootType: wire.type,
+		hasRootUnion: Array.isArray(wire.anyOf),
 		languages,
+		actions,
 		languageDescription: language?.description,
-		codeDescription: props?.code?.description,
+		codeDescription: wire.properties?.code?.description,
 	};
 }
 
@@ -62,12 +90,52 @@ describe("eval tool description", () => {
 		expect(wildcard).toContain("agent(prompt");
 		expect(denied).not.toContain("agent(prompt");
 	});
+
+	it("hides eval-defined tool guidance when eval.tools.enabled is off", () => {
+		const enabled = getEvalToolDescription({ evalTools: true });
+		const disabled = getEvalToolDescription({ evalTools: false });
+		expect(enabled).toContain("@tool");
+		expect(enabled).toContain("tools?=None");
+		expect(disabled).not.toContain("@tool");
+		expect(disabled).not.toContain("tools?=None");
+	});
+
+	it("composes only current enabled prelude documentation", () => {
+		let enabled = true;
+		const prelude: EvalPreludeDefinition = {
+			name: "fixture",
+			documentation: "CURRENT PRELUDE DOCUMENTATION",
+			javascript: "",
+			python: "",
+			exports: [],
+			enabled: () => enabled,
+			async invoke() {
+				return { content: [] };
+			},
+		};
+		const tool = new EvalTool(makeSession({ preludes: () => [prelude] }));
+		expect(tool.description).toContain("CURRENT PRELUDE DOCUMENTATION");
+		enabled = false;
+		expect(tool.description).not.toContain("CURRENT PRELUDE DOCUMENTATION");
+	});
+
+	it("documents stored Python cells only when Python is enabled", () => {
+		const python = getEvalToolDescription({ py: true, js: true });
+		expect(python).toContain("Every ordinary Python call stores one stable, 1-based cell.");
+		expect(python).toContain('Source changes → `action: "edit"`');
+		expect(python).toContain("`replay` runs an inclusive range in order");
+		expect(python).toContain("`list` returns exact source, last output, revision, run count, and kernel provenance.");
+		expect(python).toContain("`output()` reads task/agent artifacts, not cells.");
+
+		const javascript = getEvalToolDescription({ py: false, js: true });
+		expect(javascript).not.toContain("Python cells:");
+	});
 });
 
 describe("eval tool dynamic schema", () => {
 	// resolveEvalBackends lets PI_* env flags override settings; neutralize them per-test
 	// so the schema is driven purely by the isolated settings (and restore to avoid leaks).
-	const EVAL_ENV_FLAGS = ["PI_PY", "PI_JS", "PI_RB", "PI_JL"] as const;
+	const EVAL_ENV_FLAGS = ["PI_PY", "PI_JS"] as const;
 	let savedEnv: Record<string, string | undefined>;
 	beforeEach(() => {
 		savedEnv = {};
@@ -84,45 +152,73 @@ describe("eval tool dynamic schema", () => {
 		}
 	});
 
-	it("hides rb/jl from the wire schema, summary, description, and examples by default", () => {
+	it("advertises one provider-compatible object schema with Python cell actions", () => {
 		const tool = new EvalTool(makeSession({}));
-		const fields = wireCellFields(tool);
-		// Default config: rb/jl off → the wire schema is byte-identical to the pre-feature py/js one.
+		const fields = wireEvalFields(tool);
+		expect(fields.rootType).toBe("object");
+		expect(fields.hasRootUnion).toBe(false);
 		expect(fields.languages).toEqual(["js", "py"]);
 		expect(fields.languageDescription).toBe('runtime: "py" for the IPython kernel, "js" for the persistent JS VM');
 		expect(fields.codeDescription).toBe("code to run in this eval call, verbatim. Use top-level await freely.");
+		expect(fields.actions).toEqual(["execute", "run", "edit", "replay", "list"]);
 		expect(tool.summary).toBe("Execute Python or JavaScript code in an in-process eval backend");
 		expect(tool.description).not.toMatch(/ruby|julia/i);
-		// Examples must not advertise a disabled backend.
-		const exampleLangs = tool.examples.map(ex => ("call" in ex ? ex.call.language : null));
-		expect(exampleLangs).toEqual(["py", "py", "py"]);
-		expect(tool.examples.some(ex => "call" in ex && ex.call.language === "rb")).toBe(false);
+		const exampleActions = tool.examples.map(ex => ("call" in ex ? ex.call.action : null));
+		expect(exampleActions).toEqual([undefined, undefined, undefined, "run", "edit", "replay", "list"]);
 	});
 
-	it("advertises rb/jl across enum, descriptions, summary, and prelude once enabled", () => {
-		const tool = new EvalTool(makeSession({ backends: { "eval.rb": true, "eval.jl": true } }));
-		const fields = wireCellFields(tool);
-		expect(fields.languages).toEqual(["jl", "js", "py", "rb"]);
-		expect(fields.languageDescription).toBe(
-			'runtime: "py" for the IPython kernel, "js" for the persistent JS VM, "rb" for the persistent Ruby kernel, "jl" for the persistent Julia kernel',
+	it("enforces each action contract without a root schema union", () => {
+		const parameters = new EvalTool(makeSession({})).parameters;
+		expect(() => parameters.assert({ language: "py" })).toThrow(/"code" is required/);
+		expect(() => parameters.assert({ action: "run", language: "js", cell: 1 })).toThrow(
+			/action "run" requires language "py"/,
 		);
-		expect(fields.codeDescription).toContain(
-			"code to run in this eval call, verbatim. Top-level `await` is available in py/js; rb/jl auto-display the last expression like a REPL.",
+		expect(() => parameters.assert({ action: "edit", language: "py", cell: 1 })).toThrow(
+			/"cell" and "edits" are required/,
 		);
-		expect(tool.summary).toBe("Execute Python, JavaScript, Ruby, or Julia code in a persistent eval backend");
-		expect(tool.description).toMatch(/ruby/i);
-		expect(tool.description).toMatch(/julia/i);
-		// Ruby examples appear once rb is enabled.
-		const rbExampleLangs = tool.examples.filter(ex => "call" in ex && ex.call.language === "rb");
-		expect(rbExampleLangs.length).toBe(2);
+		expect(() => parameters.assert({ action: "run", language: "py", cell: 0 })).toThrow(/"cell" is required/);
+		expect(
+			parameters.assert({
+				language: "py",
+				code: "value = 41",
+				cell: 0,
+				from: 0,
+				through: 0,
+				edits: [],
+			}),
+		).toMatchObject({ language: "py", code: "value = 41" });
+		const extras = {
+			code: "x = 1",
+			from: 1,
+			through: 3,
+			edits: [{ old: "x = 1", new: "x = 2" }],
+			title: "setup",
+			timeout: 30,
+			reset: false,
+		};
+		expect(parameters.assert({ action: "run", language: "py", cell: 1, ...extras })).toMatchObject({
+			action: "run",
+			language: "py",
+			cell: 1,
+		});
+		expect(parameters.assert({ action: "list", language: "py", ...extras })).toMatchObject({
+			action: "list",
+			language: "py",
+		});
+		expect(parameters.assert({ action: "run", language: "py", cell: 1 })).toEqual({
+			action: "run",
+			language: "py",
+			cell: 1,
+		});
 	});
 
-	it("advertises only the enabled subset of optional backends", () => {
-		const tool = new EvalTool(makeSession({ backends: { "eval.rb": true } }));
-		const fields = wireCellFields(tool);
-		expect(fields.languages).toEqual(["js", "py", "rb"]);
-		expect(tool.summary).toBe("Execute Python, JavaScript, or Ruby code in a persistent eval backend");
-		expect(tool.description).toMatch(/ruby/i);
-		expect(tool.description).not.toMatch(/julia/i);
+	it("omits Python cell actions when only JavaScript is enabled", () => {
+		const tool = new EvalTool(makeSession({ backends: { "eval.py": false, "eval.js": true } }));
+		const fields = wireEvalFields(tool);
+		expect(fields.rootType).toBe("object");
+		expect(fields.hasRootUnion).toBe(false);
+		expect(fields.languages).toEqual(["js"]);
+		expect(fields.actions).toEqual(["execute"]);
+		expect(tool.description).not.toContain("Python cells:");
 	});
 });

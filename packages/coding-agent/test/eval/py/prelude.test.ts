@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import { $which } from "@oh-my-pi/pi-utils";
 import { PYTHON_PRELUDE } from "../../../src/eval/py/prelude";
 
-const pythonPath = Bun.env.PYTHON ?? "python3";
+const pythonPath = Bun.env.PYTHON ?? ($which("python3") ? "python3" : "python");
 
 async function runPrelude(
 	code: string,
@@ -22,7 +23,8 @@ async function runPrelude(
 		new Response(proc.stderr).text(),
 		proc.exited,
 	]);
-	return { stdout, stderr, exitCode };
+	// Python's text-mode stdout emits \r\n on Windows.
+	return { stdout: stdout.replaceAll("\r\n", "\n"), stderr: stderr.replaceAll("\r\n", "\n"), exitCode };
 }
 
 describe("python prelude", () => {
@@ -39,6 +41,46 @@ describe("python prelude", () => {
 		expect(signature).not.toContain("*,");
 		expect(signature).toContain("offset");
 		expect(signature).toContain("limit");
+	});
+
+	it("infers eval tool schemas and replaces definitions by name", async () => {
+		const result = await runPrelude(
+			[
+				"from typing import Annotated, Literal, Optional",
+				"@tool",
+				"def word_count(text: Annotated[str, 'Text to split'], sep: Literal[' ', ','] = ' ', limit: Optional[int] = None) -> dict:",
+				'    """Count words in text."""',
+				"    return {'count': len(text.split(sep))}",
+				"first = __omp_tools__['word_count'].describe()",
+				"@tool(name='word_count', description='Replacement')",
+				"def replacement(text: str) -> dict:",
+				"    return {'count': 1}",
+				"print(json.dumps({'first': first, 'current': __omp_tools__['word_count'].describe(), 'defined': tool.defined()}, sort_keys=True))",
+				"print(tool.undefine('word_count'), tool.defined())",
+			].join("\n"),
+			{},
+		);
+
+		expect(result.exitCode).toBe(0);
+		const lines = result.stdout.trim().split("\n");
+		const value = JSON.parse(lines[0] ?? "{}");
+		expect(value.first).toEqual({
+			name: "word_count",
+			description: "Count words in text.",
+			parameters: {
+				type: "object",
+				properties: {
+					text: { type: "string", description: "Text to split" },
+					sep: { enum: [" ", ","], default: " " },
+					limit: { anyOf: [{ type: "integer" }, { type: "null" }], default: null },
+				},
+				required: ["text"],
+				additionalProperties: false,
+			},
+		});
+		expect(value.current.description).toBe("Replacement");
+		expect(value.defined).toEqual(["word_count"]);
+		expect(lines[1]).toBe("True []");
 	});
 
 	it("appends line selectors to delegated URI paths", async () => {
@@ -89,16 +131,64 @@ describe("python prelude", () => {
 		}
 	});
 
-	it("exposes isolation artifacts on the agent() handle node", () => {
-		// agent(..., handle=True) is the only escape hatch for
-		// recovering apply=False patch/branch/nested artifacts (the bare
-		// schema return is just the parsed object), so the helper MUST
-		// translate the bridge's camelCase details onto the node — otherwise
-		// an isolated apply=False workflow loses captured nested patches.
-		expect(PYTHON_PRELUDE).toContain('("patchPath", "patch_path")');
-		expect(PYTHON_PRELUDE).toContain('("branchName", "branch_name")');
-		expect(PYTHON_PRELUDE).toContain('("nestedPatches", "nested_patches")');
-		expect(PYTHON_PRELUDE).toContain('("changesApplied", "changes_applied")');
-		expect(PYTHON_PRELUDE).toContain('("isolationSummary", "isolation_summary")');
+	it("bypasses discovered proxies for loopback bridge calls", async () => {
+		let proxyRequests = 0;
+		const bridge = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: async request => {
+				const body = (await request.json()) as { name?: string; args?: { path?: string } };
+				return Response.json({
+					ok: true,
+					value: body.args?.path,
+				});
+			},
+		});
+		const proxy = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () => {
+				proxyRequests++;
+				return new Response("proxy intercepted", { status: 502 });
+			},
+		});
+
+		try {
+			const proxyUrl = proxy.url.toString();
+			// urllib also reads macOS SystemConfiguration; environment injection
+			// is the hermetic equivalent for this subprocess test.
+			const result = await runPrelude(
+				[
+					"async def main():",
+					'    paths = ["one.ts", "two.ts", "three.ts"]',
+					"    results = []",
+					"    for path in paths:",
+					'        results.append(await tool.read({"path": path}))',
+					"    print(results)",
+					"asyncio.run(main())",
+				].join("\n"),
+				{
+					PI_TOOL_BRIDGE_URL: bridge.url.toString(),
+					PI_TOOL_BRIDGE_TOKEN: "test-token",
+					PI_TOOL_BRIDGE_SESSION: "test-session",
+					HTTP_PROXY: proxyUrl,
+					http_proxy: proxyUrl,
+					ALL_PROXY: proxyUrl,
+					all_proxy: proxyUrl,
+					NO_PROXY: "",
+					no_proxy: "",
+				},
+			);
+
+			expect(result).toEqual({
+				stdout: "['one.ts', 'two.ts', 'three.ts']\n",
+				stderr: "",
+				exitCode: 0,
+			});
+			expect(proxyRequests).toBe(0);
+		} finally {
+			bridge.stop(true);
+			proxy.stop(true);
+		}
 	});
 });

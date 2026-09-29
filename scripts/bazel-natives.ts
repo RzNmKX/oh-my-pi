@@ -2,7 +2,7 @@
 /**
  * Canonical Bazel driver for the shipping pi_natives addons.
  *
- * Usage: bun scripts/bazel-natives.ts <target>... [--dest <dir>] [-- <extra bazel args>]
+ * Usage: bun scripts/bazel-natives.ts <target>... [--dest <dir>] [--source <dir>] [-- <extra bazel args>]
  *
  * Targets are the //:natives-* names from BUILD.bazel (e.g. linux-x64-baseline,
  * darwin-arm64) plus three pseudo-targets:
@@ -18,13 +18,27 @@
  * Extra args after `--` are passed to bazel verbatim (cache configs, endpoints,
  * headers — see .bazelrc for the cache-rw/cache-ro policy configs).
  *
+ * The `host` pseudo-target builds through the local Cargo/N-API path
+ * (packages/natives/scripts/build-bindings.ts) by default — no bazel needed
+ * for plain host iteration. Bazel is opt-in for host via
+ * `OMP_NATIVE_BUILD_BACKEND=bazel` or by passing extra bazel args after `--`;
+ * explicit //:natives-* targets and aggregates always build through bazel.
+ * Release CI uses that path except for Windows ARM64, which builds `host`
+ * natively on its GitHub-hosted runner.
+ *
+ * Windows hosts: the msvc cc toolchain in bazel/toolchains/msvc only supports
+ * linux/mac exec hosts (its clang-cl+xwin wrappers replace the MSVC a Windows
+ * box already has), so a win32 host cannot run any bazel addon build. `host`
+ * always uses the local napi build there (against installed VS Build Tools);
+ * every other target on a win32 host fails fast with guidance.
+ *
  * Note: musl addons intentionally reuse the plain linux-<arch> filenames, so a
  * `linux-all` copy overwrites the gnu addon with the musl one (and vice versa);
  * CI jobs that ship files always request an explicit disjoint target set.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { detectHostAvx2Support } from "./host-detect";
+import { detectHostAvx2Support, resolveLocalHostAddon } from "./host-detect";
 
 const repoRoot = path.join(import.meta.dir, "..");
 
@@ -118,15 +132,19 @@ export function parseBazelFilesOutput(output: string): string[] {
 	return files;
 }
 
+/** Parsed options for the native addon build and artifact install modes. */
 export interface CliOptions {
 	targets: string[];
 	dest: string | null;
+	source: string | null;
 	bazelArgs: string[];
 }
 
+/** Parse target names and the mutually exclusive build or artifact source options. */
 export function parseCliArgs(argv: string[]): CliOptions {
 	const targets: string[] = [];
 	let dest: string | null = null;
+	let source: string | null = null;
 	const bazelArgs: string[] = [];
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
@@ -134,10 +152,14 @@ export function parseCliArgs(argv: string[]): CliOptions {
 			bazelArgs.push(...argv.slice(i + 1));
 			break;
 		}
-		if (arg === "--dest") {
+		if (arg === "--dest" || arg === "--source") {
 			const value = argv[++i];
-			if (!value) throw new Error("--dest requires a directory argument");
-			dest = value;
+			if (!value) throw new Error(`${arg} requires a directory argument`);
+			if (arg === "--dest") {
+				dest = value;
+			} else {
+				source = value;
+			}
 			continue;
 		}
 		if (arg.startsWith("-")) {
@@ -146,19 +168,18 @@ export function parseCliArgs(argv: string[]): CliOptions {
 		targets.push(arg);
 	}
 	if (targets.length === 0) {
-		throw new Error("Usage: bun scripts/bazel-natives.ts <target>... [--dest <dir>] [-- <extra bazel args>]");
-	}
-	return { targets, dest, bazelArgs };
-}
-
-function resolveBazelBinary(): string {
-	const bin = Bun.which("bazelisk") ?? Bun.which("bazel");
-	if (!bin) {
 		throw new Error(
-			"Neither `bazelisk` nor `bazel` found on PATH. Install bazelisk: https://github.com/bazelbuild/bazelisk",
+			"Usage: bun scripts/bazel-natives.ts <target>... [--dest <dir>] [--source <dir>] [-- <extra bazel args>]",
 		);
 	}
-	return bin;
+	if (source && bazelArgs.length > 0) {
+		throw new Error("--source cannot be combined with extra bazel arguments");
+	}
+	return { targets, dest, source, bazelArgs };
+}
+
+function resolveBazelBinary(): string | null {
+	return Bun.which("bazelisk") ?? Bun.which("bazel");
 }
 
 const STDERR_TAIL_LINES = 40;
@@ -201,43 +222,112 @@ async function installAddon(sourcePath: string, destPath: string): Promise<void>
 	}
 }
 
+/** Build and install the host addon through the local Cargo/N-API path. */
+async function buildLocalHostAddon(host: HostInfo, destDir: string): Promise<void> {
+	const script = path.join(repoRoot, "packages/natives/scripts/build-bindings.ts");
+	console.log(`local host build: using ${path.relative(repoRoot, script)}`);
+	const proc = Bun.spawn([process.execPath, script], {
+		cwd: repoRoot,
+		stdout: "inherit",
+		stderr: "inherit",
+	});
+	const exitCode = await proc.exited;
+	if (exitCode !== 0) process.exit(exitCode || 1);
+
+	const filename = resolveLocalHostAddon(host).filename;
+	const builtPath = path.join(repoRoot, "packages/natives/native", filename);
+	if (path.dirname(builtPath) !== destDir) {
+		await fs.mkdir(destDir, { recursive: true });
+		await installAddon(builtPath, path.join(destDir, filename));
+	}
+	console.log(`installed ${filename} → ${path.join(destDir, filename)}`);
+}
+
 async function main(): Promise<void> {
 	const options = parseCliArgs(process.argv.slice(2));
 	const host: HostInfo = { platform: process.platform, arch: process.arch, avx2: detectHostAvx2Support() };
-	const labels = resolveTargetLabels(options.targets, host);
 	const destDir = options.dest ? path.resolve(options.dest) : path.join(repoRoot, "packages/natives/native");
-	const bazel = resolveBazelBinary();
-	// CI hands cache wiring (remote or disk) through a bazelrc fragment so
-	// endpoint composition stays in .github/actions/bazel-cache.
-	const rcPath = Bun.env.OMP_BAZEL_RC?.trim();
-	const startupArgs = rcPath ? [`--bazelrc=${rcPath}`] : [];
 
-	const buildArgs = [...startupArgs, "build", ...options.bazelArgs, "--", ...labels];
-	console.log(`$ ${path.basename(bazel)} ${buildArgs.join(" ")}`);
-	const build = await runBazel(bazel, buildArgs, "inherit");
-	if (build.exitCode !== 0) {
-		console.error(`\nbazel build failed (exit ${build.exitCode}). stderr tail:\n${build.stderrTail}`);
-		process.exit(build.exitCode || 1);
+	const backend = Bun.env.OMP_NATIVE_BUILD_BACKEND?.trim();
+	if (backend && backend !== "cargo" && backend !== "bazel") {
+		throw new Error(`Unknown OMP_NATIVE_BUILD_BACKEND "${backend}" (expected "cargo" or "bazel")`);
 	}
-
-	// Same flags as the build so cquery resolves the identical configuration.
-	// cquery takes exactly one query expression, so multiple targets join
-	// into a single union rather than positional args.
-	const cquery = await runBazel(
-		bazel,
-		[...startupArgs, "cquery", ...options.bazelArgs, "--output=files", labels.join(" + ")],
-		"pipe",
-	);
+	const hostOnly = options.targets.length === 1 && options.targets[0] === "host";
+	// Backend selection: the host build defaults to the local Cargo/N-API
+	// path; bazel is opt-in for host via OMP_NATIVE_BUILD_BACKEND=bazel or
+	// extra bazel args after `--`. Explicit //:natives-* targets always go
+	// through bazel. win32 hosts can only build `host`, locally (see the msvc
+	// toolchain note in the header).
+	const cargoBackend =
+		backend === "cargo" ||
+		host.platform === "win32" ||
+		(backend !== "bazel" && hostOnly && options.bazelArgs.length === 0);
+	if (cargoBackend && !options.source) {
+		if (!hostOnly) {
+			if (host.platform === "win32") {
+				throw new Error(
+					`Cannot bazel-build [${options.targets.join(", ")}] on a Windows host: the msvc cross ` +
+						"toolchain (bazel/toolchains/msvc) only runs on linux/mac exec hosts. Use `host` here " +
+						"(local napi build via VS Build Tools), or run this script from WSL/linux for cross targets.",
+				);
+			}
+			throw new Error("OMP_NATIVE_BUILD_BACKEND=cargo supports only the host target");
+		}
+		await buildLocalHostAddon(host, destDir);
+		return;
+	}
 	let outputs: string[];
-	if (cquery.exitCode === 0) {
-		outputs = parseBazelFilesOutput(cquery.stdout);
+
+	if (options.source) {
+		const sourceDir = path.resolve(options.source);
+		outputs = conventionOutputPaths(options.targets, host).map(output =>
+			path.join(sourceDir, path.relative("bazel-bin", output)),
+		);
 	} else {
-		console.warn(`bazel cquery failed (exit ${cquery.exitCode}); falling back to bazel-bin path convention`);
-		outputs = conventionOutputPaths(options.targets, host);
-	}
-	if (outputs.length === 0) {
-		console.error("bazel build succeeded but no .node outputs were located");
-		process.exit(1);
+		const labels = resolveTargetLabels(options.targets, host);
+		const bazel = resolveBazelBinary();
+		if (!bazel) {
+			if (options.targets.length !== 1 || options.targets[0] !== "host") {
+				throw new Error(
+					`Neither \`bazelisk\` nor \`bazel\` found on PATH; Cargo fallback supports only the host target, not [${options.targets.join(", ")}]. ` +
+						"Install bazelisk or request `host` for a local Cargo/N-API build.",
+				);
+			}
+			console.log("bazelisk/bazel not found; falling back to the local Cargo/N-API host build");
+			await buildLocalHostAddon(host, destDir);
+			return;
+		}
+		// CI hands cache wiring (remote or disk) through a bazelrc fragment so
+		// endpoint composition stays in .github/actions/bazel-cache.
+		const rcPath = Bun.env.OMP_BAZEL_RC?.trim();
+		const startupArgs = rcPath ? [`--bazelrc=${rcPath}`] : [];
+
+		const buildArgs = [...startupArgs, "build", ...options.bazelArgs, "--", ...labels];
+		console.log(`$ ${path.basename(bazel)} ${buildArgs.join(" ")}`);
+		const build = await runBazel(bazel, buildArgs, "inherit");
+		if (build.exitCode !== 0) {
+			console.error(`\nbazel build failed (exit ${build.exitCode}). stderr tail:\n${build.stderrTail}`);
+			process.exit(build.exitCode || 1);
+		}
+
+		// Same flags as the build so cquery resolves the identical configuration.
+		// cquery takes exactly one query expression, so multiple targets join
+		// into a single union rather than positional args.
+		const cquery = await runBazel(
+			bazel,
+			[...startupArgs, "cquery", ...options.bazelArgs, "--output=files", labels.join(" + ")],
+			"pipe",
+		);
+		if (cquery.exitCode === 0) {
+			outputs = parseBazelFilesOutput(cquery.stdout);
+		} else {
+			console.warn(`bazel cquery failed (exit ${cquery.exitCode}); falling back to bazel-bin path convention`);
+			outputs = conventionOutputPaths(options.targets, host);
+		}
+		if (outputs.length === 0) {
+			console.error("bazel build succeeded but no .node outputs were located");
+			process.exit(1);
+		}
 	}
 
 	const seen = new Map<string, string>();

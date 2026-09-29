@@ -31,6 +31,8 @@ function createHangingSession(): HangingSessionHandle {
 	let abortCount = 0;
 	const { promise: hang, resolve: releaseHang } = Promise.withResolvers<void>();
 	const session: Partial<AgentSession> = {
+		setIrcWakeTurnObserver: () => {},
+		subscribeRunState: () => () => {},
 		state: { messages: [] } as never,
 		agent: { state: { systemPrompt: ["test"] } } as never,
 		extensionRunner: undefined as never,
@@ -48,6 +50,8 @@ function createHangingSession(): HangingSessionHandle {
 		waitForIdle: async () => {
 			await hang;
 		},
+		prepareForHeadlessAdvisorDrain: () => {},
+		waitForAdvisorCatchup: async () => true,
 		getLastAssistantMessage: () => undefined,
 		abort: async () => {
 			abortCount += 1;
@@ -121,6 +125,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		// hang; we only need to assert that NO timeout fires when maxRuntimeMs=0.
 		const settings = Settings.isolated({ "task.maxRuntimeMs": 0 });
 		const fastSession: Partial<AgentSession> = {
+			setIrcWakeTurnObserver: () => {},
+			subscribeRunState: () => () => {},
 			state: { messages: [] } as never,
 			agent: { state: { systemPrompt: ["test"] } } as never,
 			extensionRunner: undefined as never,
@@ -147,6 +153,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			},
 			prompt: async () => true,
 			waitForIdle: async () => {},
+			prepareForHeadlessAdvisorDrain: () => {},
+			waitForAdvisorCatchup: async () => true,
 			getLastAssistantMessage: () => undefined,
 			abort: async () => {},
 			dispose: async () => {},
@@ -209,6 +217,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		const lateDisposed = Promise.withResolvers<void>();
 		const lateSession = {
 			dispose: async () => lateDisposed.resolve(),
+			setIrcWakeTurnObserver: () => {},
+			subscribeRunState: () => () => {},
 		} as unknown as AgentSession;
 		let lateInstall = registry.get("late-generation");
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (options = {}) => {
@@ -245,7 +255,11 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		const cancelled = await run;
 		expect(cancelled.aborted).toBe(true);
 
-		const replacementSession = { dispose: async () => {} } as unknown as AgentSession;
+		const replacementSession = {
+			dispose: async () => {},
+			setIrcWakeTurnObserver: () => {},
+			subscribeRunState: () => () => {},
+		} as unknown as AgentSession;
 		const replacement = registry.register({
 			id: "late-generation",
 			displayName: "replacement B",
@@ -272,6 +286,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		let listenerRef: ((event: AgentSessionEvent) => void) | undefined;
 		let abortCount = 0;
 		const session: Partial<AgentSession> = {
+			setIrcWakeTurnObserver: () => {},
+			subscribeRunState: () => () => {},
 			state: { messages: [] } as never,
 			agent: { state: { systemPrompt: ["test"] } } as never,
 			extensionRunner: undefined as never,
@@ -290,6 +306,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			waitForIdle: async () => {
 				await hang;
 			},
+			prepareForHeadlessAdvisorDrain: () => {},
+			waitForAdvisorCatchup: async () => true,
 			getLastAssistantMessage: () => undefined,
 			abort: async () => {
 				abortCount += 1;
@@ -340,7 +358,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 					type: "toolCall" as const,
 					id: "tool-yield-budget",
 					name: "yield",
-					arguments: { result: { data: { finished: "unvalidated" } } },
+					arguments: { data: { finished: "unvalidated" } },
 				},
 			],
 			stopReason: "toolUse" as const,
@@ -350,6 +368,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		let abortCount = 0;
 		let abortCountBeforeYieldExecutionEnd: number | undefined;
 		const session: Partial<AgentSession> = {
+			setIrcWakeTurnObserver: () => {},
+			subscribeRunState: () => () => {},
 			state: { messages: [] } as never,
 			agent: { state: { systemPrompt: ["test"] } } as never,
 			extensionRunner: undefined as never,
@@ -385,6 +405,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 					isError: false,
 				} as AgentSessionEvent);
 			},
+			prepareForHeadlessAdvisorDrain: () => {},
+			waitForAdvisorCatchup: async () => true,
 			getLastAssistantMessage: () => yieldAssistantMessage as never,
 			abort: async () => {
 				abortCount += 1;
@@ -421,7 +443,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 					type: "toolCall" as const,
 					id: "tool-yield-rejected",
 					name: "yield",
-					arguments: { result: { data: { finished: "rejected-before-validation" } } },
+					arguments: { data: { finished: "rejected-before-validation" } },
 				},
 			],
 			stopReason: "toolUse" as const,
@@ -433,7 +455,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 					type: "toolCall" as const,
 					id: "tool-yield-valid",
 					name: "yield",
-					arguments: { result: { data: { finished: "unvalidated-later" } } },
+					arguments: { data: { finished: "unvalidated-later" } },
 				},
 			],
 			stopReason: "toolUse" as const,
@@ -450,6 +472,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		let abortCountBeforeValidYieldExecutionEnd: number | undefined;
 		const promptCalls: Array<{ text: string; options?: PromptOptions }> = [];
 		const session: Partial<AgentSession> = {
+			setIrcWakeTurnObserver: () => {},
+			subscribeRunState: () => () => {},
 			state: { messages: [] } as never,
 			agent: { state: { systemPrompt: ["test"] } } as never,
 			extensionRunner: undefined as never,
@@ -510,6 +534,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 					} as AgentSessionEvent);
 				}
 			},
+			prepareForHeadlessAdvisorDrain: () => {},
+			waitForAdvisorCatchup: async () => true,
 			getLastAssistantMessage: () => lastAssistantMessage as never,
 			abort: async () => {
 				abortCount += 1;
@@ -559,7 +585,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 					type: "toolCall" as const,
 					id: "tool-yield-incremental",
 					name: "yield",
-					arguments: { type: ["findings"], result: { data: { id: "saved" } } },
+					arguments: { type: ["findings"], data: { id: "saved" } },
 				},
 			],
 			stopReason: "toolUse" as const,
@@ -580,6 +606,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		let abortCountBeforeYieldExecutionEnd: number | undefined;
 		let abortCountAfterFollowingTurn: number | undefined;
 		const session: Partial<AgentSession> = {
+			setIrcWakeTurnObserver: () => {},
+			subscribeRunState: () => () => {},
 			state: { messages: [] } as never,
 			agent: { state: { systemPrompt: ["test"] } } as never,
 			extensionRunner: undefined as never,
@@ -627,6 +655,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 				} as unknown as AgentSessionEvent);
 				abortCountAfterFollowingTurn = abortCount;
 			},
+			prepareForHeadlessAdvisorDrain: () => {},
+			waitForAdvisorCatchup: async () => true,
 			getLastAssistantMessage: () => lastAssistantMessage as never,
 			abort: async () => {
 				abortCount += 1;
@@ -663,6 +693,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		// executor must surface it on SingleResult.contextTokens.
 		const settings = Settings.isolated({ "task.maxRuntimeMs": 0 });
 		const fastSession: Partial<AgentSession> = {
+			setIrcWakeTurnObserver: () => {},
+			subscribeRunState: () => () => {},
 			state: { messages: [] } as never,
 			agent: { state: { systemPrompt: ["test"] } } as never,
 			extensionRunner: undefined as never,
@@ -695,6 +727,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			},
 			prompt: async () => true,
 			waitForIdle: async () => {},
+			prepareForHeadlessAdvisorDrain: () => {},
+			waitForAdvisorCatchup: async () => true,
 			getLastAssistantMessage: () => undefined,
 			abort: async () => {},
 			dispose: async () => {},
@@ -713,5 +747,126 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		// here we mock createAgentSession so it stays undefined. The async-task
 		// consumer's assignment is a straight copy, so undefined is acceptable.
 		expect(result.contextWindow).toBeUndefined();
+	});
+
+	it("attributes a budget hard-abort to the budget, not a timer that fires during teardown", async () => {
+		// softRequestBudget=1 -> stop at 1.5 requests, hard abort at 1.5 + grace.
+		// The child burns 8 requests immediately, so the budget kills the run at
+		// t~0. maxRuntimeMs=400 then fires while the budget abort's teardown is
+		// still in flight (abort() holds the run open past the deadline). The
+		// wall-clock timer must not rewrite the already-committed budget outcome.
+		const settings = Settings.isolated({ "task.softRequestBudget": 1, "task.maxRuntimeMs": 400 });
+		const { promise: hang, resolve: releaseHang } = Promise.withResolvers<void>();
+		let listenerRef: ((event: AgentSessionEvent) => void) | undefined;
+		let abortCount = 0;
+		const session: Partial<AgentSession> = {
+			setIrcWakeTurnObserver: () => {},
+			subscribeRunState: () => () => {},
+			state: { messages: [] } as never,
+			agent: { state: { systemPrompt: ["test"] } } as never,
+			extensionRunner: undefined as never,
+			sessionManager: { appendSessionInit: () => {} } as never,
+			getActiveToolNames: () => ["read", "yield"],
+			getEnabledToolNames: () => ["read", "yield"],
+			setActiveToolsByName: async () => {},
+			subscribe: (listener: (event: AgentSessionEvent) => void) => {
+				listenerRef = listener;
+				return () => {};
+			},
+			hasPendingAsyncWork: () => false,
+			prompt: async () => {
+				for (let i = 0; i < 8; i++) {
+					listenerRef?.({
+						type: "message_end",
+						message: { role: "assistant", content: [{ type: "text", text: `step ${i}` }] },
+					} as unknown as AgentSessionEvent);
+				}
+				await hang;
+				return true;
+			},
+			waitForIdle: async () => {
+				await hang;
+			},
+			prepareForHeadlessAdvisorDrain: () => {},
+			waitForAdvisorCatchup: async () => true,
+			getLastAssistantMessage: () => undefined,
+			abort: async () => {
+				abortCount += 1;
+				// Genuine delay: the defect is the real interleaving between the
+				// executor's setTimeout(maxRuntimeMs) and its async teardown, so the
+				// teardown must outlast the deadline against the real clock. Fake
+				// timers would dictate that ordering instead of observing it.
+				await Bun.sleep(1500);
+				releaseHang();
+			},
+			dispose: async () => {},
+		};
+		mockCreateAgentSession(session as AgentSession);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-budget-then-timer", settings });
+
+		expect(abortCount).toBeGreaterThanOrEqual(1);
+		expect(result.aborted).toBe(true);
+		expect(result.abortReason).toContain("Soft request budget exceeded");
+		expect(result.abortReason).not.toContain("runtime limit exceeded");
+	});
+
+	it("does not flip a committed pre-deadline yield to an aborted timeout", async () => {
+		// The child yields a full report at t~0, well inside the 400ms budget.
+		// Post-yield teardown then runs past the deadline; a timer that fires
+		// after the outcome is committed must be a no-op — the run succeeded.
+		const settings = Settings.isolated({ "task.maxRuntimeMs": 400 });
+		let listenerRef: ((event: AgentSessionEvent) => void) | undefined;
+		let abortCount = 0;
+		const session: Partial<AgentSession> = {
+			setIrcWakeTurnObserver: () => {},
+			subscribeRunState: () => () => {},
+			state: { messages: [] } as never,
+			agent: { state: { systemPrompt: ["test"] } } as never,
+			extensionRunner: undefined as never,
+			sessionManager: { appendSessionInit: () => {} } as never,
+			getActiveToolNames: () => ["read", "yield"],
+			getEnabledToolNames: () => ["read", "yield"],
+			setActiveToolsByName: async () => {},
+			subscribe: (listener: (event: AgentSessionEvent) => void) => {
+				listenerRef = listener;
+				return () => {};
+			},
+			hasPendingAsyncWork: () => false,
+			prompt: async () => {
+				listenerRef?.({
+					type: "tool_execution_end",
+					toolCallId: "tool-yield",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "Result submitted." }],
+						details: { status: "success", data: { finding: "complete report" } },
+					},
+					isError: false,
+				} as AgentSessionEvent);
+				return true;
+			},
+			waitForIdle: async () => {},
+			prepareForHeadlessAdvisorDrain: () => {},
+			waitForAdvisorCatchup: async () => true,
+			getLastAssistantMessage: () => undefined,
+			abort: async () => {
+				abortCount += 1;
+				// Genuine delay: post-yield teardown must outlast the real
+				// setTimeout(maxRuntimeMs) so the timer fires after the yield has
+				// committed. See the budget test above for why fake timers do not fit.
+				await Bun.sleep(1500);
+			},
+			dispose: async () => {},
+		};
+		mockCreateAgentSession(session as AgentSession);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-yield-then-timer", settings });
+
+		expect(abortCount).toBeGreaterThanOrEqual(1);
+		expect(result.extractedToolData?.yield).toBeDefined();
+		expect(result.aborted).toBe(false);
+		expect(result.exitCode).toBe(0);
+		expect(result.abortReason).toBeUndefined();
 	});
 });

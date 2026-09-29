@@ -1,0 +1,6 @@
+auth "amazon-bedrock-openai" {
+	name "Amazon Bedrock (OpenAI)"
+	// Same credential chain as amazon-bedrock (SigV4 against bedrock-mantle); no API key.
+	env hook="aws-bedrock-mantle"
+	allows-missing-api-key #true
+}

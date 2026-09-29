@@ -1,0 +1,64 @@
+// Provider-wire compat for "palantir-foundry" (XOS LLM proxy).
+
+provider "palantir-foundry" {
+	// The Anthropic proxy rejects the unrecognized `context_management` field.
+	supports-context-management #false
+	// The Anthropic proxy serves first-party Claude, so it takes the first-party
+	// thinking ladders (mirrors the github-copilot rows in classes/anthropic.kdl,
+	// which enumerate providers and therefore never match this one).
+	class "anthropic" {
+		family "haiku" {
+			thinking-mode "budget"
+		}
+		family "sonnet" {
+			revision ">=3.7 <4.6" {
+				thinking-mode "budget"
+			}
+			revision ">=4.6 <5" {
+				thinking-efforts "low" "medium" "high"
+			}
+		}
+		family "opus" {
+			revision ">=4.5 <4.6" {
+				thinking-mode "anthropic-budget-effort"
+			}
+			revision ">=4.6 <4.7" {
+				thinking-efforts "low" "medium" "high" "max"
+			}
+		}
+		revision ">=4.6 <4.7" {
+			thinking-mode "anthropic-adaptive"
+		}
+		revision ">=4.7 <45.1" {
+			thinking-mode "anthropic-adaptive"
+			thinking-efforts "low" "medium" "high" "xhigh" "max"
+		}
+	}
+	class "openai" {
+		// The OpenAI proxy fronts GPT-5.x on Azure OpenAI deployments whose effort
+		// ladder stops at xhigh. GPT-6+ is served with the full five-tier low..max
+		// ladder (verified live against gpt-6-astra: `max` scales reasoning tokens
+		// above xhigh, while `minimal` and `none` are both 400s), so it keeps the
+		// generic wire-effort rule. priority=1 outranks the class GPT generation
+		// ladders (e.g. minimal..high for <5.2), which tie on specificity.
+		revision ">=5 <6" priority=1 {
+			thinking-efforts "low" "medium" "high" "xhigh"
+			// The proxy passes OpenAI `type: "custom"` tools straight through: a
+			// freeform `apply_patch` call round-trips as a `custom_tool_call` with a
+			// `*** Begin Patch` body (verified live against gpt-5.6-sol).
+			apply-patch-tool-type "freeform"
+		}
+		// Exact id outranks the class `*codex-mini*` medium/high glob.
+		models "gpt-5.1-codex-mini" {
+			thinking-efforts "low" "medium" "high" "xhigh"
+		}
+		// Every non-GPT-6 OpenAI-proxy row shares the Azure low..xhigh ladder.
+		family "o-series" {
+			thinking-efforts "low" "medium" "high" "xhigh"
+		}
+	}
+	// Gemma is served on the same OpenAI proxy route.
+	class "gemma" {
+		thinking-efforts "low" "medium" "high" "xhigh"
+	}
+}

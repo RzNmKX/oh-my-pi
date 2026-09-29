@@ -176,7 +176,8 @@ describe("Palantir Foundry provider catalog", () => {
 			requestModelId: "ri.language-model-service..language-model.gpt-5-6-sol",
 			reasoning: true,
 			input: ["text", "image"],
-			cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
+			// Pricing is borrowed from the bundled first-party OpenAI row.
+			cost: { input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5 },
 			contextWindow: 1_050_000,
 			maxTokens: 128_000,
 		});

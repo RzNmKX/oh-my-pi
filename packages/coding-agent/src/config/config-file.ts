@@ -1,8 +1,15 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { OmpErrors, type Type } from "@oh-my-pi/omptype";
 import { getAgentDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
-import { ArkErrors, type Type } from "arktype";
 import { JSONC, YAML } from "bun";
+
+const YAML_MAPPING_HEADER_TRAILING_SPACE = /: +$/gm;
+
+/** Serialize config YAML without Bun's trailing space on block mapping headers. */
+export function stringifyYamlConfig(value: unknown): string {
+	return YAML.stringify(value, null, 2).replace(YAML_MAPPING_HEADER_TRAILING_SPACE, ":");
+}
 
 /** Minimal subset of the AJV ConfigSchemaError shape this module actually relies on. */
 interface ConfigSchemaError {
@@ -46,7 +53,7 @@ function migrateJsonToYml(jsonPath: string, ymlPath: string) {
 			migratedPaths.add(key);
 			return;
 		}
-		fs.writeFileSync(ymlPath, YAML.stringify(parsed, null, 2));
+		fs.writeFileSync(ymlPath, stringifyYamlConfig(parsed));
 		migratedPaths.add(key);
 	} catch (error) {
 		logger.warn("migrateJsonToYml: migration failed", { error: String(error) });
@@ -109,11 +116,11 @@ export class ConfigError extends Error {
 		this.#message = message;
 	}
 
-	get message(): string {
+	override get message(): string {
 		return this.#message;
 	}
 
-	toString(): string {
+	override toString(): string {
 		return this.message;
 	}
 }
@@ -252,7 +259,7 @@ export class ConfigFile<T> implements IConfigFile<T> {
 			}
 
 			const checked = this.schema(parsed);
-			if (checked instanceof ArkErrors) {
+			if (checked instanceof OmpErrors) {
 				const schemaErrors: ConfigSchemaError[] = checked.map(error => ({
 					instancePath: error.path.length === 0 ? "root" : error.path.join("."),
 					message: error.problem,

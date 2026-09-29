@@ -1,0 +1,11 @@
+// Provider-wire compat for "amazon-bedrock-openai" (SigV4 Responses on bedrock-mantle).
+
+provider "amazon-bedrock-openai" {
+	class "openai" {
+		// First-party GPT Responses SKUs on mantle take the freeform apply_patch
+		// custom tool, same as the first-party OpenAI API.
+		revision ">=5 <7" {
+			apply-patch-tool-type "freeform"
+		}
+	}
+}

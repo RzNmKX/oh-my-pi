@@ -19,7 +19,7 @@ import * as logger from "@oh-my-pi/pi-utils/logger";
 import type { ModelManagerOptions } from "../model-manager";
 import { getBundledModels } from "../models";
 import { createBundledReferenceMap } from "../provider-models/bundled-references";
-import { fetchModelsDevPayload, mapBedrockModelsDevReferences } from "../provider-models/openai-compat";
+import { fetchWellKnownModels, mapBedrockModelsDevReferences } from "../provider-models/openai-compat";
 import type { Api, FetchImpl, ModelSpec } from "../types";
 import { cleanModelName, isRecord } from "../utils";
 
@@ -144,7 +144,7 @@ async function listFoundationModels(config: BedrockDiscoveryConfig): Promise<Fou
 async function loadModelsDevReferences(fetchImpl: FetchImpl | undefined): Promise<Map<string, ModelSpec<Api>>> {
 	const references = new Map<string, ModelSpec<Api>>();
 	try {
-		for (const model of mapBedrockModelsDevReferences(await fetchModelsDevPayload(fetchImpl))) {
+		for (const model of mapBedrockModelsDevReferences(await fetchWellKnownModels(fetchImpl))) {
 			references.set(model.id, model);
 		}
 	} catch (error) {

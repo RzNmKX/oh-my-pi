@@ -43,10 +43,8 @@ import {
 } from "./render-utils";
 export const EVAL_DEFAULT_PREVIEW_LINES = 10;
 
-function languageForHighlighter(language: EvalLanguage | undefined): "python" | "javascript" | "ruby" | "julia" {
+function languageForHighlighter(language: EvalLanguage | undefined): "python" | "javascript" {
 	if (language === "js") return "javascript";
-	if (language === "ruby") return "ruby";
-	if (language === "julia") return "julia";
 	return "python";
 }
 
@@ -57,9 +55,15 @@ interface EvalRenderCellArg {
 }
 
 interface EvalRenderArgs {
+	action?: "execute" | "run" | "edit" | "replay" | "list";
 	language?: string;
 	code?: string;
 	title?: string;
+	cell?: number;
+	edits?: Array<{ old?: string; new?: string }>;
+	from?: number;
+	through?: number;
+	reset?: boolean;
 	cells?: EvalRenderCellArg[];
 	__partialJson?: string;
 }
@@ -79,8 +83,6 @@ interface EvalRenderCell {
 
 function normalizeRenderLanguage(value: string | undefined): EvalLanguage {
 	if (value === "js") return "js";
-	if (value === "rb" || value === "ruby") return "ruby";
-	if (value === "jl" || value === "julia") return "julia";
 	return "python";
 }
 
@@ -99,6 +101,25 @@ function getRenderCells(args: EvalRenderArgs | undefined): EvalRenderCell[] {
 		});
 	}
 	return out;
+}
+
+function formatStoredCellAction(args: EvalRenderArgs): string | undefined {
+	switch (args.action) {
+		case "run":
+			return `Rerun Python cell ${args.cell ?? "?"}`;
+		case "edit": {
+			const count = args.edits?.length;
+			const replacements = count === undefined ? "" : ` (${count} replacement${count === 1 ? "" : "s"})`;
+			return `Edit and rerun Python cell ${args.cell ?? "?"}${replacements}`;
+		}
+		case "replay":
+			return `Replay Python cells ${args.from ?? 1}-${args.through ?? "latest"}${args.reset ? " after reset" : ""}`;
+		case "list":
+			return "List stored Python cells";
+		case "execute":
+		case undefined:
+			return undefined;
+	}
 }
 
 type AgentEventStatus = "pending" | "running" | "completed" | "failed" | "aborted";
@@ -261,6 +282,8 @@ function formatStatusEvent(event: EvalStatusEvent, theme: Theme): string {
 		env: "icon.package",
 		batch: "icon.package",
 		completion: "icon.package",
+		tool_define: "icon.package",
+		workpool: "icon.package",
 		log: "icon.package",
 		phase: "icon.package",
 	};
@@ -325,6 +348,15 @@ function formatStatusEvent(event: EvalStatusEvent, theme: Theme): string {
 			if (data.model) parts.push(String(data.model));
 			if (data.tier && data.tier !== data.model) parts.push(`(${data.tier})`);
 			parts.push(`${data.chars ?? 0} chars`);
+			break;
+		case "tool_define":
+			parts.push(`${data.name}(${(Array.isArray(data.params) ? data.params : []).join(", ")})`);
+			break;
+		case "workpool":
+			parts.push(`${data.action} ${data.pool}`);
+			if (data.count !== undefined) {
+				parts.push(data.action === "create" ? `${data.count} agent(s)` : `${data.count} item(s)`);
+			}
 			break;
 		case "wc":
 			parts.push(`${data.lines}L ${data.words}W ${data.chars}C`);
@@ -500,7 +532,8 @@ export const evalToolRenderer = {
 
 		if (cells.length === 0) {
 			const promptSym = uiTheme.fg("accent", ">>>");
-			const text = formatTitle(`${promptSym} …`, uiTheme);
+			const action = formatStoredCellAction(args);
+			const text = formatTitle(`${promptSym} ${action ?? "…"}`, uiTheme);
 			return new Text(text, 0, 0);
 		}
 
@@ -586,6 +619,10 @@ export const evalToolRenderer = {
 			warningLine = formatStyledTruncationWarning(details.meta, uiTheme) ?? undefined;
 		}
 		const noticeLine = details?.notice ? uiTheme.fg("dim", wrapBrackets(details.notice, uiTheme)) : undefined;
+		const asyncLine =
+			details?.async?.state === "running"
+				? uiTheme.fg("dim", wrapBrackets(`Backgrounded: ${details.async.jobId}`, uiTheme))
+				: undefined;
 
 		const cellResults = details?.cells;
 		if (cellResults && cellResults.length > 0) {
@@ -670,6 +707,9 @@ export const evalToolRenderer = {
 					if (noticeLine) {
 						lines.push(noticeLine);
 					}
+					if (asyncLine) {
+						lines.push(asyncLine);
+					}
 					if (warningLine) {
 						lines.push(warningLine);
 					}
@@ -693,14 +733,19 @@ export const evalToolRenderer = {
 		);
 
 		if (!combinedOutput && statusLines.length === 0) {
-			const lines = [timeoutLine, noticeLine, warningLine].filter(Boolean) as string[];
+			const lines = [timeoutLine, noticeLine, asyncLine, warningLine].filter(Boolean) as string[];
 			return new Text(lines.join("\n"), 0, 0);
 		}
 
 		if (!combinedOutput && statusLines.length > 0) {
-			const lines = [uiTheme.fg("dim", "Status"), ...statusLines, timeoutLine, noticeLine, warningLine].filter(
-				Boolean,
-			) as string[];
+			const lines = [
+				uiTheme.fg("dim", "Status"),
+				...statusLines,
+				timeoutLine,
+				noticeLine,
+				asyncLine,
+				warningLine,
+			].filter(Boolean) as string[];
 			return new Text(lines.join("\n"), 0, 0);
 		}
 
@@ -714,6 +759,7 @@ export const evalToolRenderer = {
 				...(statusLines.length > 0 ? [uiTheme.fg("dim", "Status"), ...statusLines] : []),
 				timeoutLine,
 				noticeLine,
+				asyncLine,
 				warningLine,
 			].filter(Boolean) as string[];
 			return new Text(lines.join("\n"), 0, 0);
@@ -764,6 +810,9 @@ export const evalToolRenderer = {
 				}
 				if (noticeLine) {
 					outputLines.push(truncateToWidth(noticeLine, width));
+				}
+				if (asyncLine) {
+					outputLines.push(truncateToWidth(asyncLine, width));
 				}
 				if (warningLine) {
 					outputLines.push(truncateToWidth(warningLine, width));

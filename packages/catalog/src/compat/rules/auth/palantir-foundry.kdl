@@ -1,0 +1,14 @@
+// Palantir Foundry's XOS LLM proxy fronts multiple provider-native protocols
+// under one enterprise enrollment. Catalog discovery uses Foundry GraphQL, but
+// token validation stays on the OpenAI Responses proxy because the gateway does
+// not publish a conventional `/models` endpoint.
+auth "palantir-foundry" {
+	name "Palantir Foundry"
+	env "PALANTIR_API_KEY"
+	login "api-key" {
+		auth-url "https://xos.bpx.com/workspace/developer-console/"
+		instructions "Create a Foundry service-user token with LLM proxy access and copy it"
+		prompt "Paste your Palantir Foundry token" placeholder="eyJ..."
+		validate "responses" label="Palantir Foundry" base-url="https://xos.bpx.com/api/v2/llm/proxy/openai/v1" model="gpt-5.6-sol"
+	}
+}
