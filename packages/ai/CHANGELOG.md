@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed OpenAI Responses-compatible proxies crashing a turn when the finished reasoning item lists a `null` summary part.
+
 ## [18.17.0] - 2026-11-06
 
 ### Added

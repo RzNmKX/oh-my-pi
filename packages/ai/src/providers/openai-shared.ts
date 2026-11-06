@@ -2965,7 +2965,7 @@ function foldReasoningSummary(parts: ResponseReasoningItem["summary"] | undefine
 	if (!parts) return "";
 	let canonical = "";
 	for (const part of parts) {
-		const text = part.text;
+		const text = part?.text;
 		if (!text || text === canonical) continue;
 		const extendsCanonical = text.startsWith(canonical) && text[canonical.length] === "\n";
 		canonical = !canonical || extendsCanonical ? text : `${canonical}\n\n${text}`;
@@ -2980,7 +2980,9 @@ export function finalizeReasoningThinking(
 	cutoff?: SequentialCutoffSummaryState,
 ): string {
 	if (cutoff) return finalizeCutoffReasoningThinking(item, streamedThinking, cutoff);
-	const summaryThinking = item.summary?.map(part => part.text).join("\n\n") ?? "";
+	// Responses proxies that omit a summary part's payload can finish the item
+	// with `summary: [null]`; those slots carry no text.
+	const summaryThinking = item.summary?.map(part => part?.text).join("\n\n") ?? "";
 	if (summaryThinking) return summaryThinking;
 	const contentThinking = item.content?.[0]?.type === "reasoning_text" ? (item.content[0].text ?? "") : "";
 	return contentThinking || streamedThinking || "";
@@ -2994,7 +2996,7 @@ export function finalizeReasoningThinking(
  * append.
  */
 export function settleReasoningSummary(item: ResponseReasoningItem, block: ThinkingContent): void {
-	const hasSummary = item.summary?.some(part => part.text) ?? false;
+	const hasSummary = item.summary?.some(part => part?.text) ?? false;
 	const hasTrace = item.content?.some(part => part.type === "reasoning_text" && part.text) ?? false;
 	block.summary = hasSummary || (!hasTrace && block.summary === true);
 }
