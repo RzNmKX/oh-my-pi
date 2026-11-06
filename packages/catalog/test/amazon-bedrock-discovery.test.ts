@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	type BedrockSignedGetJson,
 	fetchBedrockConverseModels,
@@ -116,6 +117,12 @@ describe("fetchBedrockConverseModels", () => {
 		expect(opus55.cost.input).toBe(4.4);
 		// ListFoundationModels reports IMAGE input even though the reference row omits it.
 		expect(opus55.input).toContain("image");
+		// Converse takes the full adaptive ladder and rejects `minimal`; the
+		// discovered row must not fall back to the generic Converse ladder.
+		expect(buildModel(opus55).thinking).toMatchObject({
+			mode: "anthropic-adaptive",
+			efforts: ["low", "medium", "high", "xhigh", "max"],
+		});
 	});
 
 	it("follows pagination and skips ids with no metadata instead of defaulting", async () => {

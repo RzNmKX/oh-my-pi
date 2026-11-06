@@ -668,6 +668,18 @@ describe("model thinking derivation", () => {
 		expect(sonnet45.thinking?.mode).toBe("budget");
 		const haiku45 = createModel({ id: "claude-haiku-4-5", api: "anthropic-messages", provider: "anthropic" });
 		expect(haiku45.thinking?.mode).toBe("budget");
+		// Haiku 5.5 rejects budget thinking; it must resolve adaptive instead of
+		// tying the haiku budget rule against the 4.7+ adaptive rule (a throw
+		// that previously failed the entire Bedrock discovery batch).
+		for (const [id, api, provider] of [
+			["claude-haiku-5-5", "anthropic-messages", "anthropic"],
+			["us.anthropic.claude-haiku-5-5", "bedrock-converse-stream", "amazon-bedrock"],
+		] as const) {
+			expect(createModel({ id, api, provider }).thinking).toMatchObject({
+				mode: "anthropic-adaptive",
+				efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
+			});
+		}
 		const sonnet45Bedrock = createModel({
 			id: "us.anthropic.claude-sonnet-4-5-20250929",
 			api: "bedrock-converse-stream",
@@ -710,10 +722,17 @@ describe("model thinking derivation", () => {
 		expect(opus47.thinking?.effortMap).toBeUndefined();
 		expect(() => mapEffortToAnthropicAdaptiveEffort(opus47, Effort.Minimal)).toThrow(/not supported/);
 		expect(mapEffortToAnthropicAdaptiveEffort(mythos, Effort.XHigh)).toBe("xhigh");
-		// Bedrock Converse stays on the four-tier scale regardless of version.
-		expect(getSupportedEfforts(opus47Bedrock)).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.Max]);
+		// Bedrock Converse accepts the same five-tier wire scale and rejects `minimal`.
+		expect(getSupportedEfforts(opus47Bedrock)).toEqual([
+			Effort.Low,
+			Effort.Medium,
+			Effort.High,
+			Effort.XHigh,
+			Effort.Max,
+		]);
 		expect(opus47Bedrock.thinking?.effortMap).toBeUndefined();
-		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet5Bedrock, Effort.XHigh)).toThrow(/not supported/);
+		expect(mapEffortToAnthropicAdaptiveEffort(sonnet5Bedrock, Effort.XHigh)).toBe("xhigh");
+		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet5Bedrock, Effort.Minimal)).toThrow(/not supported/);
 		// Sonnet 4.6 runs adaptive mode on the three-tier low/medium/high scale.
 		expect(getSupportedEfforts(sonnet46)).toEqual([Effort.Low, Effort.Medium, Effort.High]);
 		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet46, Effort.XHigh)).toThrow(/not supported/);

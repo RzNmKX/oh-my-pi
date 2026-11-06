@@ -2207,7 +2207,7 @@ export class ModelRegistry {
 					: providerConfig.compat;
 				const model = buildCustomModelOverlay(
 					providerName,
-					providerConfig.baseUrl!,
+					providerConfig.baseUrl,
 					providerConfig.api as Api | undefined,
 					providerConfig.headers,
 					providerConfig.apiKey,

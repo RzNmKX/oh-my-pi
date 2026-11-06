@@ -20,7 +20,7 @@ const claudeModel: Model<"anthropic-messages"> = buildModel({
 	maxTokens: 128_000,
 });
 
-it("omits unsupported context management from Palantir Claude requests", async () => {
+it("omits unsupported context management and prompt cache controls from Palantir Claude requests", async () => {
 	let capturedBeta: string | null = null;
 	const fetch: FetchImpl = async (_input, init) => {
 		capturedBeta = new Headers(init?.headers).get("anthropic-beta");
@@ -44,6 +44,7 @@ it("omits unsupported context management from Palantir Claude requests", async (
 	};
 	expect(payload.thinking?.type).toBe("adaptive");
 	expect(payload.context_management).toBeUndefined();
+	expect(JSON.stringify(payload)).not.toContain('"cache_control"');
 	expect(capturedBeta ?? "").not.toContain("context-management-2025-06-27");
 });
 

@@ -3,6 +3,8 @@
 provider "palantir-foundry" {
 	// The Anthropic proxy rejects the unrecognized `context_management` field.
 	supports-context-management #false
+	// The Anthropic proxy also rejects block-level `cache_control` markers.
+	supports-prompt-cache-control #false
 	// The Anthropic proxy serves first-party Claude, so it takes the first-party
 	// thinking ladders (mirrors the github-copilot rows in classes/anthropic.kdl,
 	// which enumerate providers and therefore never match this one).

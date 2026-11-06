@@ -2202,7 +2202,8 @@ class CodexStreamProcessor {
 			if (entry?.item.type === "reasoning") {
 				appendReasoningSummaryPart(
 					entry.item,
-					(rawEvent as { part: ResponseReasoningItem["summary"][number] }).part,
+					rawEvent.part,
+					typeof rawEvent.summary_index === "number" ? rawEvent.summary_index : 0,
 				);
 			}
 			return firstTokenTime;
@@ -2270,7 +2271,14 @@ class CodexStreamProcessor {
 				return firstTokenTime;
 			}
 			if (entry?.item.type === "reasoning" && entry.block?.type === "thinking") {
-				appendReasoningSummaryPartDone(entry.item, entry.block, stream, output, entry.contentIndex);
+				appendReasoningSummaryPartDone(
+					entry.item,
+					entry.block,
+					stream,
+					output,
+					entry.contentIndex,
+					typeof rawEvent.summary_index === "number" ? rawEvent.summary_index : 0,
+				);
 			}
 			return firstTokenTime;
 		}

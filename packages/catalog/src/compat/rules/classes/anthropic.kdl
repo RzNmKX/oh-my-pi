@@ -58,7 +58,10 @@ class "anthropic" {
 	on "amazon-bedrock" "anthropic" "cloudflare-ai-gateway" "github-copilot" "gitlab-duo" \
 		"google-vertex" "opencode-zen" "vercel-ai-gateway" {
 		family "haiku" {
-			thinking-mode "budget"
+			// Haiku 5.5+ rejects `thinking.type.enabled` and takes adaptive thinking.
+			revision "<4.7" {
+				thinking-mode "budget"
+			}
 		}
 	}
 	on "amazon-bedrock" "anthropic" "cloudflare-ai-gateway" "github-copilot" "gitlab-duo" \

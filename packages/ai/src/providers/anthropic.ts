@@ -565,7 +565,7 @@ function getCacheControl(
 	// retention remains an explicit PI_CACHE_RETENTION/request override; idle
 	// sessions keep the short entry warm with bounded read-only refreshes.
 	const retention = resolveCacheRetention(cacheRetention, "short");
-	if (retention === "none") {
+	if (retention === "none" || model.compat.supportsPromptCacheControl === false) {
 		return { retention };
 	}
 	const ttl = retention === "long" && model.compat.supportsLongCacheRetention ? "1h" : undefined;

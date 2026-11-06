@@ -857,6 +857,7 @@ function resolveAnthropicPolicy(
 		disableAdaptiveThinking: false,
 		allowAnthropicHeaderOverrides: false,
 		supportsEagerToolInputStreaming: official,
+		supportsPromptCacheControl: true,
 		supportsLongCacheRetention: official,
 		supportsMidConversationSystem: official && !facts.family("sonnet") && facts.anthropicAdaptiveGenAtLeast("4.8"),
 		supportsTurnScopedSystem: false,

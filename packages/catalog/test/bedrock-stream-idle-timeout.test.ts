@@ -33,6 +33,9 @@ describe("Bedrock stream idle-timeout compat", () => {
 			"us.anthropic.claude-opus-4-8",
 			"us.anthropic.claude-sonnet-5",
 			"us.anthropic.claude-opus-5",
+			"global.anthropic.claude-fable-5-1",
+			"us.anthropic.claude-sonnet-5-5",
+			"us.anthropic.claude-opus-5-5",
 		]) {
 			expect(buildModel(bedrockSpec({ id })).compat.streamIdleTimeoutMs).toBe(900_000);
 		}

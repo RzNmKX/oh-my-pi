@@ -200,6 +200,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"signing-endpoint": wire("signingEndpoint", ["anthropic"]),
 	"supports-context-management": wire("supportsContextManagement", ["anthropic"]),
 	"supports-output-effort": wire("supportsOutputEffort", ["anthropic"]),
+	"supports-prompt-cache-control": wire("supportsPromptCacheControl", ["anthropic"]),
 	"supports-eager-tool-input-streaming": wire("supportsEagerToolInputStreaming", ["anthropic"]),
 	"supports-long-cache-retention": wire("supportsLongCacheRetention", ["anthropic"]),
 	"supports-mid-conversation-system": wire("supportsMidConversationSystem", ["anthropic"]),

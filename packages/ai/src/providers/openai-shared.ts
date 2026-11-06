@@ -2452,23 +2452,32 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
  */
 type ResponsesToolCallBlock = ToolCall & { [kStreamingPartialJson]: string; [kStreamingLastParseLen]?: number };
 
-function ensureReasoningSummaryPart(
-	item: ResponseReasoningItem,
-	summaryIndex: number,
-): ResponseReasoningItem["summary"][number] {
-	item.summary = item.summary || [];
-	while (item.summary.length <= summaryIndex) {
-		item.summary.push({ type: "summary_text", text: "" });
-	}
-	return item.summary[summaryIndex]!;
+type ReasoningSummaryPart = ResponseReasoningItem["summary"][number];
+
+function reasoningSummaryPartText(part: unknown): string | undefined {
+	return isRecord(part) && typeof part.text === "string" ? part.text : undefined;
 }
 
-export function appendReasoningSummaryPart(
-	item: ResponseReasoningItem,
-	part: ResponseReasoningItem["summary"][number],
-): void {
-	item.summary = item.summary || [];
-	item.summary.push(part);
+function ensureReasoningSummaryPart(
+	item: { summary: ResponseReasoningItem["summary"] | undefined },
+	summaryIndex: number,
+): ReasoningSummaryPart {
+	item.summary = Array.isArray(item.summary) ? item.summary : [];
+	const index = Number.isSafeInteger(summaryIndex) && summaryIndex >= 0 ? summaryIndex : 0;
+	while (item.summary.length <= index) {
+		item.summary.push({ type: "summary_text", text: "" });
+	}
+	const existing = item.summary[index];
+	if (reasoningSummaryPartText(existing) !== undefined) return existing;
+	const replacement: ReasoningSummaryPart = { type: "summary_text", text: "" };
+	item.summary[index] = replacement;
+	return replacement;
+}
+
+export function appendReasoningSummaryPart(item: ResponseReasoningItem, part: unknown, summaryIndex: number): void {
+	const target = ensureReasoningSummaryPart(item, summaryIndex);
+	const text = reasoningSummaryPartText(part);
+	if (text !== undefined) target.text = text;
 }
 
 /**
@@ -2492,11 +2501,11 @@ export function createSequentialCutoffSummaryState(): SequentialCutoffSummarySta
 }
 
 // Sequential-cutoff streams may repeat the full canonical summary as later parts.
-function foldReasoningSummary(parts: ResponseReasoningItem["summary"] | undefined): string {
-	if (!parts) return "";
+function foldReasoningSummary(parts: unknown): string {
+	if (!Array.isArray(parts)) return "";
 	let canonical = "";
 	for (const part of parts) {
-		const text = part.text;
+		const text = reasoningSummaryPartText(part);
 		if (!text || text === canonical) continue;
 		const extendsCanonical = text.startsWith(canonical) && text[canonical.length] === "\n";
 		canonical = !canonical || extendsCanonical ? text : `${canonical}\n\n${text}`;
@@ -2511,7 +2520,12 @@ export function finalizeReasoningThinking(
 	cutoff?: SequentialCutoffSummaryState,
 ): string {
 	if (cutoff) return finalizeCutoffReasoningThinking(item, streamedThinking, cutoff);
-	const summaryThinking = item.summary?.map(part => part.text).join("\n\n") ?? "";
+	const summaryThinking = Array.isArray(item.summary)
+		? item.summary
+				.map(reasoningSummaryPartText)
+				.filter(text => text !== undefined)
+				.join("\n\n")
+		: "";
 	if (summaryThinking) return summaryThinking;
 	const contentThinking = item.content?.[0]?.type === "reasoning_text" ? (item.content[0].text ?? "") : "";
 	return contentThinking || streamedThinking || "";
@@ -2594,10 +2608,9 @@ export function appendReasoningSummaryPartDone(
 	stream: AssistantMessageEventStream,
 	output: AssistantMessage,
 	contentIndex: number,
+	summaryIndex: number,
 ): void {
-	item.summary = item.summary || [];
-	const lastPart = item.summary[item.summary.length - 1];
-	if (!lastPart) return;
+	const lastPart = ensureReasoningSummaryPart(item, summaryIndex);
 	block.thinking += "\n\n";
 	lastPart.text += "\n\n";
 	stream.push({ type: "thinking_delta", contentIndex, delta: "\n\n", partial: output });
@@ -2622,10 +2635,8 @@ export function applyReasoningSummaryDone(
 	output: AssistantMessage,
 	contentIndex: number,
 ): void {
-	while (state.summary.length <= summaryIndex) {
-		state.summary.push({ type: "summary_text", text: "" });
-	}
-	state.summary[summaryIndex].text = text;
+	const part = ensureReasoningSummaryPart(state, summaryIndex);
+	part.text = text;
 	const after = foldReasoningSummary(state.summary);
 	if (!after.startsWith(state.emitted)) return;
 	let delta = after.slice(state.emitted.length);
@@ -3112,7 +3123,9 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 		} else if (event.type === "response.reasoning_summary_part.added") {
 			const entry = lookupOpenItem(event);
-			if (entry?.item.type === "reasoning") appendReasoningSummaryPart(entry.item, event.part);
+			if (entry?.item.type === "reasoning") {
+				appendReasoningSummaryPart(entry.item, event.part, event.summary_index);
+			}
 		} else if (event.type === "response.reasoning_summary_text.delta") {
 			const entry = lookupOpenItem(event);
 			if (entry?.item.type === "reasoning" && entry.block.type === "thinking") {
@@ -3142,7 +3155,14 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.reasoning_summary_part.done") {
 			const entry = lookupOpenItem(event);
 			if (entry?.item.type === "reasoning" && entry.block.type === "thinking") {
-				appendReasoningSummaryPartDone(entry.item, entry.block, stream, output, contentIndexOf(entry.block));
+				appendReasoningSummaryPartDone(
+					entry.item,
+					entry.block,
+					stream,
+					output,
+					contentIndexOf(entry.block),
+					event.summary_index,
+				);
 			}
 		} else if (event.type === "response.reasoning_text.delta") {
 			// Raw reasoning text delta from local providers that stream thinking

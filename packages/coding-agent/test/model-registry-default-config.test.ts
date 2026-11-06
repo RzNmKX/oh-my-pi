@@ -76,6 +76,34 @@ describe("ModelRegistry default custom models config", () => {
 		});
 	});
 
+	test("pins a SigV4 Mantle model without moving other models to its region", () => {
+		fs.writeFileSync(
+			path.join(tempDir.path(), "models.yml"),
+			[
+				"providers:",
+				"  amazon-bedrock-openai:",
+				"    models:",
+				"      - id: openai.gpt-6-sol",
+				"        api: bedrock-openai-responses",
+				"        baseUrl: https://bedrock-mantle.us-east-1.api.aws",
+				"        cost: { input: 2.2, output: 11, cacheRead: 0.22, cacheWrite: 2.75 }",
+				"        contextWindow: 1050000",
+				"        maxTokens: 128000",
+				"",
+			].join("\n"),
+		);
+
+		const registry = new ModelRegistry(authStorage);
+		expect(registry.getError()).toBeUndefined();
+		const sol = registry.find("amazon-bedrock-openai", "openai.gpt-6-sol");
+		expect(sol?.api).toBe("bedrock-openai-responses");
+		expect(sol?.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws");
+		expect(sol?.cost.input).toBe(2.2);
+		expect(registry.find("amazon-bedrock-openai", "openai.gpt-6-astra")?.baseUrl).toBe(
+			"https://bedrock-mantle.us-west-2.api.aws",
+		);
+	});
+
 	test("prefers default models.yml over models.yaml when both exist", () => {
 		writeModelsYaml("models.yml", {
 			provider: "yaml-precedence",

@@ -494,6 +494,8 @@ export interface AnthropicCompat {
 	disableAdaptiveThinking?: boolean;
 	/** Whether tools may include Anthropic's per-tool eager_input_streaming flag. Default: true for the canonical Anthropic API. */
 	supportsEagerToolInputStreaming?: boolean;
+	/** Whether requests may include Anthropic `cache_control` breakpoints. Default: true. */
+	supportsPromptCacheControl?: boolean;
 	/** Whether long prompt-cache retention (`ttl: "1h"`) is supported. Default: true for canonical Anthropic API. */
 	supportsLongCacheRetention?: boolean;
 	/**

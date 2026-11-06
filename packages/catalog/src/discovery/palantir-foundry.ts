@@ -82,6 +82,8 @@ export interface PalantirFoundryDiscoveryOptions {
 	apiKey: string;
 	baseUrl?: string;
 	fetch?: FetchImpl;
+	/** Optional exact-id metadata fallback for models newer than the bundled catalog. */
+	resolveReference?: (modelId: string) => ModelSpec<Api> | undefined;
 }
 
 async function executeGraphQl<T>(
@@ -160,7 +162,11 @@ function supportsVision(value: unknown): boolean {
 	return false;
 }
 
-function mapPalantirModel(value: unknown, baseUrl: string): ModelSpec<Api> | null {
+function mapPalantirModel(
+	value: unknown,
+	baseUrl: string,
+	resolveReference?: (modelId: string) => ModelSpec<Api> | undefined,
+): ModelSpec<Api> | null {
 	if (
 		!isRecord(value) ||
 		typeof value.rid !== "string" ||
@@ -215,7 +221,7 @@ function mapPalantirModel(value: unknown, baseUrl: string): ModelSpec<Api> | nul
 	const references = getBundledModelReferenceIndex();
 	let reference: ModelSpec | undefined;
 	for (const referenceId of referenceIds) {
-		reference = resolveModelReference(referenceId, references);
+		reference = resolveReference?.(referenceId) ?? resolveModelReference(referenceId, references);
 		if (reference) break;
 	}
 	if (!reference) {
@@ -298,7 +304,7 @@ export async function fetchPalantirFoundryModels(options: PalantirFoundryDiscove
 			throw new Error("Palantir catalog returned an invalid model page");
 		}
 		for (const value of values) {
-			const model = mapPalantirModel(value, baseUrl);
+			const model = mapPalantirModel(value, baseUrl, options.resolveReference);
 			if (model) models.set(model.id, model);
 		}
 		const nextPageToken = page.languageModelsV4?.nextPageToken;

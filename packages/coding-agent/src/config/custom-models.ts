@@ -64,7 +64,7 @@ function resolveCustomModelIsOAuth(api: Api, providerAuth: ProviderAuthMode | un
 
 export function buildCustomModelOverlay(
 	providerName: string,
-	providerBaseUrl: string,
+	providerBaseUrl: string | undefined,
 	providerApi: Api | undefined,
 	providerHeaders: Record<string, string> | undefined,
 	providerApiKey: string | undefined,
@@ -80,7 +80,7 @@ export function buildCustomModelOverlay(
 		id: modelDef.id,
 		provider: providerName,
 		api,
-		baseUrl: modelDef.baseUrl ?? providerBaseUrl,
+		baseUrl: (modelDef.baseUrl ?? providerBaseUrl)!,
 		name: modelDef.name,
 		reasoning: modelDef.reasoning,
 		thinking: modelDef.thinking,

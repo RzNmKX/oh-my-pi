@@ -9,8 +9,10 @@
 
 ### Fixed
 
+- Fixed Palantir Foundry Claude requests failing with `unrecognizedProperty=cache_control` by allowing Anthropic-compatible providers to disable unsupported prompt-cache breakpoints.
 - Fixed Bedrock Mantle routing and SigV4 signing to use each model's catalog region, enabling GPT-6 Astra in Oregon without moving existing models out of Virginia. Explicit SDK region overrides remain supported, and Astra accepts `max` reasoning.
 - Fixed Palantir native proxy compatibility: Gemini requests use bearer authentication and full catalog RIDs, Claude omits unsupported context-management fields, and OpenAI Responses models can suppress `prompt_cache_key` on xAI-compatible proxies.
+- Fixed OpenAI Responses-compatible proxies crashing a turn when a reasoning-summary event omits its declared part.
 
 ## [18.1.9] - 2026-09-04
 

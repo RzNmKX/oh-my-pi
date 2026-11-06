@@ -4600,12 +4600,18 @@ export function palantirFoundryModelManagerOptions(
 		dynamicModelsAuthoritative: true,
 		...(apiKey
 			? {
-					fetchDynamicModels: () =>
-						fetchPalantirFoundryModels({
+					fetchDynamicModels: async () => {
+						const modelsDevReferences = await fetchWellKnownModels(config?.fetch)
+							.then(payload => createModelsDevReferenceMap<Api>(mapAnthropicModelsDev(payload, baseUrl)))
+							.catch(() => new Map<string, ModelSpec<Api>>());
+						return fetchPalantirFoundryModels({
 							apiKey,
 							baseUrl,
 							fetch: config?.fetch,
-						}),
+							resolveReference: modelId =>
+								modelsDevReferences.get(modelId) ?? modelsDevReferences.get(modelId.replaceAll(".", "-")),
+						});
+					},
 				}
 			: undefined),
 	};

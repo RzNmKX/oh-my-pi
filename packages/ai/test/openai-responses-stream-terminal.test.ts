@@ -775,6 +775,47 @@ describe("processResponsesStream: reasoning summary recovery", () => {
 		]);
 		expect(emitted.find(event => event.type === "thinking_end")?.content).toBe("Let's check");
 	});
+
+	test("recovers when a Responses proxy omits a reasoning summary part", async () => {
+		const output = makeOutput();
+		const emitted: EmittedEvent[] = [];
+		const stream = { push: (e: unknown) => emitted.push(e as EmittedEvent), end: () => {} } as never;
+
+		await processResponsesStream(
+			makeStream([
+				{
+					type: "response.output_item.added",
+					output_index: 0,
+					item: { type: "reasoning", id: "rs_proxy", summary: [] },
+				},
+				{
+					type: "response.reasoning_summary_part.added",
+					output_index: 0,
+					item_id: "rs_proxy",
+					summary_index: 0,
+				},
+				{
+					type: "response.reasoning_summary_text.delta",
+					output_index: 0,
+					item_id: "rs_proxy",
+					summary_index: 0,
+					delta: "Inspecting contract",
+				},
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: { type: "reasoning", id: "rs_proxy", summary: [null] },
+				},
+				{ type: "response.completed", response: { id: "resp_proxy", status: "completed" } },
+			]),
+			output,
+			stream,
+			makeModel(),
+		);
+
+		expect(output.content).toEqual([expect.objectContaining({ type: "thinking", thinking: "Inspecting contract" })]);
+		expect(emitted.find(event => event.type === "thinking_end")?.content).toBe("Inspecting contract");
+	});
 });
 
 describe("processResponsesStream: lost output_item.added recovery", () => {

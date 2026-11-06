@@ -98,13 +98,14 @@ providers:
 - `azure-openai-responses`
 - `anthropic-messages`
 - `bedrock-converse-stream`
+- `bedrock-openai-responses` (SigV4 against Bedrock Mantle)
 - `google-generative-ai`
 - `google-gemini-cli`
 - `google-vertex`
 
 ### Allowed auth/discovery values
 
-- `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
+- `auth`: `apiKey` (default), `none`, or `oauth`; `oauth` uses the provider's OAuth credential, while `amazon-bedrock-openai` uses AWS SigV4 without a configured API key
 - `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, `openai-models-list`, `proxy`, or `litellm`
 - `discovery.injectV1`: optional boolean, default `true`, for `openai-models-list`. Set `false` to fetch the model list from `{baseUrl}/models` without injecting `/v1` — for gateways that root their OpenAI-compatible surface at a versioned path (e.g. `https://api.opper.ai/v3/compat`) where the forced `/v1/models` returns a different, smaller model list. Query strings in `baseUrl` are ignored, matching the default mode.
 - `transport`: `pi-native` only. When set, every model under that provider is sent to an `omp auth-gateway` compatible `baseUrl` via `POST /v1/pi/stream`; `apiKey` is the gateway bearer.
@@ -117,8 +118,8 @@ providers:
 
 Required:
 
-- `baseUrl`
-- `apiKey` unless `auth: none`
+- `baseUrl` at provider level, or on every custom model (use per-model URLs when bundled models in the same provider have different regions)
+- `apiKey` unless `auth: none`, `auth: oauth`, or the built-in `amazon-bedrock-openai` provider uses `bedrock-openai-responses` with AWS SigV4 credentials
 - `api` at provider level or each model
 
 ### Override-only provider (`models` missing or empty)

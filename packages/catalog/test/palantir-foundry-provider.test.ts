@@ -235,6 +235,66 @@ describe("Palantir Foundry provider catalog", () => {
 		expect(requests[2]?.body.requests[0]?.variables.pageToken).toBe("second-page");
 	});
 
+	it("enriches newer Foundry models from models.dev metadata", async () => {
+		const fetchImpl: FetchImpl = async (input, init) => {
+			if (String(input).includes("catalog.stencil.so")) {
+				return new Response(
+					JSON.stringify({
+						anthropic: {
+							models: {
+								"claude-opus-5-5": {
+									name: "Claude Opus 5.5",
+									tool_call: true,
+									reasoning: true,
+									limit: { context: 1_000_000, output: 128_000 },
+									cost: { input: 4, output: 20, cache_read: 0.2, cache_write: 5 },
+									modalities: { input: ["text", "image"] },
+								},
+							},
+						},
+					}),
+					{ headers: { "Content-Type": "application/json" } },
+				);
+			}
+			const body = JSON.parse(String(init?.body)) as RecordedRequest["body"];
+			const operation = body.requests[0];
+			if (operation?.name === "HomeProjectRidQuery") {
+				return sseResponse({ homeProject: { rid: "ri.compass.main.folder.home" } });
+			}
+			return sseResponse({
+				languageModelsV4: {
+					nextPageToken: null,
+					values: [
+						modelRecord({
+							rid: "ri.language-model-service..language-model.anthropic-claude-5-5-opus",
+							displayName: "Claude Opus 5.5",
+							modelCreator: "ANTHROPIC",
+							inputTypes: ["CLAUDE_CHAT", "GENERIC_CHAT_COMPLETION"],
+							vision: true,
+							contextWindow: 1_000_000,
+							maxOutputTokens: 128_000,
+						}),
+					],
+				},
+			});
+		};
+		const options = palantirFoundryModelManagerOptions({ apiKey: "secret-token", fetch: fetchImpl });
+		const fetchDynamicModels = options.fetchDynamicModels;
+		if (!fetchDynamicModels) throw new Error("Expected credentialed Foundry discovery");
+
+		const models = await fetchDynamicModels();
+		if (models === null) throw new Error("Expected complete Foundry discovery");
+
+		expect(models).toHaveLength(1);
+		expect(models[0]).toMatchObject({
+			id: "claude-opus-5.5",
+			requestModelId: "ri.language-model-service..language-model.anthropic-claude-5-5-opus",
+			cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+		});
+	});
+
 	it("configures credentialed discovery as authoritative", () => {
 		const withoutCredential = palantirFoundryModelManagerOptions();
 		const withCredential = palantirFoundryModelManagerOptions({ apiKey: "secret-token" });

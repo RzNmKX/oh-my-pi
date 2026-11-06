@@ -31724,6 +31724,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -31769,6 +31770,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -31814,6 +31816,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -31859,6 +31862,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -31992,6 +31996,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -32037,6 +32042,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -32170,6 +32176,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -32637,6 +32644,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -32679,10 +32687,11 @@
 			"thinking": {
 				"mode": "anthropic-adaptive",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
-					"high"
+					"high",
+					"xhigh",
+					"max"
 				],
 				"supportsDisplay": true,
 				"prefixBinding": true
@@ -32700,7 +32709,7 @@
 				"supportsLongPromptCacheRetention": true,
 				"promptCacheMinimumTokens": 1024,
 				"promptCacheMaximumCheckpoints": 4,
-				"streamIdleTimeoutMs": 600000
+				"streamIdleTimeoutMs": 900000
 			}
 		},
 		"eu.anthropic.claude-haiku-4-5-20251001-v1:0": {
@@ -32948,6 +32957,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -32993,6 +33003,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -33038,6 +33049,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -33215,6 +33227,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -33302,6 +33315,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -33344,10 +33358,11 @@
 			"thinking": {
 				"mode": "anthropic-adaptive",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
-					"high"
+					"high",
+					"xhigh",
+					"max"
 				],
 				"supportsDisplay": true,
 				"prefixBinding": true
@@ -33365,7 +33380,7 @@
 				"supportsLongPromptCacheRetention": true,
 				"promptCacheMinimumTokens": 1024,
 				"promptCacheMaximumCheckpoints": 4,
-				"streamIdleTimeoutMs": 600000
+				"streamIdleTimeoutMs": 900000
 			}
 		},
 		"global.anthropic.claude-haiku-4-5-20251001-v1:0": {
@@ -33525,6 +33540,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -33570,6 +33586,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -33615,6 +33632,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -33792,6 +33810,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -34072,6 +34091,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -34117,6 +34137,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -34250,6 +34271,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -35529,6 +35551,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -35571,10 +35594,11 @@
 			"thinking": {
 				"mode": "anthropic-adaptive",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
-					"high"
+					"high",
+					"xhigh",
+					"max"
 				],
 				"supportsDisplay": true,
 				"prefixBinding": true
@@ -35592,7 +35616,7 @@
 				"supportsLongPromptCacheRetention": true,
 				"promptCacheMinimumTokens": 1024,
 				"promptCacheMaximumCheckpoints": 4,
-				"streamIdleTimeoutMs": 600000
+				"streamIdleTimeoutMs": 900000
 			}
 		},
 		"us-gov.anthropic.claude-haiku-4-5-20251001-v1:0": {
@@ -35796,6 +35820,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -35841,6 +35866,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -35886,6 +35912,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -36019,6 +36046,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -36235,6 +36263,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -36277,10 +36306,11 @@
 			"thinking": {
 				"mode": "anthropic-adaptive",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
-					"high"
+					"high",
+					"xhigh",
+					"max"
 				],
 				"supportsDisplay": true,
 				"prefixBinding": true
@@ -36298,7 +36328,7 @@
 				"supportsLongPromptCacheRetention": true,
 				"promptCacheMinimumTokens": 1024,
 				"promptCacheMaximumCheckpoints": 4,
-				"streamIdleTimeoutMs": 600000
+				"streamIdleTimeoutMs": 900000
 			}
 		},
 		"us.anthropic.claude-haiku-4-5-20251001-v1:0": {
@@ -36546,6 +36576,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -36591,6 +36622,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -36636,6 +36668,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true
@@ -36813,6 +36846,7 @@
 					"low",
 					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"supportsDisplay": true

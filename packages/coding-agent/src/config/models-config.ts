@@ -11,6 +11,7 @@ export type ProviderValidationMode = "models-config" | "runtime-register";
 
 export interface ProviderValidationModel {
 	id: string;
+	baseUrl?: string;
 	api?: Api;
 	contextWindow?: number;
 	supportsTools?: boolean;
@@ -64,13 +65,19 @@ export function validateProviderConfiguration(
 			}
 		}
 	} else {
-		if (!config.baseUrl) {
+		if (!config.baseUrl && models.some(model => !model.baseUrl)) {
 			throw new Error(`Provider ${providerName}: "baseUrl" is required when defining custom models.`);
 		}
+		const usesBedrockSigV4 =
+			providerName === "amazon-bedrock-openai" &&
+			models.every(model => (model.api ?? config.api) === "bedrock-openai-responses");
 		const requiresAuth =
 			mode === "runtime-register"
 				? !config.apiKey && !config.oauthConfigured
-				: !config.apiKey && (config.auth ?? "apiKey") !== "none" && (config.auth ?? "apiKey") !== "oauth";
+				: !config.apiKey &&
+					(config.auth ?? "apiKey") !== "none" &&
+					(config.auth ?? "apiKey") !== "oauth" &&
+					!usesBedrockSigV4;
 		if (requiresAuth) {
 			throw new Error(
 				mode === "runtime-register"
