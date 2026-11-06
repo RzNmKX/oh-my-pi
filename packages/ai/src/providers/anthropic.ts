@@ -1975,8 +1975,11 @@ const streamAnthropicOnce = (
 			// earlier turn is honored on this turn's first attempt. Whichever of the
 			// two flags the session latched decides where this turn's ladder starts,
 			// so a session that learned only the narrow one keeps sending
-			// breakpoints — without `ttl`/`scope` — rather than none.
-			let dropCacheControl = providerSessionState?.cacheControlUnsupported ?? false;
+			// breakpoints — without `ttl`/`scope` — rather than none. A model whose
+			// compat declares the field unsupported starts with no breakpoints.
+			let dropCacheControl =
+				(providerSessionState?.cacheControlUnsupported ?? false) ||
+				model.compat.supportsPromptCacheControl === false;
 			let dropCacheControlOptions = providerSessionState?.cacheControlOptionsUnsupported ?? false;
 			// Set when this turn replayed because the endpoint refused
 			// `cache_control`. The endpoint-level latch is written from the turn's

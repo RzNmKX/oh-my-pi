@@ -63,6 +63,7 @@ export type KnownProvider =
 	| "opencode-go"
 	| "opencode-zen"
 	| "openrouter"
+	| "palantir-foundry"
 	| "qianfan"
 	| "qwen-portal"
 	| "sakana"

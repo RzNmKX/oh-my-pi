@@ -206,6 +206,8 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"supports-penalty-and-stop-params": wire("supportsPenaltyAndStopParams", OAI),
 	"supports-prompt-cache-breakpoints": wire("supportsPromptCacheBreakpoints", OAI),
 	"supports-prompt-cache-key": wire("supportsPromptCacheKey", ["openai"]),
+	/** Drop top-level `prompt_cache_key` from Responses requests: the host rejects the field. */
+	"omit-prompt-cache-key": wire("omitPromptCacheKey", ["openai-responses"]),
 	"supports-reasoning-effort": wire("supportsReasoningEffort", OAI),
 	"supports-reasoning-params": wire("supportsReasoningParams", OAI),
 	"supports-reasoning-summary": wire("supportsReasoningSummary", ["openai-responses"]),
@@ -274,6 +276,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"supports-mid-conversation-system": wire("supportsMidConversationSystem", ["anthropic"]),
 	"supports-mid-conversation-tool-changes": wire("supportsMidConversationToolChanges", ["anthropic"]),
 	"supports-per-message-effort": wire("supportsPerMessageEffort", ["anthropic"]),
+	"supports-prompt-cache-control": wire("supportsPromptCacheControl", ["anthropic"]),
 	"supports-server-compaction": wire("supportsServerCompaction", ["anthropic", "bedrock"]),
 	"supports-message-threads": wire("supportsMessageThreads", ["anthropic"]),
 	"supports-between-tools-thinking": wire("supportsBetweenToolsThinking", ["anthropic"]),
@@ -293,6 +296,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	// ── wire: google APIs ──
 	"antigravity-claude-tool-mode": wire("antigravityClaudeToolMode", ["google"]),
 	"antigravity-usage-label": wire("antigravityUsageLabel", ["google"]),
+	"bearer-auth": wire("bearerAuth", ["google"]),
 	"cca-legacy-parameters-schema": wire("ccaLegacyParametersSchema", ["google"]),
 	"claude-thinking-beta-header": wire("claudeThinkingBetaHeader", ["google"]),
 	"drop-unsigned-thinking": wire("dropUnsignedThinking", ["google"]),

@@ -679,6 +679,11 @@ export interface AnthropicCompat {
 	supportsEagerToolInputStreaming?: boolean;
 	/** Whether long prompt-cache retention (`ttl: "1h"`) is supported. Default: true for canonical Anthropic API. */
 	supportsLongCacheRetention?: boolean;
+	/**
+	 * Whether blocks may carry `cache_control` prompt-cache breakpoints. Default:
+	 * true. `false` sends no breakpoint on any block, for proxies that reject the field.
+	 */
+	supportsPromptCacheControl?: boolean;
 	/** Whether a `ttl: "1h"` breakpoint on API-key requests adds the `extended-cache-ttl-2025-04-11` beta. Unset: true (Vertex rawPredict URLs never send it). */
 	extendedCacheTtlBeta?: boolean;
 	/**
@@ -1195,6 +1200,8 @@ export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompa
 	officialEndpoint: boolean;
 	/** Run Harmony-protocol leak detection/mitigation on streamed output. */
 	harmonyLeakMitigation: boolean;
+	/** Omit top-level `prompt_cache_key`: the host rejects the field. Rule-owned; undefined behaves as false. */
+	omitPromptCacheKey?: boolean;
 	/** Responses-surface prompt-cache marker dialect (OpenRouter-Anthropic `cache_control`). */
 	cacheControlFormat?: OpenAICompat["cacheControlFormat"];
 }
@@ -1218,6 +1225,7 @@ export type ResolvedAnthropicCompat = Required<
 		| "betweenToolsEffort"
 		| "stripThinkingHistory"
 		| "fastMode"
+		| "supportsPromptCacheControl"
 		| "maxImageDimension"
 		| "maxImagePayloadBytes"
 	>
@@ -1234,6 +1242,8 @@ export type ResolvedAnthropicCompat = Required<
 	stripThinkingHistory?: AnthropicCompat["stripThinkingHistory"];
 	/** Fast-mode SKU; undefined behaves as false. */
 	fastMode?: AnthropicCompat["fastMode"];
+	/** Block-level `cache_control` breakpoints; undefined behaves as true. */
+	supportsPromptCacheControl?: AnthropicCompat["supportsPromptCacheControl"];
 	/**
 	 * Largest width or height a single image block may carry. Undefined defers
 	 * to the canonical Anthropic API limit applied by the request builder.
@@ -1330,6 +1340,11 @@ export interface GoogleCompat {
 	claudeThinkingBetaHeader?: boolean;
 	/** Antigravity Claude tool-mode request framing. */
 	antigravityClaudeToolMode?: boolean;
+	/**
+	 * Send the API key as `Authorization: Bearer` instead of `x-goog-api-key`
+	 * (google-generative-ai only; gateways fronting the Gemini API). Default: false.
+	 */
+	bearerAuth?: boolean;
 	/** Usage-label bucket Antigravity reports this model under. */
 	antigravityUsageLabel?: string;
 	/** Strip image inputs before encoding (text-only serving of a multimodal id). */
@@ -1358,6 +1373,7 @@ export type ResolvedGoogleCompat = Required<
 		| "streamIdleTimeoutMs"
 		| "antigravityUsageLabel"
 		| "supportsSamplingParams"
+		| "bearerAuth"
 		| "maxImageDimension"
 		| "maxImagePayloadBytes"
 	>
@@ -1366,6 +1382,8 @@ export type ResolvedGoogleCompat = Required<
 	streamIdleTimeoutMs?: number;
 	antigravityUsageLabel?: string;
 	supportsSamplingParams?: boolean;
+	/** Bearer-token auth; undefined behaves as false. */
+	bearerAuth?: boolean;
 	maxImageDimension?: number;
 	maxImagePayloadBytes?: number;
 };

@@ -9,6 +9,7 @@ import {
 	validateAnthropicCompatibleApiKey,
 	validateApiKeyAgainstModelsEndpoint,
 	validateOpenAICompatibleApiKey,
+	validateOpenAIResponsesApiKey,
 } from "../api-key-validation";
 import type { OAuthController } from "../oauth/types";
 import { loadHeadersHook } from "./common";
@@ -36,6 +37,16 @@ async function runValidation(
 			return;
 		case "anthropic-messages":
 			await validateAnthropicCompatibleApiKey({
+				provider,
+				apiKey,
+				baseUrl: validate.baseUrl,
+				model: validate.model,
+				signal: options.signal,
+				fetch: options.fetch,
+			});
+			return;
+		case "responses":
+			await validateOpenAIResponsesApiKey({
 				provider,
 				apiKey,
 				baseUrl: validate.baseUrl,

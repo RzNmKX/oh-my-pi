@@ -1273,6 +1273,53 @@ describe("model thinking derivation", () => {
 		});
 	});
 
+	it("keeps Foundry GPT-5.x capped at xhigh and exposes max for GPT-6 Astra", () => {
+		const baseUrl = "https://xos.bpx.com/api/v2/llm/proxy/openai/v1";
+		const sol = createModel({
+			id: "gpt-5.6-sol",
+			api: "openai-responses",
+			provider: "palantir-foundry",
+			baseUrl,
+		});
+		const astra = createModel({
+			id: "gpt-6-astra",
+			api: "openai-responses",
+			provider: "palantir-foundry",
+			baseUrl,
+		});
+
+		expect(sol.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh]);
+		expect(astra.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
+	});
+
+	it("gives Foundry's dotted Claude ids the first-party thinking ladders", () => {
+		const claude = (id: string) =>
+			createModel({
+				id,
+				api: "anthropic-messages",
+				provider: "palantir-foundry",
+				baseUrl: "https://xos.bpx.com/api/v2/llm/proxy/anthropic",
+			}).thinking;
+
+		expect(claude("claude-haiku-4.5")?.mode).toBe("budget");
+		expect(claude("claude-sonnet-4.5")?.mode).toBe("budget");
+		expect(claude("claude-opus-4.5")?.mode).toBe("anthropic-budget-effort");
+		expect(claude("claude-opus-4.6")).toMatchObject({
+			mode: "anthropic-adaptive",
+			efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.Max],
+		});
+		expect(claude("claude-sonnet-4.6")).toMatchObject({
+			mode: "anthropic-adaptive",
+			efforts: [Effort.Low, Effort.Medium, Effort.High],
+		});
+		for (const id of ["claude-opus-4.8", "claude-opus-5", "claude-sonnet-5", "claude-haiku-5.5", "claude-opus-5.5"]) {
+			expect(claude(id)).toMatchObject({
+				mode: "anthropic-adaptive",
+				efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
+			});
+		}
+	});
+
 	it("keeps pre-5.6 and Devin-routed GPT models on their own effort surfaces", () => {
 		const gpt55 = createModel({
 			id: "gpt-5.5",

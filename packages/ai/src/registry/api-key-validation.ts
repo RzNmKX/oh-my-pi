@@ -118,6 +118,41 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 }
 
 /**
+ * Validate an API key against an OpenAI-compatible **Responses** endpoint.
+ *
+ * Needed for gateways that only speak `/responses`: reasoning-only proxies
+ * reject the chat-completions probe above outright (legacy `max_tokens` and
+ * `temperature` are both 400s on Palantir Foundry's XOS proxy, and it serves no
+ * `/models` endpoint to fall back on).
+ */
+export async function validateOpenAIResponsesApiKey(options: OpenAICompatibleValidationOptions): Promise<void> {
+	const timeoutSignal = AbortSignal.timeout(VALIDATION_TIMEOUT_MS);
+	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+	const fetchImpl = options.fetch ?? fetch;
+
+	const response = await fetchImpl(`${options.baseUrl}/responses`, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${options.apiKey}`,
+		},
+		body: JSON.stringify({
+			model: options.model,
+			input: "ping",
+			max_output_tokens: 16,
+			store: false,
+		}),
+		signal,
+	});
+
+	if (response.ok) {
+		return;
+	}
+
+	throw await createApiKeyValidationError(options.provider, response);
+}
+
+/**
  * Validate an API key against an Anthropic-compatible messages endpoint.
  */
 export async function validateAnthropicCompatibleApiKey(options: AnthropicCompatibleValidationOptions): Promise<void> {

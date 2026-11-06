@@ -225,6 +225,11 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 			return factoryDroidModelCacheProviderId(options);
 		case "openrouter":
 			return "openrouter:pseudo-api";
+		case "palantir-foundry":
+			// v1: rows keep each model's API-specific Foundry route (older rows
+			// carried a provider-wide Anthropic base URL).
+			// v2: wire policy moved from per-row compat to providers/palantir-foundry.kdl.
+			return "palantir-foundry:per-model-routes-v2";
 		case "vllm": {
 			// v2: qwen3.8 rows cached before the reasoning/template-effort upgrade
 			// carry `reasoning: false` and must be refetched.

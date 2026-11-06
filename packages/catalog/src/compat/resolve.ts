@@ -810,6 +810,8 @@ function resolveOpenAIResponsesPolicy(
 			isOfficialOpenAIEndpoint(provider, baseUrl) ||
 			(api === "openai-codex-responses" && isOfficialCodexApiUrl(baseUrl)),
 		harmonyLeakMitigation: false,
+		// Present as a key so a rule or models.yml `compat` can set it; unset by default.
+		omitPromptCacheKey: undefined,
 		rejectRootObjectUnion: false,
 		retryWithoutStrictOnGrammarError: false,
 		cacheControlFormat: isOpenRouter && isAnthropicModel ? "anthropic" : undefined,
@@ -877,6 +879,7 @@ function pickResponsesOnly(compat: ResolvedOpenAIResponsesCompat): ResponsesOnly
 		supportsSteering: compat.supportsSteering,
 		officialEndpoint: compat.officialEndpoint,
 		harmonyLeakMitigation: compat.harmonyLeakMitigation,
+		omitPromptCacheKey: compat.omitPromptCacheKey,
 		cacheControlFormat: compat.cacheControlFormat,
 		requiresReasoningOffJuiceInstruction: compat.requiresReasoningOffJuiceInstruction,
 		supportsReasoningSummary: compat.supportsReasoningSummary,
@@ -939,6 +942,7 @@ function resolveAnthropicPolicy(
 		// Present as keys so models.yml `compat` can set them; unset unless a rule assigns them.
 		stripThinkingHistory: undefined,
 		fastMode: undefined,
+		supportsPromptCacheControl: undefined,
 		streamIdleTimeoutMs: spec.compat?.streamIdleTimeoutMs,
 	};
 	applyWireAxes(compat, axes.wire, "anthropic-messages");
@@ -1002,6 +1006,8 @@ function resolveGooglePolicy(
 		flashStreamLeakWorkaround: false,
 		claudeThinkingBetaHeader: false,
 		antigravityClaudeToolMode: false,
+		// Present as a key so a rule or models.yml `compat` can set it; unset by default.
+		bearerAuth: undefined,
 		stripImageInput: false,
 		// Unset means "no image contract": images go out as sent. Keys exist so
 		// a KDL rule or a user `compat` block can declare one.

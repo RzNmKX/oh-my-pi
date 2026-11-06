@@ -394,6 +394,15 @@ export type CompiledAuthValidation =
 			optional?: boolean;
 			trustForbidden?: boolean;
 	  }
+	/** Minimal `POST {baseUrl}/responses` probe for gateways without a `/models` endpoint. */
+	| {
+			kind: "responses";
+			label?: string;
+			baseUrl: string;
+			model: string;
+			optional?: boolean;
+			trustForbidden?: boolean;
+	  }
 	| {
 			kind: "models-endpoint";
 			label?: string;

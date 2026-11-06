@@ -116,3 +116,7 @@ test("Codex cache scope follows a gateway baseUrl but keeps the official namespa
 	);
 	expect(gateway.cacheProviderId).not.toBe(official);
 });
+
+test("Palantir invalidates caches holding pre-KDL per-row wire overrides", () => {
+	expect(resolveModelCacheProviderId("palantir-foundry")).toBe("palantir-foundry:per-model-routes-v2");
+});

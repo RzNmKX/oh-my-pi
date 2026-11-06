@@ -359,7 +359,8 @@ class "anthropic" {
 		thinking-efforts "minimal" "low" "medium" "high" "xhigh"
 	}
 	on "amazon-bedrock" "anthropic" "cloudflare-ai-gateway" "github-copilot" "gitlab-duo" \
-		"google-antigravity" "google-vertex" "opencode-zen" "snowflake" "vercel-ai-gateway" "zenmux" {
+		"google-antigravity" "google-vertex" "opencode-zen" "palantir-foundry" "snowflake" "vercel-ai-gateway" \
+		"zenmux" {
 		family "sonnet" {
 			revision ">=3.7 <4.6" {
 				thinking-mode "budget"
@@ -367,7 +368,7 @@ class "anthropic" {
 		}
 	}
 	on "amazon-bedrock" "anthropic" "cloudflare-ai-gateway" "github-copilot" "gitlab-duo" \
-		"google-vertex" "opencode-zen" "snowflake" "vercel-ai-gateway" {
+		"google-vertex" "opencode-zen" "palantir-foundry" "snowflake" "vercel-ai-gateway" {
 		family "haiku" {
 			thinking-mode "budget"
 			// Haiku 5.5 is the first adaptive Haiku: `budget_tokens` is a 400.
@@ -381,7 +382,7 @@ class "anthropic" {
 		}
 	}
 	on "amazon-bedrock" "anthropic" "cloudflare-ai-gateway" "github-copilot" "gitlab-duo" \
-		"google-vertex" "opencode-zen" "snowflake" "vercel-ai-gateway" "zenmux" {
+		"google-vertex" "opencode-zen" "palantir-foundry" "snowflake" "vercel-ai-gateway" "zenmux" {
 		family "opus" {
 			revision ">=4.5 <4.6" {
 				thinking-mode "anthropic-budget-effort"
@@ -389,7 +390,7 @@ class "anthropic" {
 		}
 	}
 	on "amazon-bedrock" "anthropic" "cloudflare-ai-gateway" "github-copilot" "google-vertex" \
-		"opencode-zen" "openrouter" "snowflake" "vercel-ai-gateway" "zenmux" {
+		"opencode-zen" "openrouter" "palantir-foundry" "snowflake" "vercel-ai-gateway" "zenmux" {
 		family "opus" {
 			revision ">=4.6 <4.7" {
 				thinking-efforts "low" "medium" "high" "max"
@@ -397,7 +398,7 @@ class "anthropic" {
 		}
 	}
 	on "amazon-bedrock" "anthropic" "cloudflare-ai-gateway" "github-copilot" "google-vertex" \
-		"opencode-zen" "snowflake" "vercel-ai-gateway" "zenmux" {
+		"opencode-zen" "palantir-foundry" "snowflake" "vercel-ai-gateway" "zenmux" {
 		revision ">=4.7 <45.1" {
 			thinking-mode "anthropic-adaptive"
 		}
@@ -428,13 +429,13 @@ class "anthropic" {
 		}
 	}
 	on "anthropic" "cloudflare-ai-gateway" "github-copilot" "google-vertex" "opencode-zen" \
-		"openrouter" "snowflake" "vercel-ai-gateway" "zenmux" {
+		"openrouter" "palantir-foundry" "snowflake" "vercel-ai-gateway" "zenmux" {
 		revision ">=4.7 <45.1" {
 			thinking-efforts "low" "medium" "high" "xhigh" "max"
 		}
 	}
 	on "anthropic" "cloudflare-ai-gateway" "github-copilot" "google-vertex" "opencode-zen" \
-		"snowflake" "vercel-ai-gateway" "zenmux" {
+		"palantir-foundry" "snowflake" "vercel-ai-gateway" "zenmux" {
 		family "sonnet" {
 			revision ">=4.6 <5" {
 				thinking-efforts "low" "medium" "high"

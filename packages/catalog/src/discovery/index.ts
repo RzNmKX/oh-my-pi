@@ -5,5 +5,6 @@ export * from "./gemini";
 export * from "./gemini-cli";
 export * from "./gitlab-duo-workflow";
 export * from "./openai-compatible";
+export * from "./palantir-foundry";
 export * from "./protobuf";
 export * from "./typesafe";

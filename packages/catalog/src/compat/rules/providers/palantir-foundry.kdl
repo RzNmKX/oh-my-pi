@@ -1,0 +1,149 @@
+// Palantir Foundry XOS LLM proxy. One enrollment fronts several provider-native
+// protocols, each on its own route under the Foundry origin:
+//   /api/v2/llm/proxy/anthropic     Claude (anthropic-messages)
+//   /api/v2/llm/proxy/openai/v1     GPT, o-series, Gemma (openai-responses)
+//   /api/v2/llm/proxy/google/v1     Gemini (google-generative-ai)
+//   /api/v2/llm/proxy/xai/v1        Grok (openai-responses)
+// Requests address models by their Foundry RID (`request-model-id`), not by id.
+provider "palantir-foundry" {
+	default-model "gpt-5.6-sol"
+	env "PALANTIR_API_KEY"
+	// The live GraphQL roster (`discovery/palantir-foundry.ts`) replaces the seed.
+	dynamic-models-authoritative #true
+
+	// Credential-scoped roster: no `discovery` node, so catalog generation never
+	// fetches it and one enrollment's entitlements never enter the shared bundle.
+	// These rows keep the provider usable before the first live roster arrives.
+	// RIDs, limits, and prices are copied from the last live roster.
+	seed api="openai-responses" base-url="https://xos.bpx.com/api/v2/llm/proxy/openai/v1" bundle="fallback" {
+		model "gpt-5.6-sol" name="GPT-5.6 Sol (Foundry)" {
+			reasoning #true
+			input "text" "image"
+			cost input=5 output=30 cache-read=0.5 cache-write=6.25
+			limits context=1050000 max-tokens=128000
+			request-model-id "ri.language-model-service..language-model.gpt-5-6-sol"
+		}
+		model "gpt-5.6-terra" name="GPT-5.6 Terra (Foundry)" {
+			reasoning #true
+			input "text" "image"
+			cost input=2.5 output=15 cache-read=0.25 cache-write=3.125
+			limits context=1050000 max-tokens=128000
+			request-model-id "ri.language-model-service..language-model.gpt-5-6-terra"
+		}
+		model "gpt-5.6-luna" name="GPT-5.6 Luna (Foundry)" {
+			reasoning #true
+			input "text" "image"
+			cost input=1 output=6 cache-read=0.1 cache-write=1.25
+			limits context=1050000 max-tokens=128000
+			request-model-id "ri.language-model-service..language-model.gpt-5-6-luna"
+		}
+		model "gpt-6-astra" name="GPT-6 Astra (Foundry)" {
+			reasoning #true
+			input "text" "image"
+			cost input=10 output=50 cache-read=1 cache-write=12.5
+			limits context=1050000 max-tokens=128000
+			request-model-id "ri.language-model-service..language-model.gpt-6-astra"
+		}
+		model "claude-opus-5" name="Claude Opus 5 (Foundry)" api="anthropic-messages" base-url="https://xos.bpx.com/api/v2/llm/proxy/anthropic" {
+			reasoning #true
+			input "text" "image"
+			cost input=5 output=25 cache-read=0.5 cache-write=6.25
+			limits context=1000000 max-tokens=128000
+			request-model-id "ri.language-model-service..language-model.anthropic-claude-5-opus"
+		}
+		model "claude-sonnet-5" name="Claude Sonnet 5 (Foundry)" api="anthropic-messages" base-url="https://xos.bpx.com/api/v2/llm/proxy/anthropic" {
+			reasoning #true
+			input "text" "image"
+			cost input=2 output=10 cache-read=0.2 cache-write=2.5
+			limits context=1000000 max-tokens=128000
+			request-model-id "ri.language-model-service..language-model.anthropic-claude-5-sonnet"
+		}
+		model "claude-haiku-4.5" name="Claude Haiku 4.5 (Foundry)" api="anthropic-messages" base-url="https://xos.bpx.com/api/v2/llm/proxy/anthropic" {
+			reasoning #true
+			input "text" "image"
+			cost input=1 output=5 cache-read=0.1 cache-write=1.25
+			limits context=200000 max-tokens=64000
+			request-model-id "ri.language-model-service..language-model.anthropic-claude-4-5-haiku"
+		}
+		model "gemini-3.6-flash" name="Gemini 3.6 Flash (Foundry)" api="google-generative-ai" base-url="https://xos.bpx.com/api/v2/llm/proxy/google/v1" {
+			reasoning #true
+			input "text" "image"
+			cost input=1.5 output=7.5 cache-read=0.15 cache-write=0
+			limits context=1048576 max-tokens=65535
+			request-model-id "ri.language-model-service..language-model.gemini-3-6-flash"
+		}
+		model "gemini-3.1-pro-preview" name="Gemini 3.1 Pro Preview (Foundry)" api="google-generative-ai" base-url="https://xos.bpx.com/api/v2/llm/proxy/google/v1" {
+			reasoning #true
+			input "text" "image"
+			cost input=2 output=12 cache-read=0.2 cache-write=0
+			limits context=1000000 max-tokens=64000
+			request-model-id "ri.language-model-service..language-model.gemini-3-1-pro"
+		}
+		model "grok-4.5" name="Grok 4.5 (Foundry)" base-url="https://xos.bpx.com/api/v2/llm/proxy/xai/v1" {
+			reasoning #true
+			input "text" "image"
+			cost input=2 output=6 cache-read=0.5 cache-write=0
+			limits context=500000 max-tokens=500000
+			request-model-id "ri.language-model-service..language-model.grok-4-5"
+		}
+	}
+
+	// The Anthropic proxy rejects the unrecognized `context_management` field.
+	supports-context-management #false
+	// The Anthropic proxy also rejects block-level `cache_control` markers
+	// (`unrecognizedProperty=cache_control`).
+	supports-prompt-cache-control #false
+	on-api "anthropic-messages" {
+		// The Anthropic proxy rejects the top-level tool `strict` field.
+		disable-strict-tools #true
+	}
+	on-api "google-generative-ai" {
+		// The Google proxy takes the Foundry token as a bearer token, not `x-goog-api-key`.
+		bearer-auth #true
+	}
+	// Claude thinking ladders are first-party; this provider joins the
+	// first-party `on` lists in classes/anthropic.kdl.
+	class "openai" {
+		// The OpenAI proxy fronts GPT-5.x on Azure OpenAI deployments whose effort
+		// ladder stops at xhigh. GPT-6+ is served with the full five-tier low..max
+		// ladder (verified live against gpt-6-astra: `max` scales reasoning tokens
+		// above xhigh, while `minimal` and `none` are both 400s), so it keeps the
+		// generic wire-effort rule. priority=1 outranks the class GPT generation
+		// ladders (e.g. minimal..high for <5.2), which tie on specificity.
+		revision ">=5 <6" priority=1 {
+			thinking-efforts "low" "medium" "high" "xhigh"
+			// The proxy passes OpenAI `type: "custom"` tools straight through: a
+			// freeform `apply_patch` call round-trips as a `custom_tool_call` with a
+			// `*** Begin Patch` body (verified live against gpt-5.6-sol).
+			apply-patch-tool-type "freeform"
+		}
+		// Exact id outranks the class `*codex-mini*` medium/high glob.
+		models "gpt-5.1-codex-mini" {
+			thinking-efforts "low" "medium" "high" "xhigh"
+		}
+		// Every non-GPT-6 OpenAI-proxy row shares the Azure low..xhigh ladder.
+		family "o-series" {
+			thinking-efforts "low" "medium" "high" "xhigh"
+		}
+		// Not verified against the proxy: the hosted `image_generation` tool, and
+		// `configuration_update` input items for GPT-6 effort changes. Effort
+		// changes stay on the request-level `reasoning.effort`, which is verified.
+		// priority=1 outranks the class-wide `on-api "openai-responses"` grant,
+		// which ties on specificity.
+		revision ">=5" priority=1 {
+			hosted-image #false
+			image-model #false
+		}
+		revision ">=6 <7" {
+			supports-configuration-update #false
+		}
+	}
+	// Gemma is served on the same OpenAI proxy route.
+	class "gemma" {
+		thinking-efforts "low" "medium" "high" "xhigh"
+	}
+	// The xAI proxy rejects `prompt_cache_key`.
+	class "xai" {
+		omit-prompt-cache-key #true
+	}
+}

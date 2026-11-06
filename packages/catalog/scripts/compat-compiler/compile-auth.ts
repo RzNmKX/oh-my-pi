@@ -326,6 +326,7 @@ function validation(node: KdlNodeView): CompiledAuthValidation {
 			return result;
 		}
 		case "anthropic-messages":
+		case "responses":
 			leaf(node, ["base-url", "model", "label", "optional", "trust-forbidden"]);
 			return { kind, ...common, baseUrl: requiredProp(node, "base-url"), model: requiredProp(node, "model") };
 		case "models-endpoint": {

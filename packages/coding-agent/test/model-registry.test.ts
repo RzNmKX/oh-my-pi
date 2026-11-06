@@ -3810,6 +3810,73 @@ describe("ModelRegistry", () => {
 		});
 	});
 
+	describe("multi-route built-in discovery", () => {
+		test("preserves each Palantir model's protocol-specific base URL", async () => {
+			authStorage.keys.setRuntime("palantir-foundry", "palantir-test-key");
+			const fetchMock: FetchImpl = async (input, init) => {
+				const url = String(input);
+				// models.dev price enrichment is optional; the roster comes from Foundry GraphQL.
+				if (!url.startsWith("https://xos.bpx.com/")) return new Response("not found", { status: 404 });
+				expect(url).toStartWith("https://xos.bpx.com/graphql-gateway/api/bulk");
+				const body = JSON.parse(String(init?.body)) as {
+					requests: Array<{ name: string }>;
+				};
+				const operation = body.requests[0]?.name;
+				const data =
+					operation === "HomeProjectRidQuery"
+						? { homeProject: { rid: "ri.compass.main.folder.home" } }
+						: {
+								languageModelsV4: {
+									nextPageToken: null,
+									values: [
+										{
+											rid: "ri.language-model-service..language-model.gpt-6-astra",
+											displayName: "GPT-6 Astra",
+											modelCreator: "OPEN_AI",
+											resolvedDetails: {
+												properties: { contextWindow: 1_050_000, maxOutputTokens: 128_000 },
+												modelSpecs: [
+													{
+														inputType: "OPEN_AI_RESPONSES",
+														modelSpec: {
+															inputModalities: [{ __typename: "LanguageModelTextInputModality" }],
+														},
+													},
+													{
+														inputType: "OPEN_AI_REASONING",
+														modelSpec: {
+															inputModalities: [{ __typename: "LanguageModelTextInputModality" }],
+														},
+													},
+												],
+											},
+										},
+									],
+								},
+							};
+				return new Response(
+					`data:${JSON.stringify({ data })}
+
+`,
+					{
+						status: 200,
+						headers: { "Content-Type": "text/event-stream" },
+					},
+				);
+			};
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+			// A full static snapshot first: the registry then passes a provider
+			// base URL inferred from a bundled row, which can be the Anthropic route.
+			registry.getAll();
+			await registry.refreshProvider("palantir-foundry", "online");
+
+			const astra = registry.find("palantir-foundry", "gpt-6-astra");
+			expect(astra?.baseUrl).toBe("https://xos.bpx.com/api/v2/llm/proxy/openai/v1");
+			expect(astra?.requestModelId).toBe("ri.language-model-service..language-model.gpt-6-astra");
+		});
+	});
+
 	describe("effort-tier variant collapsing", () => {
 		let kiroTwins: ModelRegistry;
 		let antigravityOverride: ModelRegistry;

@@ -23,6 +23,7 @@ import {
 	type OpenAICompatibleModelRecord,
 	withOpenAICompatibleDiscoveryTimeout,
 } from "../discovery/openai-compatible";
+import { fetchPalantirFoundryModels, PALANTIR_FOUNDRY_BASE_URL } from "../discovery/palantir-foundry";
 import { Effort, THINKING_EFFORTS } from "../effort";
 import { FIREWORKS_FAST_SUFFIX, toFireworksPublicModelId } from "../fireworks-model-id";
 import { getBundledModelReferenceIndex } from "../identity/bundled";
@@ -4974,6 +4975,50 @@ export function museCodeModelManagerOptions(config?: MetaModelManagerConfig): Mo
 			baseUrl: config?.baseUrl ?? META_MODEL_API_BASE_URL,
 		}),
 		staticModels: seedModels<"openai-responses">("muse-code"),
+	};
+}
+
+// ---------------------------------------------------------------------------
+// 15.77 Palantir Foundry (XOS) LLM proxy
+// ---------------------------------------------------------------------------
+
+/** Palantir Foundry discovery inputs: `apiKey` enables the live roster; `baseUrl` defaults to the BPX XOS proxy. */
+export interface PalantirFoundryModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+	fetch?: FetchImpl;
+}
+
+/**
+ * Palantir's OpenAI proxy does not expose `/models`; Agent Studio publishes
+ * the authoritative enrollment catalog through its GraphQL bulk endpoint.
+ * Discovery resolves the service user's home project for attribution, then
+ * routes each model to its native proxy (Anthropic, Google, xAI, OpenAI).
+ * A keyless manager serves only the bundled seed. Wire policy for every route
+ * lives in `providers/palantir-foundry.kdl`.
+ */
+export function palantirFoundryModelManagerOptions(
+	config?: PalantirFoundryModelManagerConfig,
+): ModelManagerOptions<Api> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? PALANTIR_FOUNDRY_BASE_URL;
+	return {
+		providerId: "palantir-foundry",
+		cacheProviderId: resolveModelCacheProviderId("palantir-foundry"),
+		dynamicModelsAuthoritative: true,
+		...(apiKey && {
+			fetchDynamicModels: async () => {
+				// models.dev prices newer Foundry models before the bundled catalog lists them.
+				const modelsDevReferences = await loadModelsDevReferences<Api>(config?.fetch);
+				return fetchPalantirFoundryModels({
+					apiKey,
+					baseUrl,
+					fetch: config?.fetch,
+					resolveReference: modelId =>
+						modelsDevReferences.get(modelId) ?? modelsDevReferences.get(modelId.replaceAll(".", "-")),
+				});
+			},
+		}),
 	};
 }
 
