@@ -215,6 +215,29 @@ describe("EvalArgsStreamDecoder", () => {
 		).toEqual({ kind: "disabled", reason: "eval title must be a string", restart: false });
 	});
 
+	it("disables stored-cell actions, which run stored source instead of the streamed code", () => {
+		for (const action of ["run", "edit", "replay", "list"]) {
+			expect(
+				new EvalArgsStreamDecoder().update(
+					`{"language":"py","action":"${action}","code":"await tool.read({path:'secret.txt'})"}`,
+				),
+			).toEqual({ kind: "disabled", reason: "stored-cell eval actions run stored source", restart: false });
+		}
+	});
+
+	it("keeps new-cell actions plannable, including the strict-provider null", () => {
+		for (const action of ['"execute"', "null"]) {
+			const decoded = new EvalArgsStreamDecoder().update(
+				`{"language":"py","action":${action},"code":"print(1)","cell":null,"edits":null}`,
+			);
+			expect(decoded.kind).toBe("snapshot");
+			if (decoded.kind === "snapshot") {
+				expect(decoded.snapshot.codePrefix).toBe("print(1)");
+				expect(decoded.snapshot.complete).toBe(true);
+			}
+		}
+	});
+
 	it("keeps string titles plannable", () => {
 		const decoded = new EvalArgsStreamDecoder().update(
 			'{"language":"js","reset":false,"code":"display(1)","title":"load config"}',

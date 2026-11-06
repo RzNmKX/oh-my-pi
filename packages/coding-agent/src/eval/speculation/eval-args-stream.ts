@@ -309,6 +309,12 @@ function parseSnapshot(
 				// be phantom I/O for a call that never runs. Duplicate string
 				// titles need no guard: last-wins matches JSON.parse semantics.
 				if (typeof parsed !== "string") return { reason: "eval title must be a string" };
+			} else if (key.value === "action") {
+				// `run`/`edit`/`replay`/`list` execute stored source, never the streamed
+				// `code`; strict providers send `null` for an omitted action.
+				if (parsed !== null && parsed !== "execute") {
+					return { reason: "stored-cell eval actions run stored source" };
+				}
 			} else if (key.value === "timeout") {
 				if (typeof parsed !== "number" || !Number.isFinite(parsed) || parsed < 0) {
 					return { reason: "eval timeout must be a non-negative finite number" };

@@ -5,6 +5,14 @@ One cell per call; top-level state persists, including across compaction.{{#if s
 On error, retry only the failed step; earlier steps may have taken effect.
 Cell deadline: nonzero `timeout` values clamp to {{timeoutMin}}–{{timeoutMax}} seconds{{#if configuredMaxTimeout}}, with configured `tools.maxTimeout: {{configuredMaxTimeout}}` (effective ceiling {{timeoutCeiling}}s){{/if}}; `0` disables the deadline. A changed supplied deadline is disclosed before execution.
 Printing an image{{#if py}} or figure{{/if}} attaches it.
+{{#if py}}
+Python cells: each new Python call stores a stable 1-based `cell` whose source survives kernel reset and loss. Act on stored cells with `action` instead of resending source:
+- `run`: rerun `cell`.
+- `edit`: apply exact `edits` (each `old` matches once) atomically, then run the revision.
+- `replay`: run `from`–`through` in order; `reset: true` resets once, before the first. Use it to restore setup after kernel loss.
+- `list`: each cell's exact source, last output, revision, run count, and kernel provenance. `output()` reads task/agent artifacts, not cells.
+To change a stored cell, `edit` it; NEVER resend a whole cell unless exact matching cannot express the change.
+{{/if}}
 
 <prelude>
 {{#ifAll py js}}

@@ -261,6 +261,32 @@ describe("eval tool dynamic schema", () => {
 		cfgEvalPy.set(session.settings, true);
 		expect(wireCellFields(tool).languages).toEqual(["js", "py"]);
 	});
+
+	it("advertises stored Python cell actions in one object schema only while Python is enabled", () => {
+		const session = makeSession({});
+		const tool = new EvalTool(session);
+		const wire = () =>
+			toolWireSchema(tool as unknown as AiTool) as {
+				type?: string;
+				anyOf?: unknown;
+				required?: string[];
+				properties?: Record<string, { enum?: string[] }>;
+			};
+		// Providers reject a root union, so per-action requirements are cross-field checks.
+		expect(wire().type).toBe("object");
+		expect(wire().anyOf).toBeUndefined();
+		expect(wire().required).toEqual(["language"]);
+		expect(wire().properties?.action?.enum).toEqual(["execute", "run", "edit", "replay", "list"]);
+		expect(tool.description).toContain("Python cells:");
+		expect(tool.examples.some(example => "call" in example && example.call.action === "replay")).toBe(true);
+
+		// Stored cells are Python-only: a JavaScript-only session sees new cells, with `code` required.
+		cfgEvalPy.set(session.settings, false);
+		expect(Object.keys(wire().properties ?? {}).sort()).toEqual(["code", "language", "reset", "timeout", "title"]);
+		expect(wire().required?.sort()).toEqual(["code", "language"]);
+		expect(tool.description).not.toContain("Python cells:");
+		expect(tool.examples.some(example => "call" in example && example.call.action !== undefined)).toBe(false);
+	});
 });
 
 // The description tells the model which prelude helpers need `await` by prefixing their

@@ -153,6 +153,13 @@ interface EvalRenderCellArg {
 }
 
 interface EvalRenderArgs extends EvalRenderCellArg {
+	/** Stored Python cell action; `run`/`edit`/`replay`/`list` send no source. */
+	action?: "execute" | "run" | "edit" | "replay" | "list";
+	cell?: number;
+	edits?: Array<{ old?: string; new?: string }>;
+	from?: number;
+	through?: number;
+	reset?: boolean;
 	cells?: EvalRenderCellArg[];
 	__partialJson?: string;
 }
@@ -189,6 +196,25 @@ function getRenderCells(args: EvalRenderArgs | undefined): EvalRenderCell[] {
 		});
 	}
 	return out;
+}
+
+/** Label for a source-free stored Python cell action; `undefined` for a new cell. */
+function formatStoredCellAction(args: EvalRenderArgs | undefined): string | undefined {
+	switch (args?.action) {
+		case "run":
+			return `Rerun Python cell ${args.cell ?? "?"}`;
+		case "edit": {
+			const count = args.edits?.length;
+			const replacements = count === undefined ? "" : ` (${count} replacement${count === 1 ? "" : "s"})`;
+			return `Edit and rerun Python cell ${args.cell ?? "?"}${replacements}`;
+		}
+		case "replay":
+			return `Replay Python cells ${args.from ?? 1}-${args.through ?? "latest"}${args.reset ? " after reset" : ""}`;
+		case "list":
+			return "List stored Python cells";
+		default:
+			return undefined;
+	}
 }
 
 /**
@@ -937,7 +963,8 @@ export const evalToolRenderer = {
 
 		if (cells.length === 0) {
 			const promptSym = uiTheme.fg("accent", ">>>");
-			const text = formatTitle(`${promptSym} …`, uiTheme);
+			const action = formatStoredCellAction(args);
+			const text = formatTitle(`${promptSym} ${action ?? "…"}`, uiTheme);
 			return new Text(text, 0, 0);
 		}
 
@@ -1270,7 +1297,7 @@ export const evalToolRenderer = {
 			: undefined;
 		return {
 			tool: evalToolHead(
-				cells[0]?.title,
+				cells[0]?.title ?? formatStoredCellAction(args),
 				cells.map(cell => cell.language),
 				cells.length,
 			),
@@ -1328,7 +1355,12 @@ export const evalToolRenderer = {
 				);
 			});
 			return {
-				tool: evalToolHead(cellResults[0]!.title, languages, cellResults.length, details),
+				tool: evalToolHead(
+					cellResults[0]!.title ?? formatStoredCellAction(args),
+					languages,
+					cellResults.length,
+					details,
+				),
 				body: cells,
 				preview: "children",
 			};
@@ -1354,7 +1386,7 @@ export const evalToolRenderer = {
 				: [{ language: languages[0] ?? "python", code: "", ...last }];
 		return {
 			tool: evalToolHead(
-				argCells[0]?.title,
+				argCells[0]?.title ?? formatStoredCellAction(args),
 				argCells.length > 0 ? argCells.map(cell => cell.language) : languages,
 				argCells.length,
 				details,
