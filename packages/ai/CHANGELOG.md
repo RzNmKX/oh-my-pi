@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Palantir Foundry support: API-key validation against the Responses endpoint, and per-model switches to omit the prompt cache key (Responses), send no `cache_control` markers (Anthropic), and authenticate with a bearer token (Google).
+
 ### Fixed
 
 - Bedrock Mantle models pinned to a regional host (e.g. `https://bedrock-mantle.us-east-1.api.aws/openai/v1` in `models.yml`) now sign for that region instead of failing with 401 when `AWS_REGION` names another.

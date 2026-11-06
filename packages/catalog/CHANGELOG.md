@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `palantir-foundry` provider for the Foundry LLM proxy: models addressed by Foundry id across its anthropic, openai/v1, google/v1 and xai/v1 routes, live model discovery with per-model routes, and the `omit-prompt-cache-key`, `supports-prompt-cache-control` and `bearer-auth` compat axes.
+
 ## [18.17.0] - 2026-11-06
 
 ### Added

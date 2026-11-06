@@ -4,6 +4,7 @@
 
 ### Added
 
+- Listed `PALANTIR_API_KEY` among the provider environment variables in `--help`.
 - Python eval cells are stored with stable 1-based ids: `run` reruns a cell without resending its source, `edit` applies exact-match edits atomically, `replay` reruns a range in order, and `list` shows each cell's source, last output, revision, run count, and whether it ran in an earlier kernel (after a reset, crash, or restart).
 
 ### Changed
