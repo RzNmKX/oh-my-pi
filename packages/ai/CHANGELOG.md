@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Bedrock Mantle models pinned to a regional host (e.g. `https://bedrock-mantle.us-east-1.api.aws/openai/v1` in `models.yml`) now sign for that region instead of failing with 401 when `AWS_REGION` names another.
 - Fixed OpenAI Responses-compatible proxies crashing a turn when the finished reasoning item lists a `null` summary part.
 
 ## [18.17.0] - 2026-11-06

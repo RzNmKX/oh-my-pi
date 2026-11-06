@@ -69,8 +69,24 @@ function resolveBearerToken(options: BedrockMantleOptions): string | undefined {
 	return resolveAwsBearerToken(apiKey, options.providerOptions?.bearerToken);
 }
 
-export function createBedrockMantleAuthenticatedFetch(options: BedrockMantleOptions = {}): FetchImpl {
-	const region = resolveAwsRegion(options.providerOptions?.region, options.providerOptions?.profile);
+/**
+ * Region named by a concrete Mantle host (`bedrock-mantle.<region>.api.aws`).
+ * SigV4 credentials must be scoped to the host's region, so a model pinned to a
+ * regional endpoint signs for that region whatever `AWS_REGION` says. Templated
+ * (`{region}`) or non-Mantle URLs return undefined.
+ */
+function mantleHostRegion(baseUrl: string): string | undefined {
+	if (!URL.canParse(baseUrl)) return undefined;
+	const labels = new URL(baseUrl).hostname.split(".");
+	if (labels.length !== 4 || labels[0] !== "bedrock-mantle" || labels[2] !== "api" || labels[3] !== "aws") {
+		return undefined;
+	}
+	// URL parsing keeps a `{region}` template as a percent-encoded label.
+	return /^[a-z0-9-]+$/.test(labels[1]) ? labels[1] : undefined;
+}
+
+export function createBedrockMantleAuthenticatedFetch(options: BedrockMantleOptions = {}, region?: string): FetchImpl {
+	region ??= resolveAwsRegion(options.providerOptions?.region, options.providerOptions?.profile);
 	const bearerToken = resolveBearerToken(options);
 	if (!bearerToken) return createSignedFetch(options, region);
 
@@ -93,7 +109,9 @@ export function prepareBedrockMantleRequest(
 	model: Model<"openai-responses">,
 	options: BedrockMantleOptions,
 ): PreparedBedrockMantleRequest {
-	const region = resolveAwsRegion(options.providerOptions?.region, options.providerOptions?.profile);
+	const region =
+		mantleHostRegion(model.baseUrl) ??
+		resolveAwsRegion(options.providerOptions?.region, options.providerOptions?.profile);
 	const resolvedModel = { ...model, baseUrl: model.baseUrl.replaceAll("{region}", encodeURIComponent(region)) };
 	const bearerToken = resolveBearerToken(options);
 	if (bearerToken) {
@@ -104,7 +122,7 @@ export function prepareBedrockMantleRequest(
 		options: {
 			...options,
 			apiKey: NO_AUTH_SENTINEL,
-			fetch: createBedrockMantleAuthenticatedFetch(options),
+			fetch: createBedrockMantleAuthenticatedFetch(options, region),
 		},
 	};
 }

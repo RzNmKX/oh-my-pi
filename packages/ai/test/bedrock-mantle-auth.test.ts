@@ -149,6 +149,25 @@ describe("Bedrock Mantle authentication", () => {
 		expect(capture.securityToken).toBe("test-session-token");
 	});
 
+	test("SigV4-signs for the region of a model pinned to a regional Mantle host", async () => {
+		const capture: Capture = {};
+		const pinnedModel = { ...mantleModel, baseUrl: "https://bedrock-mantle.us-east-1.api.aws/openai/v1" };
+		await withEnv(
+			{
+				...cleanAwsEnv,
+				AWS_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE",
+				AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+				AWS_REGION: "us-west-2",
+			},
+			async () => {
+				clearAwsCredentialCache();
+				await stream(pinnedModel, context, { fetch: captureFetch(capture), maxTokens: 16 }).result();
+			},
+		);
+		expect(capture.url).toStartWith("https://bedrock-mantle.us-east-1.api.aws/openai/v1/responses");
+		expect(capture.authorization).toContain("/us-east-1/bedrock-mantle/aws4_request");
+	});
+
 	test("invalidates cached SigV4 credentials after an authentication rejection", async () => {
 		const authorizations: string[] = [];
 		const rejectingFetch: FetchImpl = Object.assign(
