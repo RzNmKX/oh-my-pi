@@ -25,6 +25,12 @@ export interface ContextFile {
 	 * scope slot, so AGENTS.local.md loads beside AGENTS.md instead of replacing it.
 	 */
 	additive?: boolean;
+	/**
+	 * Convention that owns this file's per-depth slot. Files with a scope compete
+	 * only with same-scope files at their depth, so a standalone CLAUDE.md loads
+	 * beside AGENTS.md and `.claude/CLAUDE.md` instead of being shadowed by them.
+	 */
+	scope?: string;
 	/** Source metadata */
 	_source: SourceMeta;
 }
@@ -39,7 +45,8 @@ export const contextFileCapability = defineCapability<ContextFile>({
 	// Clamp depth >= 0: files inside config subdirectories of an ancestor (e.g. .claude/, .github/)
 	// are same-scope as the ancestor itself.
 	key: file => {
-		const scope = file.level === "user" ? "user" : `project:${Math.max(0, file.depth ?? 0)}`;
+		const depthScope = `project:${Math.max(0, file.depth ?? 0)}`;
+		const scope = file.level === "user" ? "user" : file.scope ? `${depthScope}:${file.scope}` : depthScope;
 		// Path, not basename: two extra files can share a depth (a walked ancestor and
 		// the primary checkout of a sibling worktree) and must both survive.
 		return file.additive ? `${scope}:additive:${path.resolve(file.path)}` : scope;

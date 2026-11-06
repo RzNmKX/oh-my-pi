@@ -162,7 +162,7 @@ describe("claude-md final registration and precedence", () => {
 		]);
 	});
 
-	test(".claude/CLAUDE.md shadows standalone CLAUDE.md at the same depth", async () => {
+	test(".claude/CLAUDE.md and standalone CLAUDE.md both load at the same depth", async () => {
 		const repoRoot = path.join(tempDir, "repo");
 		const cwd = path.join(repoRoot, "src");
 		fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
@@ -172,12 +172,13 @@ describe("claude-md final registration and precedence", () => {
 
 		const result = await loadCapability<ContextFile>(contextFileCapability.id, { cwd });
 
-		expect(result.items.filter(file => file.level === "project" && file.depth === 0).map(file => file.path)).toEqual([
-			path.join(cwd, ".claude", "CLAUDE.md"),
-		]);
+		const depthZero = result.items.filter(file => file.level === "project" && file.depth === 0);
+		expect(depthZero.map(file => file.path).sort()).toEqual(
+			[path.join(cwd, ".claude", "CLAUDE.md"), path.join(cwd, "CLAUDE.md")].sort(),
+		);
 	});
 
-	test("standalone AGENTS.md wins the depth tie against standalone CLAUDE.md", async () => {
+	test("standalone CLAUDE.md loads beside standalone AGENTS.md at the same depth", async () => {
 		const repoRoot = path.join(tempDir, "repo");
 		const cwd = path.join(repoRoot, "src");
 		fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
@@ -187,9 +188,10 @@ describe("claude-md final registration and precedence", () => {
 
 		const result = await loadCapability<ContextFile>(contextFileCapability.id, { cwd });
 
-		expect(result.items.filter(file => file.level === "project" && file.depth === 1).map(file => file.path)).toEqual([
-			path.join(repoRoot, "AGENTS.md"),
-		]);
+		const depthOne = result.items.filter(file => file.level === "project" && file.depth === 1);
+		expect(depthOne.map(file => file.path).sort()).toEqual(
+			[path.join(repoRoot, "AGENTS.md"), path.join(repoRoot, "CLAUDE.md")].sort(),
+		);
 	});
 
 	test("empty standalone files do not claim a depth scope", async () => {

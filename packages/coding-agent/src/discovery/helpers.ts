@@ -719,11 +719,15 @@ function isWithin(parent: string, child: string): boolean {
  * home directory's own copy as project context. A repository rooted at the
  * home directory itself is not "nested below" it, so the home-level file
  * remains project context.
+ *
+ * `scope` gives the files their own per-depth dedupe slot (see
+ * {@link ContextFile.scope}).
  */
 export async function loadStandaloneContextFiles(
 	ctx: LoadContext,
 	providerId: string,
 	fileName: string,
+	scope?: string,
 ): Promise<LoadResult<ContextFile>> {
 	const items: ContextFile[] = [];
 	const warnings: string[] = [];
@@ -763,6 +767,7 @@ export async function loadStandaloneContextFiles(
 						content,
 						level: "project",
 						depth: calculatedDepth,
+						...(scope ? { scope } : {}),
 						_source: createSourceMeta(providerId, candidate, "project"),
 					});
 				}

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- A project-root `CLAUDE.md` now loads alongside `AGENTS.md` and `.claude/CLAUDE.md` in the same directory instead of being shadowed by them, as Claude Code reads all three.
+
 ## [18.17.0] - 2026-11-06
 
 ### Added
